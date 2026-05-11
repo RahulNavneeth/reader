@@ -1,0 +1,208 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg: #FFFFFF;
+    --panel: #F4F5F7;
+    --panel-2: #FAFBFC;
+    --border: #DFE1E6;
+    --border-soft: #EBECF0;
+    --fg: #172B4D;
+    --fg-muted: #6B778C;
+    --fg-subtle: #8993A4;
+    --accent: #0052CC;
+    --accent-bg: #DEEBFF;
+    --hover: #EBECF0;
+    --selected: #DEEBFF;
+    --code-bg: #F4F5F7;
+  }
+  .dark {
+    --bg: #0B1424;
+    --panel: #0F1B33;
+    --panel-2: #122142;
+    --border: #1E2C49;
+    --border-soft: #16243F;
+    --fg: #E8ECF3;
+    --fg-muted: #97A1B7;
+    --fg-subtle: #6B778C;
+    --accent: #4C9AFF;
+    --accent-bg: #0747A6;
+    --hover: #16243F;
+    --selected: #0747A6;
+    --code-bg: #0A1224;
+  }
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+  *::selection {
+    background: var(--accent-bg);
+    color: var(--fg);
+  }
+}
+
+@layer components {
+  .surface { background: var(--bg); }
+  .panel   { background: var(--panel); }
+  .panel-2 { background: var(--panel-2); }
+  .border-app { border-color: var(--border); }
+  .border-soft { border-color: var(--border-soft); }
+  .text-fg { color: var(--fg); }
+  .text-muted { color: var(--fg-muted); }
+  .text-subtle { color: var(--fg-subtle); }
+  .text-accent { color: var(--accent); }
+  .bg-accent { background: var(--accent); }
+  .bg-accent-soft { background: var(--accent-bg); }
+  .bg-hover { background: var(--hover); }
+  .bg-selected { background: var(--selected); }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 px-3 h-8 rounded text-[13px] font-medium transition-colors;
+    color: var(--fg);
+  }
+  .btn:hover { background: var(--hover); }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-1.5 px-3 h-8 rounded text-[13px] font-medium transition-colors text-white;
+    background: var(--accent);
+  }
+  .btn-primary:hover { filter: brightness(1.05); }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-1.5 px-2 h-7 rounded text-[12.5px] font-medium transition-colors;
+    color: var(--fg-muted);
+  }
+  .btn-ghost:hover { background: var(--hover); color: var(--fg); }
+
+  .input {
+    @apply w-full h-8 px-2.5 rounded text-[13px] outline-none transition-colors;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+  }
+  .input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+
+  .tree-item {
+    @apply flex items-center gap-1.5 px-2 h-7 rounded text-[13px] cursor-pointer select-none transition-colors;
+    color: var(--fg);
+  }
+  .tree-item:hover { background: var(--hover); }
+  .tree-item.selected {
+    background: var(--selected);
+    color: var(--accent);
+    font-weight: 500;
+  }
+
+  .kbd {
+    @apply inline-flex items-center justify-center px-1.5 h-5 rounded text-[11px] font-medium;
+    background: var(--panel);
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+  }
+}
+
+/* Markdown body */
+.md {
+  color: var(--fg);
+  font-size: 15px;
+  line-height: 1.65;
+  max-width: 760px;
+}
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+  color: var(--fg);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  scroll-margin-top: 64px;
+}
+.md h1 { font-size: 28px; margin: 0 0 16px; }
+.md h2 { font-size: 22px; margin: 32px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border-soft); }
+.md h3 { font-size: 18px; margin: 24px 0 8px; }
+.md h4 { font-size: 16px; margin: 18px 0 6px; }
+.md p  { margin: 0 0 14px; }
+.md a  { color: var(--accent); text-decoration: none; }
+.md a:hover { text-decoration: underline; }
+.md ul, .md ol { padding-left: 22px; margin: 0 0 14px; }
+.md li { margin: 4px 0; }
+.md blockquote {
+  border-left: 3px solid var(--border);
+  padding: 4px 14px;
+  color: var(--fg-muted);
+  margin: 0 0 14px;
+}
+.md code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.875em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--code-bg);
+  color: var(--fg);
+}
+.md pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.md pre code {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+}
+.md table {
+  border-collapse: collapse;
+  margin: 0 0 14px;
+  font-size: 13.5px;
+  display: block;
+  overflow-x: auto;
+}
+.md th, .md td {
+  border: 1px solid var(--border);
+  padding: 7px 12px;
+  text-align: left;
+}
+.md th {
+  background: var(--panel);
+  font-weight: 600;
+}
+.md tr:nth-child(even) td { background: var(--panel-2); }
+.md hr { border: 0; border-top: 1px solid var(--border-soft); margin: 24px 0; }
+.md img { max-width: 100%; border-radius: 4px; }
+.md .anchor {
+  opacity: 0;
+  margin-left: 6px;
+  font-size: 0.8em;
+  transition: opacity 0.15s;
+}
+.md h1:hover .anchor, .md h2:hover .anchor, .md h3:hover .anchor, .md h4:hover .anchor {
+  opacity: 1;
+}
+
+/* Highlight.js — minimal Atlassian-leaning theme */
+.hljs { color: var(--fg); background: transparent; }
+.hljs-comment, .hljs-quote { color: #8993A4; font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-link { color: #0747A6; font-weight: 500; }
+.hljs-string, .hljs-attr { color: #00875A; }
+.hljs-number, .hljs-regexp, .hljs-meta, .hljs-built_in, .hljs-symbol { color: #BF2600; }
+.hljs-title, .hljs-name, .hljs-type, .hljs-tag { color: #0052CC; }
+.hljs-variable, .hljs-template-variable { color: #DE350B; }
+.dark .hljs-keyword { color: #79B8FF; }
+.dark .hljs-string, .dark .hljs-attr { color: #57D9A3; }
+.dark .hljs-number, .dark .hljs-built_in { color: #FF8F73; }
+.dark .hljs-title, .dark .hljs-tag { color: #79B8FF; }
+.dark .hljs-comment { color: #6B778C; }
+
+/* Scrollbars — invisible, scroll still works */
+* { scrollbar-width: none; -ms-overflow-style: none; }
+*::-webkit-scrollbar { width: 0; height: 0; display: none; }

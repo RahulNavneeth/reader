@@ -1,0 +1,118 @@
+import { config } from '../config.js'
+import { chunkText } from '../lib/chunk.js'
+import { saveMeta, writeText, writeChunks, loadMeta } from '../stores/documents.js'
+import { extractText } from './extract.js'
+import { embedBatch, EmbedError } from './embed.js'
+import type { Chunk, DocumentMeta } from '../types.js'
+import { invalidateSearchCache } from './search.js'
+
+/**
+ * Run the full ingestion pipeline for a freshly-uploaded document:
+ *  1. Extract text from the original blob
+ *  2. Persist text.txt
+ *  3. Chunk the text
+ *  4. Embed each chunk via Ollama (best-effort; falls back to text-only)
+ *  5. Persist chunks.jsonl + updated meta.json
+ *
+ * Always returns the latest meta. Errors are reflected in meta.ingest, never thrown.
+ */
+export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promise<DocumentMeta> {
+  let next: DocumentMeta = { ...meta, ingest: { ...meta.ingest, status: 'extracting' } }
+  await saveMeta(next)
+
+  let text = ''
+  try {
+    text = await extractText(buffer, meta.mime, meta.originalFilename)
+  } catch (e: any) {
+    next = {
+      ...next,
+      updatedAt: Date.now(),
+      ingest: { ...next.ingest, status: 'failed', error: `extract: ${e?.message ?? String(e)}` },
+    }
+    await saveMeta(next)
+    return next
+  }
+
+  await writeText(meta.id, text)
+  next = { ...next, updatedAt: Date.now(), ingest: { ...next.ingest, extractedAt: Date.now() } }
+
+  if (!text.trim()) {
+    next = {
+      ...next,
+      updatedAt: Date.now(),
+      ingest: { ...next.ingest, status: 'no-text', chunkCount: 0, embedded: false },
+    }
+    await saveMeta(next)
+    invalidateSearchCache()
+    return next
+  }
+
+  const segments = chunkText(text, config.ingest.chunkChars, config.ingest.chunkOverlap)
+
+  let chunks: Chunk[] = segments.map((t, idx) => ({ idx, text: t, embedding: [] }))
+  let embedded = false
+  let embedDim = 0
+
+  next = { ...next, ingest: { ...next.ingest, status: 'embedding', chunkCount: chunks.length } }
+  await saveMeta(next)
+
+  try {
+    const vectors = await embedBatch(segments)
+    chunks = chunks.map((c, i) => ({ ...c, embedding: vectors[i] ?? [] }))
+    embedded = chunks.some((c) => c.embedding.length > 0)
+    embedDim = chunks[0]?.embedding.length ?? 0
+  } catch (e) {
+    if (e instanceof EmbedError) {
+      // Soft-fail: keep chunks text-only, mark as not embedded so a later sweep can fill.
+      console.warn(`[ingest] embedding skipped for ${meta.id}: ${e.message}`)
+    } else {
+      throw e
+    }
+  }
+
+  await writeChunks(meta.id, chunks)
+  next = {
+    ...next,
+    updatedAt: Date.now(),
+    ingest: {
+      ...next.ingest,
+      status: 'ready',
+      chunkCount: chunks.length,
+      embedded,
+      embedDim,
+      embeddedAt: embedded ? Date.now() : next.ingest.embeddedAt,
+    },
+  }
+  await saveMeta(next)
+  invalidateSearchCache()
+  return next
+}
+
+/** Re-embed a document whose text is already extracted. Used by an admin sweep. */
+export async function reembedDocument(id: string): Promise<DocumentMeta | null> {
+  const meta = await loadMeta(id)
+  if (!meta) return null
+  // We don't have the original buffer here; we just chunk text.txt and embed.
+  const { readText } = await import('../stores/documents.js')
+  const text = await readText(id)
+  if (!text || !text.trim()) return meta
+  const segments = chunkText(text, config.ingest.chunkChars, config.ingest.chunkOverlap)
+  const vectors = await embedBatch(segments)
+  const chunks: Chunk[] = segments.map((t, idx) => ({ idx, text: t, embedding: vectors[idx] ?? [] }))
+  await writeChunks(id, chunks)
+  const next: DocumentMeta = {
+    ...meta,
+    updatedAt: Date.now(),
+    ingest: {
+      ...meta.ingest,
+      status: 'ready',
+      chunkCount: chunks.length,
+      embedded: true,
+      embedDim: chunks[0]?.embedding.length ?? 0,
+      embeddedAt: Date.now(),
+    },
+  }
+  await saveMeta(next)
+  invalidateSearchCache()
+  return next
+}

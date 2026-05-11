@@ -30,3 +30,7 @@ pnpm-debug.log*
 # misc
 .cache
 coverage
+
+# Reader filesystem state — never commit user data, sessions, documents.
+/data/*
+!/data/.gitkeep
