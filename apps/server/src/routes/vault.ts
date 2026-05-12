@@ -31,6 +31,7 @@ import {
 } from '../stores/documents.js'
 import { ingestDocument } from '../services/ingest.js'
 import { userCan, canNavigateTo } from '../lib/grants.js'
+import { invalidateSearchCache } from '../services/search.js'
 import type { DocumentMeta } from '../types.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
@@ -504,7 +505,10 @@ export async function vaultRoutes(app: FastifyInstance) {
     void userCanRead
 
     await rm(abs, { force: true }).catch(() => null)
-    if (meta) await deleteDocument(meta.id)
+    if (meta) {
+      await deleteDocument(meta.id)
+      invalidateSearchCache()
+    }
     await audit({ actor: user.username, action: 'vault.delete', target: rel })
     return { ok: true }
   })

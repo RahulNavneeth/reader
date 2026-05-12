@@ -43,17 +43,18 @@ export function FileInfoButton({ path, meta }: Props) {
       </button>
       {open && (
         <div
-          className="absolute top-full mt-1.5 z-30 w-[340px] rounded-md shadow-card overflow-hidden"
+          className="absolute top-full mt-1.5 z-30 w-[340px] rounded-md overflow-hidden"
           style={{
             background: 'var(--panel)',
-            border: '1px solid var(--border-soft)',
+            border: '1px solid var(--border)',
+            boxShadow: '0 4px 12px -4px rgba(9,30,66,0.08)',
             left: '50%',
             transform: 'translateX(-50%)',
           }}
         >
           <div
-            className="flex items-center gap-2 px-3 h-8 border-b"
-            style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+            className="flex items-center gap-2 px-3 h-8"
+            style={{ background: 'var(--panel-2)' }}
           >
             <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex-1">
               File details

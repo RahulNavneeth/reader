@@ -18,6 +18,7 @@ import { sweepExpired } from './stores/sessions.js'
 import { preheat } from './services/search.js'
 import { isAvailable as ollamaUp } from './services/embed.js'
 import { loadSettings } from './stores/settings.js'
+import { startVaultWatcher } from './services/watcher.js'
 
 async function main() {
   // Make sure all data subdirs exist before any store touches them.
@@ -90,6 +91,7 @@ async function main() {
       root: webRoot,
       prefix: '/',
       decorateReply: false,
+      wildcard: false,
     })
     app.setNotFoundHandler(async (req, reply) => {
       if (req.url.startsWith('/api') || req.url.startsWith('/mcp') || req.url === '/health') {
@@ -98,6 +100,11 @@ async function main() {
       return reply.sendFile('index.html', webRoot)
     })
     app.log.info({ webDir: webRoot }, 'serving web bundle')
+  } else {
+    // API-only build: plain JSON 404 for unmatched routes.
+    app.setNotFoundHandler((req, reply) => {
+      reply.code(404).send({ error: `not found: ${req.method} ${req.url}` })
+    })
   }
 
   // Best-effort: drop expired sessions on boot.
@@ -110,6 +117,9 @@ async function main() {
   ollamaUp()
     .then((up) => app.log.info({ ollama: up ? 'reachable' : 'down', model: config.ollama.embedModel }, 'embed backend'))
     .catch(() => null)
+
+  // Watch the vault for external edits (Obsidian, vim, Finder) and re-ingest.
+  startVaultWatcher(app.log).catch((err) => app.log.warn({ err }, 'vault watcher start failed'))
 
   try {
     await app.listen({ host: config.server.host, port: config.server.port })

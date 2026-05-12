@@ -5,12 +5,21 @@
  * marks status=no-text.
  */
 import path from 'node:path'
+import { extractImageText } from './ocr.js'
 
 export async function extractText(buffer: Buffer, mime: string, filename: string): Promise<string> {
   const m = (mime || '').toLowerCase()
   const ext = path.extname(filename).toLowerCase()
 
-  if (m.includes('pdf') || ext === '.pdf') return extractPdf(buffer)
+  if (m.includes('pdf') || ext === '.pdf') {
+    const text = await extractPdf(buffer)
+    // Scanned PDFs have no embedded text layer — fall back to OCR'ing each
+    // rendered page. extractPdf returns "" in that case; treat very short
+    // results (< 8 chars) as effectively empty too.
+    if (text.replace(/\s/g, '').length >= 8) return text
+    const ocr = await ocrPdf(buffer)
+    return ocr || text
+  }
   if (
     m.includes('officedocument.wordprocessingml.document') ||
     ext === '.docx'
@@ -22,7 +31,7 @@ export async function extractText(buffer: Buffer, mime: string, filename: string
   if (m.startsWith('text/') || ['.md', '.markdown', '.mdx', '.txt', '.csv', '.json', '.yaml', '.yml', '.toml'].includes(ext)) {
     return buffer.toString('utf8')
   }
-  if (m.startsWith('image/')) return '' // OCR is a later milestone.
+  if (m.startsWith('image/')) return extractImageText(buffer)
   return ''
 }
 
@@ -50,6 +59,39 @@ async function extractPdf(buffer: Buffer): Promise<string> {
   await pdf.cleanup()
   await pdf.destroy()
   return pages.join('\n\n')
+}
+
+/** Scanned-PDF fallback: render each page to a PNG via @napi-rs/canvas, OCR. */
+async function ocrPdf(buffer: Buffer): Promise<string> {
+  try {
+    const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+    const { createCanvas } = await import('@napi-rs/canvas')
+    const pdf = await getDocument({
+      data: new Uint8Array(buffer),
+      isEvalSupported: false,
+      useWorkerFetch: false,
+      useSystemFonts: false,
+      disableFontFace: true,
+    } as any).promise
+    const out: string[] = []
+    // Cap pages to keep OCR time bounded; a 50-page scanned doc would be 8+ min.
+    const maxPages = Math.min(pdf.numPages, 30)
+    for (let i = 1; i <= maxPages; i++) {
+      const page = await pdf.getPage(i)
+      const viewport = page.getViewport({ scale: 2 })
+      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height))
+      const ctx = canvas.getContext('2d')
+      await page.render({ canvasContext: ctx as any, viewport }).promise
+      const png = canvas.toBuffer('image/png')
+      out.push(await extractImageText(png))
+      page.cleanup()
+    }
+    await pdf.cleanup()
+    await pdf.destroy()
+    return out.join('\n\n').trim()
+  } catch {
+    return ''
+  }
 }
 
 async function extractDocx(buffer: Buffer): Promise<string> {

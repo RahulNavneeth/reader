@@ -34,3 +34,9 @@ coverage
 # Reader filesystem state — never commit user data, sessions, documents.
 /data/*
 !/data/.gitkeep
+
+# docker compose state volumes (bind-mounted to ./_state)
+/_state/
+
+# Tesseract language models, downloaded at first OCR.
+*.traineddata

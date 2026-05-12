@@ -169,13 +169,16 @@
 .md a  { color: var(--accent); text-decoration: none; }
 .md a:hover { text-decoration: underline; }
 .md ul, .md ol { padding-left: 22px; margin: 0 0 14px; }
+.md ul { list-style-type: disc; }
+.md ol { list-style-type: decimal; }
 .md li { margin: 4px 0; }
 .md blockquote {
   border-left: 3px solid var(--border);
   padding: 4px 14px;
   color: var(--fg-muted);
-  margin: 0 0 14px;
+  margin: 0;
 }
+.md blockquote p { margin: 0; }
 .md code {
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.875em;

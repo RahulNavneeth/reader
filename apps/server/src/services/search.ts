@@ -90,10 +90,14 @@ function countHits(haystackLower: string, term: string): number {
 
 /**
  * Multi-term lexical score:
- *  - Sum of occurrences across all query tokens.
- *  - Bonus for the full phrase appearing verbatim.
- *  - Bonus when more distinct terms hit (term coverage).
+ *  - Drops results with low term coverage (a 4-token query needs ≥2 hits
+ *    unless the full phrase appears verbatim).
+ *  - Scores by coverage² × normalized frequency, so a doc that hits 1/4 tokens
+ *    can't outrank one that hits 3/4 just by repeating that single word.
+ *  - Big phrase bonus when the exact query appears.
  */
+const MIN_COVERAGE = 0.5
+
 function lexicalScore(text: string, q: string): { score: number; firstHitAt: number } {
   if (!q) return { score: 0, firstHitAt: -1 }
   const lower = text.toLowerCase()
@@ -115,10 +119,18 @@ function lexicalScore(text: string, q: string): { score: number; firstHitAt: num
   if (total === 0) return { score: 0, firstHitAt: -1 }
 
   const phrase = q.trim().toLowerCase()
-  const phraseBonus = phrase.length > 0 && lower.includes(phrase) ? 5 : 0
+  const phraseHit = phrase.length > 0 && lower.includes(phrase)
   const coverage = distinctHit / tokens.length // 0..1
+
+  // Multi-token queries need real coverage to count — otherwise a doc with
+  // one frequent token (e.g. "india") matches any query containing it.
+  if (tokens.length > 1 && coverage < MIN_COVERAGE && !phraseHit) {
+    return { score: 0, firstHitAt: -1 }
+  }
+
+  const phraseBonus = phraseHit ? 5 : 0
   const lenNorm = total / Math.max(1, text.length / 1000)
-  return { score: lenNorm * (1 + coverage * 2) + phraseBonus, firstHitAt: firstHit }
+  return { score: lenNorm * coverage * coverage + phraseBonus, firstHitAt: firstHit }
 }
 
 export type SearchHit = {
@@ -161,17 +173,33 @@ export async function searchKnowledge(opts: {
   lex.sort((a, b) => b.score - a.score)
 
   // Semantic: embed query, score each chunk, take top-k.
+  //
+  // Two thresholds: a hard floor (anything below is noise on nomic-embed-text)
+  // and a higher "trust me without lexical backup" bar. Pure-semantic results
+  // that share no token with the query are required to clear the higher bar.
+  // With proper nomic prefixes ("search_query:"/"search_document:") true
+  // matches typically land at 0.65–0.85; loose noise stays under ~0.55.
+  const SEM_MIN_COSINE = 0.55
+  const SEM_HIGH_COSINE = 0.7
+  const queryTokens = tokenize(q)
   let sem: Array<{ docId: string; chunkIdx: number; score: number; sample: string }> = []
   try {
-    const [qvec] = await embedBatch([q])
+    const [qvec] = await embedBatch([q], 'query')
     if (qvec && qvec.length) {
       const qf = Float32Array.from(qvec)
       const qnorm = Math.hypot(...Array.from(qf))
       for (const ch of c.chunks) {
         if (!ch.embedding || !allowedIds.has(ch.docId)) continue
-        const score = cosine(ch.embedding, qf, ch.norm) * (qnorm || 1)
-        if (score <= 0) continue
-        sem.push({ docId: ch.docId, chunkIdx: ch.idx, score, sample: ch.text.slice(0, 280) })
+        const cs = cosine(ch.embedding, qf, ch.norm)
+        if (cs < SEM_MIN_COSINE) continue
+        // If the chunk shares no token with the query, demand a much higher
+        // cosine before we believe it.
+        if (queryTokens.length > 0 && cs < SEM_HIGH_COSINE) {
+          const chunkLower = ch.text.toLowerCase()
+          const overlaps = queryTokens.some((t) => chunkLower.includes(t))
+          if (!overlaps) continue
+        }
+        sem.push({ docId: ch.docId, chunkIdx: ch.idx, score: cs * (qnorm || 1), sample: ch.text.slice(0, 280) })
       }
       sem.sort((a, b) => b.score - a.score)
       sem = sem.slice(0, limit * 4)

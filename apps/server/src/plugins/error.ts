@@ -16,10 +16,8 @@ async function plugin(app: FastifyInstance) {
     app.log.error({ err }, 'unhandled error')
     reply.code(500).send({ error: 'internal server error' })
   })
-
-  app.setNotFoundHandler((req, reply) => {
-    reply.code(404).send({ error: `not found: ${req.method} ${req.url}` })
-  })
+  // The 404 handler lives in src/index.ts so it can do SPA fallback when a web
+  // bundle is configured. Defining it here would conflict with that setup.
 }
 
 export default fp(plugin, { name: 'reader-error' })

@@ -20,6 +20,11 @@ import { hashPassword } from '../services/auth.js'
 import type { Role, User } from '../types.js'
 import { isAvailable as isOllamaAvailable } from '../services/embed.js'
 import { invalidateMailCache, sendMail, verifySmtp } from '../services/mail.js'
+import { restartVaultWatcher } from '../services/watcher.js'
+import { ingestDocument } from '../services/ingest.js'
+import { deleteDocument, listAllDocuments } from '../stores/documents.js'
+import { invalidateSearchCache } from '../services/search.js'
+import { readFile } from 'node:fs/promises'
 
 const roleSchema = z.enum(['admin', 'editor', 'viewer'])
 
@@ -222,9 +227,49 @@ export async function adminRoutes(app: FastifyInstance) {
     // SMTP transport caches the connection; invalidate so the next sendMail()
     // rebuilds with the new host/credentials.
     if (body.smtp) invalidateMailCache()
+    // Vault root may have moved — re-arm the file watcher against the new path.
+    if (body.vaultRoot !== undefined) restartVaultWatcher(req.server.log)
     await audit({ actor: req.currentUser!.username, action: 'admin.settings.patch', meta: { ...body, smtp: body.smtp ? { ...body.smtp, pass: body.smtp.pass ? '***' : undefined } : undefined } })
     const touchedRestartKey = RESTART_REQUIRED_KEYS.some((k) => k in body)
     return { settings: next, restartRequired: touchedRestartKey }
+  })
+
+  // Re-index every document: read the original file from disk, re-extract text
+  // (so OCR / extractor improvements apply), re-chunk, re-embed. Use after
+  // changing the embedding model or expanding the extractor (e.g. OCR added).
+  app.post('/api/admin/reembed-all', async (req) => {
+    const docs = await listAllDocuments()
+    let ok = 0
+    let failed = 0
+    let removed = 0
+    const errors: Array<{ id: string; error: string }> = []
+    for (const d of docs) {
+      try {
+        const abs = path.join(config.vault.root, d.storageKey)
+        const buffer = await readFile(abs)
+        const updated = await ingestDocument(d, buffer)
+        if (updated.ingest.embedded) ok++
+        else failed++
+      } catch (e: any) {
+        // Orphan: meta references a file that's no longer on disk (vault moved,
+        // file deleted externally, etc.). Drop the stale record so it doesn't
+        // keep showing up in searches.
+        if (e?.code === 'ENOENT') {
+          await deleteDocument(d.id).catch(() => null)
+          removed++
+          continue
+        }
+        failed++
+        errors.push({ id: d.id, error: e?.message ?? String(e) })
+      }
+    }
+    invalidateSearchCache()
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.reindex-all',
+      meta: { total: docs.length, ok, removed, failed },
+    })
+    return { total: docs.length, ok, removed, failed, errors: errors.slice(0, 10) }
   })
 
   app.post('/api/admin/smtp/test', async (req, reply) => {
@@ -346,6 +391,25 @@ export async function adminRoutes(app: FastifyInstance) {
     await writeFile(ANCHOR_PATH, JSON.stringify({ dataDir: target }, null, 2), 'utf8')
     await audit({ actor: req.currentUser!.username, action: 'admin.data-dir.set', meta: { dataDir: target } })
     return { ok: true, dataDir: target, restartRequired: true }
+  })
+
+  // Live list of models installed on the Ollama daemon. Used by the embed
+  // model picker in workspace settings.
+  app.get('/api/admin/ollama/models', async () => {
+    try {
+      const res = await fetch(`${config.ollama.baseUrl.replace(/\/+$/, '')}/api/tags`)
+      if (!res.ok) {
+        return { models: [] as string[], error: `ollama responded ${res.status}` }
+      }
+      const data = (await res.json()) as { models?: Array<{ name?: string }> }
+      const names = (data.models ?? [])
+        .map((m) => m.name ?? '')
+        .filter((n) => n.length > 0)
+        .sort((a, b) => a.localeCompare(b))
+      return { models: names }
+    } catch (e: any) {
+      return { models: [] as string[], error: e?.message ?? String(e) }
+    }
   })
 
   app.get('/api/admin/system', async () => {

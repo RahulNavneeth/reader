@@ -495,6 +495,7 @@ function EmbeddingsPanel() {
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [availableModels, setAvailableModels] = useState<string[]>([])
 
   const refresh = async () => {
     try {
@@ -507,6 +508,12 @@ function EmbeddingsPanel() {
       setChunkOverlap(r.ingest.chunkOverlap)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
+    }
+    try {
+      const r = await api.adminOllamaModels()
+      setAvailableModels(r.models)
+    } catch {
+      setAvailableModels([])
     }
   }
 
@@ -569,12 +576,31 @@ function EmbeddingsPanel() {
           />
         </FieldRow>
         <FieldRow label="Embed model">
-          <input
-            className="input"
-            placeholder="nomic-embed-text"
-            value={embedModel}
-            onChange={(e) => setEmbedModel(e.target.value)}
-          />
+          {availableModels.length > 0 ? (
+            <select
+              className="input"
+              value={embedModel}
+              onChange={(e) => setEmbedModel(e.target.value)}
+            >
+              {/* Include the current value even if it's no longer installed,
+                  so the user can see and re-pick. */}
+              {!availableModels.includes(embedModel) && embedModel && (
+                <option value={embedModel}>{embedModel} (not installed)</option>
+              )}
+              {availableModels.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className="input"
+              placeholder="nomic-embed-text"
+              value={embedModel}
+              onChange={(e) => setEmbedModel(e.target.value)}
+            />
+          )}
         </FieldRow>
       </Card>
 
@@ -601,8 +627,82 @@ function EmbeddingsPanel() {
         </FieldRow>
       </Card>
 
+      <ReembedCard />
+
       <SaveBar onSave={save} saving={saving} msg={msg} />
     </div>
+  )
+}
+
+function ReembedCard() {
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<{
+    total: number
+    ok: number
+    removed: number
+    failed: number
+    errors: { id: string; error: string }[]
+  } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const run = async () => {
+    if (!confirm('Re-index every document? Reads each file from disk, re-extracts, re-embeds.')) return
+    setBusy(true)
+    setError(null)
+    setResult(null)
+    try {
+      const r = await api.adminReembedAll()
+      setResult({ total: r.total, ok: r.ok, removed: r.removed, failed: r.failed, errors: r.errors })
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Card title="Re-index corpus">
+      <div className="flex items-center gap-3">
+        <button className="btn-primary" onClick={run} disabled={busy}>
+          {busy ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+          {busy ? 'Re-indexing…' : 'Re-index all'}
+        </button>
+        {result && (
+          <span className="text-[12px]" style={{ color: result.failed === 0 ? '#00875A' : '#974F0C' }}>
+            {result.ok} OK
+            {result.removed > 0 ? `, ${result.removed} orphans cleaned` : ''}
+            {result.failed > 0 ? `, ${result.failed} failed` : ''}
+          </span>
+        )}
+        {error && (
+          <span className="text-[12px]" style={{ color: '#BF2600' }}>
+            {error}
+          </span>
+        )}
+      </div>
+      {result && result.errors.length > 0 && (
+        <div
+          className="rounded border text-[11.5px] mt-1"
+          style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+        >
+          <div className="px-2.5 py-1.5 font-semibold text-subtle uppercase tracking-wider text-[10.5px] border-b" style={{ borderColor: 'var(--border-soft)' }}>
+            Failures
+          </div>
+          <ul className="px-2.5 py-1.5 space-y-1">
+            {result.errors.map((e, i) => (
+              <li key={i} className="text-fg break-all">
+                <code className="text-subtle">{e.id}</code> — <span style={{ color: '#BF2600' }}>{e.error}</span>
+              </li>
+            ))}
+            {result.failed > result.errors.length && (
+              <li className="text-subtle">…and {result.failed - result.errors.length} more</li>
+            )}
+          </ul>
+        </div>
+      )}
+      <Hint>
+        Re-reads each file from disk and runs extraction + embedding. Use after expanding
+        the extractor (e.g. OCR added) or switching the embed model.
+      </Hint>
+    </Card>
   )
 }
 

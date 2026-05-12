@@ -12,6 +12,8 @@ import { useVault } from '../lib/vault-context'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { FileInfoButton } from './FileInfoButton'
+import { CsvTable } from './CsvTable'
+import { JsonView } from './JsonView'
 
 type Props = {
   path: string
@@ -19,7 +21,7 @@ type Props = {
 
 export function PathViewer({ path }: Props) {
   const navigate = useNavigate()
-  const { setCurrentFolder } = useVault()
+  const { setCurrentFolder, refresh } = useVault()
   const [text, setText] = useState<string | null>(null)
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -29,6 +31,40 @@ export function PathViewer({ path }: Props) {
     const i = path.lastIndexOf('/')
     setCurrentFolder(i < 0 ? '' : path.slice(0, i))
   }, [path, setCurrentFolder])
+
+  // Poll meta while ingestion is mid-flight. When the file flips to embedded,
+  // bump the global refresh nonce so the sidebar updates its sparkle indicator
+  // without a manual refresh.
+  useEffect(() => {
+    if (!meta) return
+    if (meta.ingest.embedded) return
+    const terminal = meta.ingest.status === 'failed' || meta.ingest.status === 'no-text'
+    if (terminal) return
+    let cancelled = false
+    const t = setInterval(async () => {
+      try {
+        const r = await api.fileMeta(path)
+        if (cancelled || !r.meta) return
+        const wasEmbedded = meta.ingest.embedded
+        setMeta(r.meta)
+        if (r.meta.ingest.embedded && !wasEmbedded) {
+          clearInterval(t)
+          refresh()
+        } else if (
+          r.meta.ingest.status === 'failed' ||
+          r.meta.ingest.status === 'no-text'
+        ) {
+          clearInterval(t)
+        }
+      } catch {
+        /* swallow — try again next tick */
+      }
+    }, 2500)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+    }
+  }, [path, meta?.ingest.status, meta?.ingest.embedded, refresh])
 
   useEffect(() => {
     const fname = path.split('/').pop() || path
@@ -47,7 +83,9 @@ export function PathViewer({ path }: Props) {
   }, [path])
 
   const isMarkdown = ['.md', '.markdown', '.mdx'].includes(ext)
-  const isText = ['.txt', '.csv', '.json', '.yaml', '.yml', '.toml'].includes(ext)
+  const isCsv = ext === '.csv'
+  const isJson = ext === '.json'
+  const isText = ['.txt', '.yaml', '.yml', '.toml'].includes(ext)
   const isHtml = ['.html', '.htm'].includes(ext)
   const isPdf = ext === '.pdf'
   const isImage = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg'].includes(ext)
@@ -59,7 +97,7 @@ export function PathViewer({ path }: Props) {
     setMeta(null)
     setError(null)
     api.fileMeta(path).then((r) => setMeta(r.meta)).catch(() => null)
-    if (isMarkdown || isText || isHtml || wantsExtractedText) {
+    if (isMarkdown || isText || isCsv || isJson || isHtml || wantsExtractedText) {
       api
         .fileText(path)
         .then((r) => setText(r.content))
@@ -72,7 +110,7 @@ export function PathViewer({ path }: Props) {
           }
         })
     }
-  }, [path, isMarkdown, isText, isHtml, wantsExtractedText])
+  }, [path, isMarkdown, isText, isCsv, isJson, isHtml, wantsExtractedText])
 
   const filename = path.split('/').pop() || path
   const parentDir = useMemo(() => {
@@ -100,28 +138,32 @@ export function PathViewer({ path }: Props) {
     }
   }
 
-  const headings = useMemo(() => {
-    if (!isMarkdown || !text) return [] as Array<{ level: number; text: string; slug: string }>
-    const lines = text.split('\n')
-    const out: Array<{ level: number; text: string; slug: string }> = []
-    let inFence = false
-    for (const raw of lines) {
-      if (/^```/.test(raw)) {
-        inFence = !inFence
-        continue
-      }
-      if (inFence) continue
-      const m = /^(#{1,4})\s+(.+?)\s*#*\s*$/.exec(raw)
-      if (!m) continue
-      const level = m[1].length
-      const t = m[2].trim()
-      const slug = t
-        .toLowerCase()
-        .replace(/[^\p{L}\p{N}]+/gu, '-')
-        .replace(/^-+|-+$/g, '')
-      out.push({ level, text: t, slug })
+  // Outline is built from the actual rendered DOM after react-markdown +
+  // rehype-slug run, so the slug we click matches the heading's real id even
+  // for tricky titles (parentheses, slashes, percent signs, etc.).
+  const [headings, setHeadings] = useState<Array<{ level: number; text: string; slug: string }>>([])
+  useEffect(() => {
+    if (!isMarkdown || text == null) {
+      setHeadings([])
+      return
     }
-    return out
+    // Defer so react-markdown has finished committing the heading nodes.
+    const id = requestAnimationFrame(() => {
+      const root = contentRef.current
+      if (!root) return
+      const nodes = root.querySelectorAll<HTMLElement>('h1[id], h2[id], h3[id], h4[id]')
+      const out: Array<{ level: number; text: string; slug: string }> = []
+      nodes.forEach((n) => {
+        const level = Number(n.tagName.slice(1))
+        // rehypeAutolinkHeadings appends `<a class="anchor">#</a>` to every
+        // heading; clone + strip so the outline label shows just the title.
+        const clone = n.cloneNode(true) as HTMLElement
+        clone.querySelectorAll('.anchor').forEach((a) => a.remove())
+        out.push({ level, text: (clone.textContent ?? '').trim(), slug: n.id })
+      })
+      setHeadings(out)
+    })
+    return () => cancelAnimationFrame(id)
   }, [isMarkdown, text])
 
   const showOutline = isMarkdown && headings.length > 1
@@ -162,6 +204,9 @@ export function PathViewer({ path }: Props) {
           onBack={() => goToFolder(parentDir)}
         />
         <div className="flex-1" />
+        {meta?.ingest.embedded && (
+          <Sparkles size={13} className="text-accent shrink-0 mx-1" aria-label="indexed for AI search" />
+        )}
         {needsReindex && (
           <button
             className="btn-ghost"
@@ -243,6 +288,18 @@ export function PathViewer({ path }: Props) {
           <pre className="px-10 py-8 text-[13px] whitespace-pre-wrap break-words md">{text}</pre>
         )}
 
+        {!error && isCsv && text != null && (
+          <div className="px-10 py-8">
+            <CsvTable text={text} />
+          </div>
+        )}
+
+        {!error && isJson && text != null && (
+          <div className="px-10 py-8">
+            <JsonView text={text} />
+          </div>
+        )}
+
         {!error && wantsExtractedText && text != null && (
           <div className="px-10 py-10">
             <div className="text-[12px] uppercase tracking-wider font-semibold text-subtle mb-3">extracted text</div>
@@ -274,7 +331,7 @@ export function PathViewer({ path }: Props) {
           </div>
         )}
 
-        {!error && !isPdf && !isImage && !isMarkdown && !isText && !isHtml && !wantsExtractedText && (
+        {!error && !isPdf && !isImage && !isMarkdown && !isText && !isCsv && !isJson && !isHtml && !wantsExtractedText && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center">
               <div className="text-fg font-semibold mb-1">Preview unavailable</div>
@@ -314,3 +371,5 @@ export function PathViewer({ path }: Props) {
     </div>
   )
 }
+
+

@@ -289,6 +289,16 @@ export const api = {
     post<{ ok: true; dataDir: string | null; restartRequired: true }>('/api/admin/data-dir', { dataDir }),
   adminTestSmtp: (to: string) =>
     post<{ ok: true; id: string }>('/api/admin/smtp/test', { to }),
+  adminReembedAll: () =>
+    post<{
+      total: number
+      ok: number
+      removed: number
+      failed: number
+      errors: { id: string; error: string }[]
+    }>('/api/admin/reembed-all'),
+  adminOllamaModels: () =>
+    get<{ models: string[]; error?: string }>('/api/admin/ollama/models'),
 
   // admin — tokens
   adminTokens: () => get<{ tokens: ApiTokenInfo[] }>('/api/admin/tokens'),

@@ -439,19 +439,20 @@ function HitRow({
       data-pos={pos}
       onMouseEnter={onHover}
       onClick={onClick}
-      className="px-3 py-2.5 mx-1 my-0.5 rounded cursor-pointer"
+      className="px-3 py-1.5 mx-1 rounded cursor-pointer"
       style={{ background: active ? 'var(--selected)' : 'transparent' }}
     >
-      <div className="flex items-center gap-2 mb-0.5">
+      <div className="flex items-center gap-2">
         <FileText size={13} className="text-accent shrink-0" />
-        <div className="text-[13px] font-medium text-fg truncate flex-1">{hit.title}</div>
+        <div className="text-[12.5px] font-medium text-fg truncate flex-1">{hit.title}</div>
+        <span className="text-[10.5px] text-subtle truncate hidden sm:inline-block max-w-[180px]">
+          {hit.path}
+        </span>
         <SourceIcon size={11} className="text-subtle shrink-0" />
-        <span className="text-[10.5px] text-subtle font-mono shrink-0">{hit.source}</span>
       </div>
-      <div className="text-[11px] text-subtle truncate ml-[19px]">/{hit.path}</div>
       <div
-        className="text-[12px] text-muted mt-1 ml-[19px] leading-relaxed"
-        style={{ overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}
+        className="text-[11.5px] text-muted ml-[19px] truncate"
+        title={hit.snippet}
       >
         {hit.snippet}
       </div>

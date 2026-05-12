@@ -6,8 +6,24 @@ export class EmbedError extends Error {
   }
 }
 
+export type EmbedKind = 'query' | 'document'
+
+/**
+ * `nomic-embed-text` is trained to be prompted with one of two prefixes:
+ *   "search_query: ..."     for the query side
+ *   "search_document: ..."  for indexed passages
+ * Without these, effective cosine on related pairs drops by ~0.15–0.20.
+ */
+function prefixFor(text: string, kind: EmbedKind): string {
+  const model = (config.ollama.embedModel || '').toLowerCase()
+  if (model.includes('nomic-embed')) {
+    return kind === 'query' ? `search_query: ${text}` : `search_document: ${text}`
+  }
+  return text
+}
+
 /** Returns embeddings of length `dim` per input, or throws EmbedError if Ollama is unreachable. */
-export async function embedBatch(inputs: string[]): Promise<number[][]> {
+export async function embedBatch(inputs: string[], kind: EmbedKind = 'document'): Promise<number[][]> {
   if (!config.ollama.enabled) throw new EmbedError('ollama disabled')
   if (inputs.length === 0) return []
   // Ollama /api/embeddings only accepts one prompt at a time as of 0.3.x.
@@ -20,7 +36,7 @@ export async function embedBatch(inputs: string[]): Promise<number[][]> {
       while (true) {
         const i = next++
         if (i >= inputs.length) return
-        out[i] = await embedOne(inputs[i])
+        out[i] = await embedOne(prefixFor(inputs[i], kind))
       }
     }),
   )
