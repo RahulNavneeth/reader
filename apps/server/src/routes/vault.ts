@@ -30,6 +30,7 @@ import {
   userCanEdit,
 } from '../stores/documents.js'
 import { ingestDocument } from '../services/ingest.js'
+import { userCan, canNavigateTo } from '../lib/grants.js'
 import type { DocumentMeta } from '../types.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
@@ -168,11 +169,72 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { vault: config.vault.root, separator: path.sep }
   })
 
+  // Recursive list of every folder path in the vault — used by client-side
+  // autocomplete in the ⌘K palette (new-folder mode).
+  app.get('/api/folders', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const out: string[] = []
+    async function walk(absDir: string, rel: string): Promise<void> {
+      let entries: import('node:fs').Dirent[]
+      try {
+        entries = await readdir(absDir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of entries) {
+        if (shouldSkipName(e.name)) continue
+        if (!e.isDirectory()) continue
+        const childRel = rel ? `${rel}/${e.name}` : e.name
+        out.push(childRel)
+        await walk(path.join(absDir, e.name), childRel)
+      }
+    }
+    await walk(config.vault.root, '')
+    out.sort()
+    return { folders: out }
+  })
+
+  // Full vault tree (folders + files) — used by the permission picker UI so
+  // admins can grant access on either a folder or an individual file.
+  app.get('/api/vault-tree', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const folders: string[] = []
+    const files: string[] = []
+    async function walk(absDir: string, rel: string): Promise<void> {
+      let entries: import('node:fs').Dirent[]
+      try {
+        entries = await readdir(absDir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of entries) {
+        if (shouldSkipName(e.name)) continue
+        const childRel = rel ? `${rel}/${e.name}` : e.name
+        if (e.isDirectory()) {
+          folders.push(childRel)
+          await walk(path.join(absDir, e.name), childRel)
+        } else if (e.isFile()) {
+          const ext = path.extname(e.name).toLowerCase()
+          if (!SUPPORTED_EXTS.has(ext)) continue
+          files.push(childRel)
+        }
+      }
+    }
+    await walk(config.vault.root, '')
+    folders.sort()
+    files.sort()
+    return { folders, files }
+  })
+
   // ---- list -----------------------------------------------------------------
 
   app.get('/api/list', async (req, reply) => {
     if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
     const { path: rel = '' } = req.query as { path?: string }
+    if (!canNavigateTo(user, rel)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
     const dir = resolveVault(rel)
 
     let entries: import('node:fs').Dirent[]
@@ -196,17 +258,21 @@ export async function vaultRoutes(app: FastifyInstance) {
       const abs = path.join(dir, e.name)
       const childRel = toVaultRel(abs)
       if (e.isDirectory()) {
+        // Hide subfolders the user can't read or navigate into.
+        if (!canNavigateTo(user, childRel)) continue
         items.push({ name: e.name, path: childRel, type: 'dir', hasChildren: true })
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase()
         if (!SUPPORTED_EXTS.has(ext)) continue
+        // Hide files the user can't read (unless they're public).
+        const indexed = indexedByPath.get(childRel)
+        if (!userCan(user, 'read', childRel) && !indexed?.public) continue
         let size: number | undefined, mtime: number | undefined
         try {
           const s = await stat(abs)
           size = s.size
           mtime = s.mtimeMs
         } catch { /* skip */ }
-        const indexed = indexedByPath.get(childRel)
         items.push({
           name: e.name,
           path: childRel,
@@ -238,11 +304,14 @@ export async function vaultRoutes(app: FastifyInstance) {
     const docs = await listAllDocuments()
     const meta = docs.find((d) => d.storageKey === rel)
 
-    // Allow without auth if explicitly public; otherwise require user + read ACL.
+    // Allow without auth if explicitly public; otherwise require user + read access
+    // (grant on the path OR file ACL).
     if (!meta?.public) {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
-      if (meta && !userCanRead(meta, u.username, u.role)) {
+      const aclOk = !meta || userCanRead(meta, u.username, u.role)
+      const grantOk = userCan(u, 'read', rel)
+      if (!aclOk && !grantOk) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
@@ -250,8 +319,42 @@ export async function vaultRoutes(app: FastifyInstance) {
     const ext = path.extname(abs).toLowerCase()
     // Native text types — read from disk directly so md/txt edits show without re-ingest.
     if (['.md', '.markdown', '.mdx', '.txt', '.csv', '.json', '.html', '.htm', '.yaml', '.yml', '.toml'].includes(ext)) {
-      const text = await readFile(abs, 'utf8')
+      const buffer = await readFile(abs)
+      const text = buffer.toString('utf8')
       const s = await stat(abs)
+      // First-read auto-ingest: if this vault file has never been embedded, kick
+      // off a background ingest so it shows up in semantic search next time.
+      if ((!meta || !meta.ingest.embedded) && req.currentUser) {
+        const u = req.currentUser
+        ;(async () => {
+          try {
+            const docsNow = await listAllDocuments()
+            const existing = docsNow.find((d) => d.storageKey === rel)
+            const id = existing?.id ?? nanoid()
+            const filename = path.basename(abs)
+            const seed: DocumentMeta = {
+              id,
+              title: existing?.title ?? filename.replace(/\.[^.]+$/, ''),
+              originalFilename: filename,
+              mime: inferMime(filename),
+              bytes: buffer.length,
+              sha256: sha256Of(buffer),
+              storageKey: rel,
+              owner: existing?.owner ?? u.username,
+              acl: existing?.acl ?? { readers: [], editors: [] },
+              public: existing?.public,
+              tags: existing?.tags ?? [],
+              createdAt: existing?.createdAt ?? Date.now(),
+              updatedAt: Date.now(),
+              ingest: { status: 'pending', embedded: false },
+            }
+            await saveMeta(seed)
+            await ingestDocument(seed, buffer)
+          } catch (e) {
+            req.log?.warn({ err: e }, `auto-ingest failed for ${rel}`)
+          }
+        })()
+      }
       return { path: rel, content: text, size: s.size, mtime: s.mtimeMs }
     }
     // Binary types — return extracted text from the index, if any.
@@ -440,34 +543,82 @@ export async function vaultRoutes(app: FastifyInstance) {
   })
 
   // Resolve a raw path → docId. Public-aware: anonymous callers can fetch
-  // metadata for a file that has `public: true`.
+  // metadata for a file that has `public: true`. For vault files without an
+  // index record (e.g. markdown read straight from disk) we return a stub so
+  // the client can render the visibility toggle on the first open.
   app.get('/api/file/meta', async (req, reply) => {
     const { path: rel } = req.query as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    resolveVault(rel) // sandbox check; throws on traversal
+    const abs = resolveVault(rel)
     const docs = await listAllDocuments()
     const meta = docs.find((d) => d.storageKey === rel)
-    if (!meta) return { meta: null }
-    if (meta.public) return { meta }
+    if (meta) {
+      if (meta.public) return { meta }
+      if (!requireAuth(req, reply)) return
+      const u = req.currentUser!
+      if (!userCanRead(meta, u.username, u.role)) {
+        return reply.code(403).send({ error: 'forbidden' })
+      }
+      return { meta }
+    }
+    // No persisted meta — synthesize a stub if the file exists in the vault.
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isFile()) return { meta: null }
     if (!requireAuth(req, reply)) return
     const u = req.currentUser!
-    if (!userCanRead(meta, u.username, u.role)) {
-      return reply.code(403).send({ error: 'forbidden' })
+    const filename = path.basename(abs)
+    const stub: DocumentMeta = {
+      id: '',
+      title: filename.replace(/\.[^.]+$/, ''),
+      originalFilename: filename,
+      mime: inferMime(filename),
+      bytes: s.size,
+      sha256: '',
+      storageKey: rel,
+      owner: u.username,
+      acl: { readers: [], editors: [] },
+      public: false,
+      tags: [],
+      createdAt: s.birthtimeMs || Date.now(),
+      updatedAt: s.mtimeMs || Date.now(),
+      ingest: { status: 'pending', embedded: false },
     }
-    return { meta }
+    return { meta: stub }
   })
 
-  // Flip a file's public flag. Only owner / admin / listed editor may change it.
+  // Flip a file's public flag. Only owner / admin / listed editor may change
+  // it. Creates an index record on the fly for vault files that haven't been
+  // ingested yet (markdown, txt, etc.) so visibility works for every file.
   app.post('/api/file/visibility', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
     const body = req.body as { path?: string; public?: boolean }
     if (!body?.path) return reply.code(400).send({ error: 'missing path' })
     if (typeof body.public !== 'boolean') return reply.code(400).send({ error: 'missing public flag' })
+    const abs = resolveVault(body.path)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === body.path)
-    if (!meta) return reply.code(404).send({ error: 'not indexed' })
-    if (!userCanEdit(meta, user.username, user.role)) {
+    let meta = docs.find((d) => d.storageKey === body.path)
+    if (!meta) {
+      // Create a minimal record — no ingest, just enough to track visibility.
+      const filename = path.basename(abs)
+      meta = {
+        id: nanoid(),
+        title: filename.replace(/\.[^.]+$/, ''),
+        originalFilename: filename,
+        mime: inferMime(filename),
+        bytes: s.size,
+        sha256: '',
+        storageKey: body.path,
+        owner: user.username,
+        acl: { readers: [], editors: [] },
+        tags: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ingest: { status: 'pending', embedded: false },
+      }
+    } else if (!userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     const next: DocumentMeta = { ...meta, public: body.public, updatedAt: Date.now() }

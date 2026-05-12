@@ -93,12 +93,51 @@
   .tree-item {
     @apply flex items-center gap-1.5 px-2 h-7 rounded text-[13px] cursor-pointer select-none transition-colors;
     color: var(--fg);
+    outline: none !important;
+    -webkit-user-drag: element;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  .tree-item:focus,
+  .tree-item:focus-visible,
+  .tree-item:focus-within,
+  .tree-item:active {
+    outline: none !important;
+    box-shadow: none !important;
+  }
+  [draggable="true"] {
+    outline: none !important;
+    -webkit-tap-highlight-color: transparent;
+  }
+  [draggable="true"]:focus,
+  [draggable="true"]:focus-visible,
+  [draggable="true"]:active {
+    outline: none !important;
   }
   .tree-item:hover { background: var(--hover); }
   .tree-item.selected {
     background: var(--selected);
     color: var(--accent);
     font-weight: 500;
+  }
+
+  .drop-indicator {
+    position: relative;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 1px;
+    margin: 1px 6px 1px 0;
+    pointer-events: none;
+  }
+  .drop-indicator::before {
+    content: '';
+    position: absolute;
+    left: -3px;
+    top: -3px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
   }
 
   .kbd {

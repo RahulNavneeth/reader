@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowRight, FileText, Lock } from 'lucide-react'
+import { ArrowRight, FileText, Lock, ShieldOff } from 'lucide-react'
 import { api, ApiError, type PublicUser } from '../lib/api'
 
 type Mode = 'signup' | 'login'
@@ -11,6 +11,7 @@ type Props = {
 export function AuthScreen({ onAuthed }: Props) {
   const [mode, setMode] = useState<Mode>('login')
   const [hasAdmin, setHasAdmin] = useState<boolean | null>(null)
+  const [allowSignup, setAllowSignup] = useState<boolean>(true)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -21,11 +22,16 @@ export function AuthScreen({ onAuthed }: Props) {
       .bootstrap()
       .then((r) => {
         setHasAdmin(r.hasAdmin)
+        setAllowSignup(r.allowOpenSignup)
         // No admin yet → first run, default to signup.
         if (!r.hasAdmin) setMode('signup')
       })
       .catch(() => setHasAdmin(true))
   }, [])
+
+  // If sign-ups are off and an admin already exists, you cannot create an account.
+  // The very first sign-up is always allowed (it makes the admin).
+  const signupBlocked = mode === 'signup' && hasAdmin === true && !allowSignup
 
   const submit = async () => {
     setError(null)
@@ -48,6 +54,39 @@ export function AuthScreen({ onAuthed }: Props) {
     }
   }
 
+  if (signupBlocked) {
+    return (
+      <div className="h-full flex items-center justify-center surface">
+        <div className="w-full max-w-sm p-8">
+          <div className="flex items-center gap-2 mb-6">
+            <FileText size={20} className="text-accent" />
+            <span className="text-[15px] font-semibold tracking-tight">Reader</span>
+          </div>
+
+          <div className="flex items-center gap-2 mb-3">
+            <ShieldOff size={18} className="text-muted" />
+            <h1 className="text-xl font-semibold tracking-tight">Sign-ups are closed</h1>
+          </div>
+          <p className="text-[13.5px] text-muted mb-5">
+            The admin of this workspace has disabled open sign-ups. Ask them to create an account
+            for you, then sign in below.
+          </p>
+
+          <button
+            className="btn-primary w-full"
+            onClick={() => {
+              setMode('login')
+              setError(null)
+            }}
+          >
+            <Lock size={14} />
+            Back to sign in
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="h-full flex items-center justify-center surface">
       <div className="w-full max-w-sm p-8">
@@ -68,7 +107,7 @@ export function AuthScreen({ onAuthed }: Props) {
             ? hasAdmin === false
               ? 'You are the first user — you become the admin.'
               : 'Pick a username and a password ≥ 8 characters.'
-            : 'Use your username and password.'}
+            : 'Your vault, searchable by you and your agents.'}
         </p>
 
         <label className="block text-[12px] font-medium text-muted mb-1.5">Username</label>
@@ -78,7 +117,7 @@ export function AuthScreen({ onAuthed }: Props) {
           autoFocus
           onChange={(e) => setUsername(e.target.value.toLowerCase())}
           onKeyDown={(e) => e.key === 'Enter' && submit()}
-          placeholder="rahul"
+          placeholder="your username"
         />
 
         <label className="block text-[12px] font-medium text-muted mb-1.5">Password</label>
@@ -105,9 +144,11 @@ export function AuthScreen({ onAuthed }: Props) {
         {hasAdmin && (
           <div className="text-[12.5px] text-muted text-center">
             {mode === 'login' ? (
-              <button className="text-accent hover:underline" onClick={() => setMode('signup')}>
-                Need an account? Sign up
-              </button>
+              allowSignup && (
+                <button className="text-accent hover:underline" onClick={() => setMode('signup')}>
+                  Need an account? Sign up
+                </button>
+              )
             ) : (
               <button className="text-accent hover:underline" onClick={() => setMode('login')}>
                 Already have an account? Sign in

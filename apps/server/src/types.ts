@@ -1,11 +1,25 @@
 export type Role = 'admin' | 'editor' | 'viewer'
 
+/**
+ * A path-based permission grant. `path = ""` applies to the whole vault.
+ * `read` lets the user list/open paths under `path`. `write` lets them edit or
+ * delete existing files. `create` lets them upload or mkdir inside the folder.
+ */
+export type Grant = {
+  path: string
+  read: boolean
+  write: boolean
+  create: boolean
+}
+
 export type User = {
   username: string
   passwordHash: string
   role: Role
   createdAt: number
   disabled?: boolean
+  /** Path-level access grants. Admins ignore this — they always have full access. */
+  grants?: Grant[]
 }
 
 export type Session = {

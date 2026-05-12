@@ -1,7 +1,25 @@
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
 const HOME = os.homedir()
+
+/**
+ * "Anchor" file outside the data dir. Holds a `dataDir` override so the user
+ * can move the entire data location at runtime without breaking the
+ * chicken-and-egg of "settings.json lives inside dataDir".
+ */
+export const ANCHOR_PATH = path.join(HOME, '.reader', 'anchor.json')
+
+function readAnchor(): { dataDir?: string } {
+  try {
+    return JSON.parse(readFileSync(ANCHOR_PATH, 'utf8')) as { dataDir?: string }
+  } catch {
+    return {}
+  }
+}
+
+const anchor = readAnchor()
 
 function expand(p: string): string {
   if (!p) return p
@@ -31,7 +49,9 @@ function envBool(key: string, fallback: boolean): boolean {
   return v === '1' || v === 'true' || v === 'yes'
 }
 
-const dataDir = expand(envStr('DATA_DIR', './data'))
+const dataDir = anchor.dataDir
+  ? expand(anchor.dataDir)
+  : expand(envStr('DATA_DIR', './data'))
 const sessionSecret = envStr('SESSION_SECRET', '')
 if (!sessionSecret || sessionSecret.length < 32) {
   console.warn(
@@ -96,6 +116,17 @@ export const config = {
   signup: {
     /** Once any user exists, only invited signups are allowed (M1: invites stub). */
     allowOpen: envBool('ALLOW_OPEN_SIGNUP', false),
+  },
+  smtp: {
+    /** When false, mail is logged to stdout instead of being sent. */
+    enabled: envBool('SMTP_ENABLED', false),
+    host: envStr('SMTP_HOST', ''),
+    port: envInt('SMTP_PORT', 587),
+    user: envStr('SMTP_USER', ''),
+    pass: envStr('SMTP_PASS', ''),
+    from: envStr('SMTP_FROM', 'Reader <noreply@reader.local>'),
+    /** true → use TLS from connect (SMTPS, usually port 465). false → STARTTLS upgrade. */
+    secure: envBool('SMTP_SECURE', false),
   },
   /** Path to a built web bundle to serve from /. If empty, the server is API-only. */
   webDir: envStr('WEB_DIR', ''),

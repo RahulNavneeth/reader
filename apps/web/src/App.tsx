@@ -21,7 +21,6 @@ type AuthState =
 export default function App() {
   const { theme, toggle } = useTheme()
   const [auth, setAuth] = useState<AuthState>({ status: 'loading' })
-  const [adminOpen, setAdminOpen] = useState(false)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [refreshNonce, setRefreshNonce] = useState(0)
   const [uploadingName, setUploadingName] = useState<string | null>(null)
@@ -202,20 +201,16 @@ export default function App() {
             {theme === 'light' ? <Moon size={14} /> : <Sun size={14} />}
           </button>
 
-          <UserMenu
-            user={auth.user}
-            onLogout={handleLogout}
-            onOpenAdmin={() => setAdminOpen(true)}
-          />
+          <UserMenu user={auth.user} onLogout={handleLogout} />
         </header>
 
         <Routes>
           <Route path="/" element={<VaultView />} />
           <Route path="/docs/*" element={<VaultView />} />
+          {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
           <Route path="*" element={<VaultView />} />
         </Routes>
 
-        {adminOpen && auth.user.role === 'admin' && <AdminPanel onClose={() => setAdminOpen(false)} />}
         <SearchPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
         {pendingFiles && (
           <UploadDialog

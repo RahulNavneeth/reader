@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Upload, X, Folder, FileText, Loader2 } from 'lucide-react'
+import { Upload, X, Folder, FileText, Loader2, CornerDownLeft } from 'lucide-react'
 import { api } from '../lib/api'
 
 type Props = {
@@ -10,48 +10,47 @@ type Props = {
 }
 
 export function UploadDialog({ files, defaultDir, onCancel, onConfirm }: Props) {
-  const [dir, setDir] = useState(defaultDir)
-  const [suggestions, setSuggestions] = useState<string[]>([])
+  // Input starts empty by default — the user explicitly picks the destination
+  // via typing or the suggestion list. `defaultDir` is kept on the prop in case
+  // a caller wants to prioritise it in the list, but does not pre-fill input.
+  const [dir, setDir] = useState('')
+  const [folderList, setFolderList] = useState<string[]>([])
+  const [activeIdx, setActiveIdx] = useState(0)
   const [busy, setBusy] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  void defaultDir
 
   useEffect(() => {
-    setDir(defaultDir)
     setTimeout(() => inputRef.current?.focus(), 0)
-  }, [defaultDir])
+  }, [])
 
   useEffect(() => {
-    // Pull top-level + immediate children of the default dir for quick-pick suggestions.
     let cancelled = false
-    const load = async () => {
-      const acc = new Set<string>()
-      acc.add('')
-      if (defaultDir) acc.add(defaultDir)
-      try {
-        const root = await api.list('')
-        root.items.filter((n) => n.type === 'dir').forEach((n) => acc.add(n.path))
-        if (defaultDir) {
-          const sub = await api.list(defaultDir).catch(() => null)
-          sub?.items.filter((n) => n.type === 'dir').forEach((n) => acc.add(n.path))
-        }
-      } catch {
-        /* ignore */
-      }
-      if (!cancelled) setSuggestions(Array.from(acc))
-    }
-    load()
+    api
+      .folders()
+      .then((r) => {
+        if (cancelled) return
+        setFolderList(['', ...r.folders])
+      })
+      .catch(() => {
+        if (!cancelled) setFolderList([''])
+      })
     return () => {
       cancelled = true
     }
-  }, [defaultDir])
+  }, [])
 
   const clean = useMemo(() => dir.trim().replace(/^\/+|\/+$/g, ''), [dir])
-  const filteredSuggestions = useMemo(() => {
+
+  const matches = useMemo(() => {
     const q = clean.toLowerCase()
-    return suggestions
-      .filter((s) => (q ? s.toLowerCase().includes(q) : true))
-      .slice(0, 8)
-  }, [suggestions, clean])
+    if (!q) return folderList.slice(0, 8)
+    return folderList.filter((f) => f.toLowerCase().includes(q)).slice(0, 8)
+  }, [folderList, clean])
+
+  useEffect(() => {
+    setActiveIdx(0)
+  }, [clean])
 
   const submit = async () => {
     setBusy(true)
@@ -71,6 +70,25 @@ export function UploadDialog({ files, defaultDir, onCancel, onConfirm }: Props) 
     if (e.key === 'Enter' && !busy) {
       e.preventDefault()
       submit()
+      return
+    }
+    if (matches.length > 0) {
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        const pick = matches[activeIdx] ?? matches[0]
+        if (pick !== undefined) setDir(pick)
+        return
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setActiveIdx((i) => Math.min(matches.length - 1, i + 1))
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setActiveIdx((i) => Math.max(0, i - 1))
+        return
+      }
     }
   }
 
@@ -115,34 +133,39 @@ export function UploadDialog({ files, defaultDir, onCancel, onConfirm }: Props) 
               disabled={busy}
             />
           </div>
-          <div className="text-[11px] text-subtle mt-1.5">
-            Will save to <code className="text-fg">/{clean || '(root)'}</code>. Use <code>/</code> for nesting; folders are created if missing.
+          <div className="text-[11px] text-subtle mt-1.5 flex items-center gap-2">
+            <CornerDownLeft size={10} />
+            <span>
+              Saving to <code className="text-fg">/{clean || '(root)'}</code> · Tab to autocomplete · ↑↓ to pick
+            </span>
           </div>
-
-          {filteredSuggestions.length > 0 && (
-            <div className="mt-3">
-              <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
-                Quick pick
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                {filteredSuggestions.map((s) => (
-                  <button
-                    key={s || '__root__'}
-                    onClick={() => setDir(s)}
-                    className="px-2 py-1 rounded text-[11.5px] hover:bg-hover transition-colors flex items-center gap-1.5"
-                    style={{
-                      background: clean === s ? 'var(--selected)' : 'var(--panel-2)',
-                      border: '1px solid var(--border-soft)',
-                    }}
-                  >
-                    <Folder size={10} className="text-subtle" />
-                    {s || '(root)'}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
         </div>
+
+        {matches.length > 0 && (
+          <div
+            className="max-h-[200px] overflow-y-auto py-1 border-b"
+            style={{ borderColor: 'var(--border-soft)' }}
+          >
+            <div className="px-4 pt-1 pb-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+              Folders
+            </div>
+            {matches.map((f, i) => (
+              <div
+                key={f || '__root__'}
+                onMouseEnter={() => setActiveIdx(i)}
+                onClick={() => {
+                  setDir(f)
+                  inputRef.current?.focus()
+                }}
+                className="px-3 py-1.5 mx-1 rounded cursor-pointer flex items-center gap-2"
+                style={{ background: activeIdx === i ? 'var(--selected)' : 'transparent' }}
+              >
+                <Folder size={13} className="text-accent shrink-0" />
+                <span className="text-[12.5px] text-fg truncate">{f || '(vault root)'}</span>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div className="px-4 py-3 max-h-[180px] overflow-y-auto">
           <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1.5">

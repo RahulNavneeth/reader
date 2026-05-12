@@ -17,6 +17,7 @@ import { mcpRoutes } from './routes/mcp.js'
 import { sweepExpired } from './stores/sessions.js'
 import { preheat } from './services/search.js'
 import { isAvailable as ollamaUp } from './services/embed.js'
+import { loadSettings } from './stores/settings.js'
 
 async function main() {
   // Make sure all data subdirs exist before any store touches them.
@@ -24,6 +25,9 @@ async function main() {
     if (p.endsWith('.json')) continue
     await ensureDir(p)
   }
+  // Load persisted workspace settings — applies any vaultRoot override before
+  // the vault folder is touched.
+  await loadSettings()
   // The vault is the user's actual content folder; auto-create on first boot.
   await ensureDir(config.vault.root)
 

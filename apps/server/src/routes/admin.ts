@@ -1,9 +1,25 @@
+import os from 'node:os'
+import path from 'node:path'
+import { mkdir, readdir, stat, writeFile } from 'node:fs/promises'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
+import { config, ANCHOR_PATH } from '../config.js'
 import { audit } from '../stores/audit.js'
-import { listUsers, getUser, saveUser, publicUser } from '../stores/users.js'
+import {
+  deleteUser,
+  getUser,
+  isValidUsername,
+  listUsers,
+  publicUser,
+  saveUser,
+} from '../stores/users.js'
+import { ROLE_PRESETS, sanitizeGrants } from '../lib/grants.js'
 import { createToken, deleteToken, listTokens } from '../stores/tokens.js'
-import type { Role } from '../types.js'
+import { loadSettings, saveSettings, RESTART_REQUIRED_KEYS, type WorkspaceSettings } from '../stores/settings.js'
+import { hashPassword } from '../services/auth.js'
+import type { Role, User } from '../types.js'
+import { isAvailable as isOllamaAvailable } from '../services/embed.js'
+import { invalidateMailCache, sendMail, verifySmtp } from '../services/mail.js'
 
 const roleSchema = z.enum(['admin', 'editor', 'viewer'])
 
@@ -23,12 +39,360 @@ export async function adminRoutes(app: FastifyInstance) {
       .object({
         role: roleSchema.optional(),
         disabled: z.boolean().optional(),
+        grants: z
+          .array(
+            z.object({
+              path: z.string(),
+              read: z.boolean(),
+              write: z.boolean(),
+              create: z.boolean(),
+            }),
+          )
+          .optional(),
       })
       .parse(req.body)
-    const next = { ...u, role: (body.role ?? u.role) as Role, disabled: body.disabled ?? u.disabled }
+    const next: User = {
+      ...u,
+      role: (body.role ?? u.role) as Role,
+      disabled: body.disabled ?? u.disabled,
+      grants: body.grants ? sanitizeGrants(body.grants) : u.grants,
+    }
     await saveUser(next)
-    await audit({ actor: req.currentUser!.username, action: 'admin.user.patch', target: username, meta: body })
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.user.patch',
+      target: username,
+      meta: { ...body, grants: body.grants ? body.grants.length : undefined },
+    })
     return { user: publicUser(next) }
+  })
+
+  app.post('/api/admin/users', async (req, reply) => {
+    const grantSchema = z
+      .array(
+        z.object({
+          path: z.string(),
+          read: z.boolean(),
+          write: z.boolean(),
+          create: z.boolean(),
+        }),
+      )
+      .optional()
+    const body = z
+      .object({
+        username: z.string().min(2).max(32),
+        password: z.string().min(8).max(256),
+        role: roleSchema.default('viewer'),
+        grants: grantSchema,
+      })
+      .parse(req.body)
+    if (!isValidUsername(body.username)) {
+      return reply.code(400).send({ error: 'invalid username' })
+    }
+    if (await getUser(body.username)) {
+      return reply.code(409).send({ error: 'username taken' })
+    }
+    const grants = body.grants ? sanitizeGrants(body.grants) : ROLE_PRESETS[body.role]
+    const user: User = {
+      username: body.username,
+      passwordHash: await hashPassword(body.password),
+      role: body.role,
+      createdAt: Date.now(),
+      grants,
+    }
+    await saveUser(user)
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.user.create',
+      target: user.username,
+      meta: { role: user.role, grantCount: grants.length },
+    })
+    return reply.code(201).send({ user: publicUser(user) })
+  })
+
+  app.delete('/api/admin/users/:username', async (req, reply) => {
+    const { username } = req.params as { username: string }
+    if (username === req.currentUser!.username) {
+      return reply.code(400).send({ error: 'cannot delete the currently signed-in user' })
+    }
+    const u = await getUser(username)
+    if (!u) return reply.code(404).send({ error: 'not found' })
+    await deleteUser(username)
+    await audit({ actor: req.currentUser!.username, action: 'admin.user.delete', target: username })
+    return { ok: true }
+  })
+
+  app.get('/api/admin/settings', async () => {
+    const s = await loadSettings()
+    return { settings: s }
+  })
+
+  app.patch('/api/admin/settings', async (req, reply) => {
+    const grantArr = z.array(
+      z.object({
+        path: z.string(),
+        read: z.boolean(),
+        write: z.boolean(),
+        create: z.boolean(),
+      }),
+    )
+    const body = z
+      .object({
+        allowOpenSignup: z.boolean().optional(),
+        defaultGrants: grantArr.optional(),
+        vaultRoot: z.string().optional(),
+        ingest: z
+          .object({
+            maxFileBytes: z.number().int().positive().optional(),
+            chunkChars: z.number().int().positive().optional(),
+            chunkOverlap: z.number().int().min(0).optional(),
+          })
+          .optional(),
+        ollama: z
+          .object({
+            enabled: z.boolean().optional(),
+            baseUrl: z.string().optional(),
+            embedModel: z.string().optional(),
+          })
+          .optional(),
+        storage: z
+          .object({
+            backend: z.enum(['local', 's3']).optional(),
+            s3: z
+              .object({
+                endpoint: z.string().optional(),
+                bucket: z.string().optional(),
+                accessKey: z.string().optional(),
+                secretKey: z.string().optional(),
+                region: z.string().optional(),
+                forcePathStyle: z.boolean().optional(),
+              })
+              .optional(),
+          })
+          .optional(),
+        session: z
+          .object({
+            ttlDays: z.number().int().positive().optional(),
+            cookieSecure: z.boolean().optional(),
+            cookieSameSite: z.enum(['lax', 'strict', 'none']).optional(),
+          })
+          .optional(),
+        server: z
+          .object({
+            host: z.string().optional(),
+            port: z.number().int().positive().optional(),
+          })
+          .optional(),
+        smtp: z
+          .object({
+            enabled: z.boolean().optional(),
+            host: z.string().optional(),
+            port: z.number().int().positive().optional(),
+            user: z.string().optional(),
+            pass: z.string().optional(),
+            from: z.string().optional(),
+            secure: z.boolean().optional(),
+          })
+          .optional(),
+      })
+      .parse(req.body)
+    const current = await loadSettings()
+    // Deep-merge each known section so PATCH doesn't blow away sibling keys.
+    const next: WorkspaceSettings = {
+      ...current,
+      ...(body.allowOpenSignup !== undefined && { allowOpenSignup: body.allowOpenSignup }),
+      ...(body.vaultRoot !== undefined && { vaultRoot: body.vaultRoot }),
+      ...(body.defaultGrants !== undefined && { defaultGrants: sanitizeGrants(body.defaultGrants) }),
+      ingest: { ...(current.ingest ?? {}), ...(body.ingest ?? {}) },
+      ollama: { ...(current.ollama ?? {}), ...(body.ollama ?? {}) },
+      storage: {
+        ...(current.storage ?? {}),
+        ...(body.storage ?? {}),
+        s3: { ...(current.storage?.s3 ?? {}), ...(body.storage?.s3 ?? {}) },
+      },
+      session: { ...(current.session ?? {}), ...(body.session ?? {}) },
+      server: { ...(current.server ?? {}), ...(body.server ?? {}) },
+      smtp: { ...(current.smtp ?? {}), ...(body.smtp ?? {}) },
+    }
+    try {
+      await saveSettings(next)
+    } catch (e: any) {
+      return reply.code(e?.statusCode ?? 400).send({ error: e?.message ?? String(e) })
+    }
+    // SMTP transport caches the connection; invalidate so the next sendMail()
+    // rebuilds with the new host/credentials.
+    if (body.smtp) invalidateMailCache()
+    await audit({ actor: req.currentUser!.username, action: 'admin.settings.patch', meta: { ...body, smtp: body.smtp ? { ...body.smtp, pass: body.smtp.pass ? '***' : undefined } : undefined } })
+    const touchedRestartKey = RESTART_REQUIRED_KEYS.some((k) => k in body)
+    return { settings: next, restartRequired: touchedRestartKey }
+  })
+
+  app.post('/api/admin/smtp/test', async (req, reply) => {
+    const body = z
+      .object({ to: z.string().email() })
+      .parse(req.body)
+    const v = await verifySmtp()
+    if (!v.ok) return reply.code(400).send({ error: v.error })
+    const r = await sendMail({
+      to: body.to,
+      subject: 'Reader — SMTP test message',
+      text: 'Your SMTP configuration works. This is an automated test email from Reader.',
+      html: '<p>Your SMTP configuration works.</p><p>This is an automated test email from Reader.</p>',
+    })
+    if (!r.ok) return reply.code(400).send({ error: r.error })
+    await audit({ actor: req.currentUser!.username, action: 'admin.smtp.test', meta: { to: body.to } })
+    return { ok: true, id: r.id }
+  })
+
+  // Look up absolute paths that match a folder name under common roots ($HOME,
+  // /Volumes). Used by the native folder picker — the browser only gives us the
+  // folder name from a webkitdirectory pick, never the absolute path, so we
+  // recover candidates server-side.
+  app.get('/api/admin/find-folder', async (req, reply) => {
+    const { name } = req.query as { name?: string }
+    const target = (name ?? '').trim()
+    if (!target) return reply.code(400).send({ error: 'name required' })
+    if (target.includes('/') || target === '.' || target === '..') {
+      return reply.code(400).send({ error: 'invalid folder name' })
+    }
+    const matches: string[] = []
+    const SKIP = new Set(['node_modules', 'Library', 'Trash', '.Trash'])
+    const walk = async (dir: string, depth: number): Promise<void> => {
+      if (depth <= 0 || matches.length >= 25) return
+      let entries
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of entries) {
+        if (matches.length >= 25) return
+        if (!e.isDirectory()) continue
+        if (e.name.startsWith('.')) continue
+        if (SKIP.has(e.name)) continue
+        const full = path.join(dir, e.name)
+        if (e.name === target) matches.push(full)
+        await walk(full, depth - 1)
+      }
+    }
+    const roots = [os.homedir(), '/Volumes']
+    for (const root of roots) {
+      await walk(root, 5)
+    }
+    return { matches }
+  })
+
+  // Browse server-side directories. Used by the workspace-settings folder
+  // picker to choose a new vault root.
+  app.get('/api/admin/browse', async (req, reply) => {
+    const { path: rel } = req.query as { path?: string }
+    const target = (rel && rel.trim()) || os.homedir()
+    if (!path.isAbsolute(target)) {
+      return reply.code(400).send({ error: 'absolute path required' })
+    }
+    const s = await stat(target).catch(() => null)
+    if (!s || !s.isDirectory()) {
+      return reply.code(404).send({ error: 'not found' })
+    }
+    let entries
+    try {
+      entries = await readdir(target, { withFileTypes: true })
+    } catch (e: any) {
+      return reply.code(403).send({ error: e?.message ?? 'cannot read directory' })
+    }
+    const dirs = entries
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => ({ name: e.name, path: path.join(target, e.name) }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+    const parent = path.dirname(target)
+    return {
+      current: target,
+      parent: parent === target ? null : parent,
+      home: os.homedir(),
+      entries: dirs,
+    }
+  })
+
+  // Persist a new data-dir override. A separate "anchor" file holds it (outside
+  // dataDir itself) so the server can read it at startup before any other path
+  // is derived. Takes effect on next restart — existing data is NOT migrated.
+  app.post('/api/admin/data-dir', async (req, reply) => {
+    const body = z.object({ dataDir: z.string() }).parse(req.body)
+    const target = body.dataDir.trim()
+    if (!target) {
+      // Clear the override → fall back to env / default on next restart.
+      try {
+        const { rm } = await import('node:fs/promises')
+        await rm(ANCHOR_PATH, { force: true })
+      } catch {}
+      await audit({ actor: req.currentUser!.username, action: 'admin.data-dir.reset' })
+      return { ok: true, dataDir: null, restartRequired: true }
+    }
+    if (!path.isAbsolute(target)) {
+      return reply.code(400).send({ error: 'absolute path required' })
+    }
+    const s = await stat(target).catch(() => null)
+    if (s && !s.isDirectory()) {
+      return reply.code(400).send({ error: 'path exists but is not a directory' })
+    }
+    if (!s) {
+      try {
+        await mkdir(target, { recursive: true })
+      } catch (e: any) {
+        return reply.code(400).send({ error: `cannot create directory: ${e?.message ?? e}` })
+      }
+    }
+    await mkdir(path.dirname(ANCHOR_PATH), { recursive: true })
+    await writeFile(ANCHOR_PATH, JSON.stringify({ dataDir: target }, null, 2), 'utf8')
+    await audit({ actor: req.currentUser!.username, action: 'admin.data-dir.set', meta: { dataDir: target } })
+    return { ok: true, dataDir: target, restartRequired: true }
+  })
+
+  app.get('/api/admin/system', async () => {
+    const ollamaUp = await isOllamaAvailable()
+    return {
+      vaultRoot: config.vault.root,
+      dataDir: config.dataDir,
+      ingest: {
+        maxFileBytes: config.ingest.maxFileBytes,
+        chunkChars: config.ingest.chunkChars,
+        chunkOverlap: config.ingest.chunkOverlap,
+      },
+      ollama: {
+        enabled: config.ollama.enabled,
+        baseUrl: config.ollama.baseUrl,
+        embedModel: config.ollama.embedModel,
+        available: ollamaUp,
+      },
+      storage: {
+        backend: config.storage.backend,
+        s3: {
+          endpoint: config.storage.s3.endpoint,
+          bucket: config.storage.s3.bucket,
+          accessKey: config.storage.s3.accessKey,
+          region: config.storage.s3.region,
+          forcePathStyle: config.storage.s3.forcePathStyle,
+        },
+      },
+      session: {
+        ttlDays: Math.round(config.session.ttlMs / (24 * 60 * 60 * 1000)),
+        cookieSecure: config.session.secure,
+        cookieSameSite: config.session.sameSite,
+      },
+      server: { host: config.server.host, port: config.server.port },
+      smtp: {
+        enabled: config.smtp.enabled,
+        host: config.smtp.host,
+        port: config.smtp.port,
+        user: config.smtp.user,
+        from: config.smtp.from,
+        secure: config.smtp.secure,
+        // never leak `pass`
+        passSet: !!config.smtp.pass,
+      },
+      // backward-compat field
+      maxFileBytes: config.ingest.maxFileBytes,
+    }
   })
 
   app.get('/api/admin/tokens', async () => {

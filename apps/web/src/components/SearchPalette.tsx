@@ -6,15 +6,15 @@ import {
   Sparkles,
   Type,
   FolderPlus,
+  Folder,
   Upload,
-  Move,
   CornerDownLeft,
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, ApiError, type SearchHit } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 
-type Mode = 'root' | 'new-folder' | 'move'
+type Mode = 'root' | 'new-folder'
 
 type Action = {
   id: string
@@ -40,6 +40,7 @@ export function SearchPalette({ open, onClose }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [activeIdx, setActiveIdx] = useState(0)
   const [busy, setBusy] = useState(false)
+  const [folderList, setFolderList] = useState<string[]>([])
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -59,6 +60,48 @@ export function SearchPalette({ open, onClose }: Props) {
     }
   }, [open, reset])
 
+  // Fetch the folder list once when the palette is opened; used by autocomplete
+  // in new-folder mode.
+  useEffect(() => {
+    if (!open) return
+    api.folders().then((r) => setFolderList(r.folders)).catch(() => setFolderList([]))
+  }, [open])
+
+  const folderMatches = useMemo(() => {
+    if (mode !== 'new-folder') return [] as string[]
+    const q = query.trim().toLowerCase()
+    const all = folderList
+    if (!q) return all.slice(0, 8)
+    return all.filter((f) => f.toLowerCase().includes(q)).slice(0, 8)
+  }, [mode, query, folderList])
+
+  // Reset cursor on the suggestion list when the query changes.
+  useEffect(() => {
+    if (mode === 'new-folder') setActiveIdx(0)
+  }, [mode, query])
+
+  // Refocus the input whenever the mode changes (e.g. user clicked an action
+  // with the mouse, which would otherwise leave focus on the button).
+  useEffect(() => {
+    if (!open) return
+    inputRef.current?.focus()
+  }, [open, mode])
+
+  // Escape handler — capture phase so we run BEFORE the browser's default
+  // "blur input" action on Escape. preventDefault then suppresses the blur.
+  useEffect(() => {
+    if (!open) return
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      e.stopImmediatePropagation()
+      if (mode !== 'root') reset()
+      else onClose()
+    }
+    window.addEventListener('keydown', onEsc, { capture: true })
+    return () => window.removeEventListener('keydown', onEsc, { capture: true })
+  }, [open, mode, reset, onClose])
+
   const submitNewFolder = useCallback(
     async (name: string) => {
       const clean = name.trim().replace(/^\/+|\/+$/g, '')
@@ -67,28 +110,6 @@ export function SearchPalette({ open, onClose }: Props) {
       setError(null)
       try {
         await api.mkdir(clean)
-        refresh()
-        onClose()
-      } catch (e) {
-        setError(e instanceof ApiError ? e.message : String(e))
-      } finally {
-        setBusy(false)
-      }
-    },
-    [refresh, onClose],
-  )
-
-  const submitMove = useCallback(
-    async (raw: string) => {
-      const parts = raw.split('->').map((s) => s.trim())
-      if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        setError('Format: <from-path> -> <to-path>')
-        return
-      }
-      setBusy(true)
-      setError(null)
-      try {
-        await api.move(parts[0], parts[1])
         refresh()
         onClose()
       } catch (e) {
@@ -124,19 +145,6 @@ export function SearchPalette({ open, onClose }: Props) {
         run: () => {
           triggerUpload()
           onClose()
-        },
-      },
-      {
-        id: 'move',
-        label: 'Move / rename file',
-        hint: 'change a file’s path',
-        icon: Move,
-        match: (q) => /^(move|mv|rename)/i.test(q.trim()),
-        run: () => {
-          setMode('move')
-          setQuery('')
-          setActiveIdx(0)
-          setError(null)
         },
       },
     ],
@@ -204,27 +212,31 @@ export function SearchPalette({ open, onClose }: Props) {
       : actions
   }, [actions, query, mode])
 
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Escape') {
-      e.preventDefault()
-      if (mode !== 'root') {
-        reset()
-      } else {
-        onClose()
-      }
-      return
-    }
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // Escape is handled by the capture-phase window listener above.
     if (mode === 'new-folder') {
       if (e.key === 'Enter') {
         e.preventDefault()
         submitNewFolder(query)
+        return
       }
-      return
-    }
-    if (mode === 'move') {
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        submitMove(query)
+      if (folderMatches.length > 0) {
+        if (e.key === 'Tab') {
+          e.preventDefault()
+          const pick = folderMatches[activeIdx] ?? folderMatches[0]
+          if (pick) setQuery(pick)
+          return
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault()
+          setActiveIdx((i) => Math.min(folderMatches.length - 1, i + 1))
+          return
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault()
+          setActiveIdx((i) => Math.max(0, i - 1))
+          return
+        }
       }
       return
     }
@@ -255,9 +267,7 @@ export function SearchPalette({ open, onClose }: Props) {
   const placeholder =
     mode === 'new-folder'
       ? 'Folder name (use "/" for nesting, e.g. notes/2026)'
-      : mode === 'move'
-      ? 'old/path.pdf -> new/path.pdf'
-      : 'Search vault, or type "new folder", "upload", "move"…'
+      : 'Search vault, or type "new folder" or "upload"…'
 
   return (
     <div
@@ -276,8 +286,6 @@ export function SearchPalette({ open, onClose }: Props) {
         >
           {mode === 'new-folder' ? (
             <FolderPlus size={15} className="text-accent shrink-0" />
-          ) : mode === 'move' ? (
-            <Move size={15} className="text-accent shrink-0" />
           ) : (
             <SearchIcon size={15} className="text-subtle shrink-0" />
           )}
@@ -307,16 +315,33 @@ export function SearchPalette({ open, onClose }: Props) {
           )}
 
           {mode === 'new-folder' && !error && (
-            <div className="px-4 py-3 text-[12.5px] text-muted flex items-center gap-2">
-              <CornerDownLeft size={12} /> Press Enter to create. Use <code>/</code> for nesting.
-            </div>
+            <>
+              <div className="px-4 py-2.5 text-[11.5px] text-muted flex items-center gap-2">
+                <CornerDownLeft size={11} /> <span>Enter to create · Tab to autocomplete · ↑↓ to pick</span>
+              </div>
+              {folderMatches.length > 0 && (
+                <Section title="Existing folders">
+                  {folderMatches.map((f, i) => (
+                    <div
+                      key={f}
+                      data-pos={i}
+                      onMouseEnter={() => setActiveIdx(i)}
+                      onClick={() => {
+                        setQuery(f)
+                        inputRef.current?.focus()
+                      }}
+                      className="px-3 py-1.5 mx-1 rounded cursor-pointer flex items-center gap-2"
+                      style={{ background: activeIdx === i ? 'var(--selected)' : 'transparent' }}
+                    >
+                      <Folder size={13} className="text-accent shrink-0" />
+                      <span className="text-[12.5px] text-fg truncate">{f}</span>
+                    </div>
+                  ))}
+                </Section>
+              )}
+            </>
           )}
 
-          {mode === 'move' && !error && (
-            <div className="px-4 py-3 text-[12.5px] text-muted flex items-center gap-2">
-              <CornerDownLeft size={12} /> Format: <code>from/path -&gt; to/path</code>. Enter to confirm.
-            </div>
-          )}
 
           {mode === 'root' && (
             <>

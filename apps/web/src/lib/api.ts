@@ -1,10 +1,18 @@
 export type Role = 'admin' | 'editor' | 'viewer'
 
+export type Grant = {
+  path: string
+  read: boolean
+  write: boolean
+  create: boolean
+}
+
 export type PublicUser = {
   username: string
   role: Role
   createdAt: number
   disabled?: boolean
+  grants?: Grant[]
 }
 
 export type IngestStatus = 'pending' | 'extracting' | 'embedding' | 'ready' | 'failed' | 'no-text'
@@ -63,6 +71,82 @@ export type SearchHit = {
   source: 'lexical' | 'semantic' | 'hybrid'
 }
 
+export type WorkspaceSettings = {
+  allowOpenSignup: boolean
+  vaultRoot?: string
+  defaultGrants?: Grant[]
+  ingest?: {
+    maxFileBytes?: number
+    chunkChars?: number
+    chunkOverlap?: number
+  }
+  ollama?: {
+    enabled?: boolean
+    baseUrl?: string
+    embedModel?: string
+  }
+  storage?: {
+    backend?: 'local' | 's3'
+    s3?: {
+      endpoint?: string
+      bucket?: string
+      accessKey?: string
+      secretKey?: string
+      region?: string
+      forcePathStyle?: boolean
+    }
+  }
+  session?: {
+    ttlDays?: number
+    cookieSecure?: boolean
+    cookieSameSite?: 'lax' | 'strict' | 'none'
+  }
+  server?: {
+    host?: string
+    port?: number
+  }
+  smtp?: {
+    enabled?: boolean
+    host?: string
+    port?: number
+    user?: string
+    pass?: string
+    from?: string
+    secure?: boolean
+  }
+}
+
+export type SystemInfo = {
+  vaultRoot: string
+  dataDir: string
+  /** Back-compat: same as ingest.maxFileBytes */
+  maxFileBytes: number
+  ingest: { maxFileBytes: number; chunkChars: number; chunkOverlap: number }
+  ollama: { enabled: boolean; baseUrl: string; embedModel: string; available: boolean }
+  storage: {
+    backend: 'local' | 's3'
+    s3: {
+      endpoint: string
+      bucket: string
+      accessKey: string
+      region: string
+      forcePathStyle: boolean
+    }
+  }
+  session: { ttlDays: number; cookieSecure: boolean; cookieSameSite: 'lax' | 'strict' | 'none' }
+  server: { host: string; port: number }
+  smtp: {
+    enabled: boolean
+    host: string
+    port: number
+    user: string
+    from: string
+    secure: boolean
+    /** True when a password is stored on the server (never exposed). */
+    passSet: boolean
+  }
+}
+
 export type ApiTokenInfo = {
   id: string
   name: string
@@ -109,7 +193,7 @@ const q = (params: Record<string, string | number | undefined>): string => {
 
 export const api = {
   // bootstrap / auth
-  bootstrap: () => get<{ hasAdmin: boolean }>('/api/bootstrap'),
+  bootstrap: () => get<{ hasAdmin: boolean; allowOpenSignup: boolean }>('/api/bootstrap'),
   me: () => get<{ user: PublicUser }>('/api/auth/me'),
   signup: (username: string, password: string) =>
     post<{ user: PublicUser }>('/api/auth/signup', { username, password }),
@@ -120,6 +204,8 @@ export const api = {
   // vault — all paths are vault-relative ("" = root)
   home: () => get<{ vault: string; separator: string }>('/api/home'),
   list: (rel: string) => get<{ path: string; items: VaultNode[] }>(`/api/list${q({ path: rel })}`),
+  folders: () => get<{ folders: string[] }>('/api/folders'),
+  vaultTree: () => get<{ folders: string[]; files: string[] }>('/api/vault-tree'),
   fileText: (rel: string) =>
     get<{ path: string; content: string; size: number; mtime: number; docId?: string }>(
       `/api/file/text${q({ path: rel })}`,
@@ -164,8 +250,47 @@ export const api = {
   searchKnowledge: (qstr: string, limit = 20) =>
     get<{ query: string; hits: SearchHit[] }>(`/api/search/knowledge${q({ q: qstr, limit })}`),
 
-  // admin
+  // admin — users
   adminUsers: () => get<{ users: PublicUser[] }>('/api/admin/users'),
+  adminCreateUser: (username: string, password: string, role: Role, grants?: Grant[]) =>
+    post<{ user: PublicUser }>('/api/admin/users', { username, password, role, grants }),
+  adminPatchUser: (
+    username: string,
+    patch: { role?: Role; disabled?: boolean; grants?: Grant[] },
+  ) =>
+    request<{ user: PublicUser }>('PATCH', `/api/admin/users/${encodeURIComponent(username)}`, patch),
+  adminDeleteUser: (username: string) =>
+    fetch(`/api/admin/users/${encodeURIComponent(username)}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    }).then(async (r) => {
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}))
+        throw new ApiError(r.status, data?.error || `HTTP ${r.status}`)
+      }
+      return r.json() as Promise<{ ok: true }>
+    }),
+
+  // admin — workspace settings & system info
+  adminSettings: () => get<{ settings: WorkspaceSettings }>('/api/admin/settings'),
+  adminPatchSettings: (patch: Partial<WorkspaceSettings>) =>
+    request<{ settings: WorkspaceSettings; restartRequired: boolean }>('PATCH', '/api/admin/settings', patch),
+  adminSystem: () => get<SystemInfo>('/api/admin/system'),
+  adminBrowse: (absPath?: string) =>
+    get<{
+      current: string
+      parent: string | null
+      home: string
+      entries: { name: string; path: string }[]
+    }>(`/api/admin/browse${q({ path: absPath })}`),
+  adminFindFolder: (name: string) =>
+    get<{ matches: string[] }>(`/api/admin/find-folder${q({ name })}`),
+  adminSetDataDir: (dataDir: string) =>
+    post<{ ok: true; dataDir: string | null; restartRequired: true }>('/api/admin/data-dir', { dataDir }),
+  adminTestSmtp: (to: string) =>
+    post<{ ok: true; id: string }>('/api/admin/smtp/test', { to }),
+
+  // admin — tokens
   adminTokens: () => get<{ tokens: ApiTokenInfo[] }>('/api/admin/tokens'),
   adminCreateToken: (name: string, role: Role) =>
     post<{ secret: string; token: ApiTokenInfo }>('/api/admin/tokens', { name, role }),

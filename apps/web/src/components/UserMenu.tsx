@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { LogOut, Shield, User as UserIcon, Settings } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import type { PublicUser } from '../lib/api'
 
 type Props = {
   user: PublicUser
   onLogout: () => void
-  onOpenAdmin: () => void
 }
 
-export function UserMenu({ user, onLogout, onOpenAdmin }: Props) {
+export function UserMenu({ user, onLogout }: Props) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
+  const navigate = useNavigate()
   const isAdmin = user.role === 'admin'
 
   useEffect(() => {
@@ -49,7 +50,7 @@ export function UserMenu({ user, onLogout, onOpenAdmin }: Props) {
               className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
               onClick={() => {
                 setOpen(false)
-                onOpenAdmin()
+                navigate('/settings')
               }}
             >
               <Settings size={13} className="text-muted" />

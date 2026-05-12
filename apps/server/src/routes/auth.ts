@@ -4,7 +4,9 @@ import { config } from '../config.js'
 import { hashPassword, verifyPassword } from '../services/auth.js'
 import { audit } from '../stores/audit.js'
 import { createSession, deleteSession } from '../stores/sessions.js'
+import { loadSettings } from '../stores/settings.js'
 import { getUser, isValidUsername, saveUser, userCount } from '../stores/users.js'
+import { ROLE_PRESETS, sanitizeGrants } from '../lib/grants.js'
 import type { User } from '../types.js'
 
 const credSchema = z.object({
@@ -19,8 +21,9 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'invalid username (lowercase letters, digits, . _ -; must start and end alphanumeric)' })
     }
     const existingCount = await userCount()
-    if (existingCount > 0 && !config.signup.allowOpen) {
-      // After the first user, signup is locked. Invitations come in M6.
+    const settings = await loadSettings()
+    if (existingCount > 0 && !settings.allowOpenSignup) {
+      // After the first user, signup is locked unless an admin re-opened it.
       return reply.code(403).send({ error: 'open signup disabled; ask an admin for an invitation' })
     }
     const existing = await getUser(username)
@@ -29,11 +32,18 @@ export async function authRoutes(app: FastifyInstance) {
     }
     const passwordHash = await hashPassword(password)
     const role: User['role'] = existingCount === 0 ? 'admin' : 'viewer'
+    const grants =
+      role === 'admin'
+        ? ROLE_PRESETS.admin
+        : settings.defaultGrants?.length
+        ? sanitizeGrants(settings.defaultGrants)
+        : ROLE_PRESETS[role]
     const user: User = {
       username,
       passwordHash,
       role,
       createdAt: Date.now(),
+      grants,
     }
     await saveUser(user)
     const session = await createSession(username)

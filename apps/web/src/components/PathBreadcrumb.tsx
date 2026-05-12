@@ -14,13 +14,15 @@ type Props = {
   dir: string
   /** When rendering a file's location, pass the filename — shown as the active non-clickable crumb. */
   currentName?: string
+  /** Optional inline element rendered right after `currentName` (e.g. info button). */
+  currentAction?: React.ReactNode
   /** Click on a crumb or the Vault link. */
   onNavigate: (dir: string) => void
   /** Click on the back chevron. Disabled if omitted. */
   onBack?: () => void
 }
 
-export function PathBreadcrumb({ dir, currentName, onNavigate, onBack }: Props) {
+export function PathBreadcrumb({ dir, currentName, currentAction, onNavigate, onBack }: Props) {
   const parts = dir
     ? dir.split('/').filter(Boolean).map((name, idx, arr) => ({
         name,
@@ -67,6 +69,7 @@ export function PathBreadcrumb({ dir, currentName, onNavigate, onBack }: Props) 
             <FileIcon name={currentName} />
             <span className="truncate">{currentName}</span>
           </span>
+          {currentAction}
         </span>
       )}
     </div>

@@ -11,6 +11,7 @@ import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
+import { FileInfoButton } from './FileInfoButton'
 
 type Props = {
   path: string
@@ -133,7 +134,8 @@ export function PathViewer({ path }: Props) {
     el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
-  const needsReindex = !!meta && meta.ingest.status === 'ready' && !meta.ingest.embedded
+  const needsReindex = !!meta && !meta.ingest.embedded
+  const reindexLabel = meta?.ingest.status === 'ready' ? 'Re-index' : 'Index'
 
   const [visibilityBusy, setVisibilityBusy] = useState(false)
   const toggleVisibility = async () => {
@@ -155,42 +157,32 @@ export function PathViewer({ path }: Props) {
         <PathBreadcrumb
           dir={parentDir}
           currentName={filename}
+          currentAction={<FileInfoButton path={path} meta={meta} />}
           onNavigate={goToFolder}
           onBack={() => goToFolder(parentDir)}
         />
         <div className="flex-1" />
-        {meta?.ingest?.embedded ? (
-          <span className="text-[11.5px] inline-flex items-center gap-1" style={{ color: '#00875A' }}>
-            <Sparkles size={11} /> indexed · {meta.ingest.chunkCount}
-          </span>
-        ) : meta?.ingest?.status === 'ready' ? (
-          <span className="text-[11.5px] text-muted inline-flex items-center gap-1">
-            text-only · {meta.ingest.chunkCount}
-          </span>
-        ) : null}
         {needsReindex && (
           <button
             className="btn-ghost"
             disabled={indexing}
             onClick={indexNow}
-            title="Re-run extraction + embedding so this file is fully searchable"
+            title="Run extraction + embedding so this file is searchable"
           >
             {indexing ? <RefreshCw size={13} className="animate-spin" /> : <Sparkles size={13} />}
-            {indexing ? 'Indexing…' : 'Re-index'}
+            {indexing ? 'Indexing…' : reindexLabel}
           </button>
         )}
-        {meta && (
-          <button
-            className="btn-ghost"
-            disabled={visibilityBusy}
-            onClick={toggleVisibility}
-            title={meta.public ? 'Make private (requires auth)' : 'Make public (anyone with link can view)'}
-            style={meta.public ? { color: '#00875A' } : undefined}
-          >
-            {meta.public ? <Globe size={13} /> : <Lock size={13} />}
-            {meta.public ? 'Public' : 'Private'}
-          </button>
-        )}
+        <button
+          className="btn-ghost"
+          disabled={visibilityBusy}
+          onClick={toggleVisibility}
+          title={meta?.public ? 'Make private (requires auth)' : 'Make public (anyone with link can view)'}
+          style={meta?.public ? { color: '#00875A' } : undefined}
+        >
+          {meta?.public ? <Globe size={13} /> : <Lock size={13} />}
+          {meta?.public ? 'Public' : 'Private'}
+        </button>
         <a className="btn-ghost" href={api.rawUrl(path)} download={filename}>
           <Download size={14} />
           Download
