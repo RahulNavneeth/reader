@@ -1,20 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Search as SearchIcon,
   Loader2,
   FileText,
   Sparkles,
   Type,
   FolderPlus,
-  Folder,
   Upload,
   CornerDownLeft,
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, ApiError, type SearchHit } from '../lib/api'
 import { useVault } from '../lib/vault-context'
-
-type Mode = 'root' | 'new-folder'
 
 type Action = {
   id: string
@@ -27,98 +23,73 @@ type Action = {
 
 type Props = {
   open: boolean
+  query: string
   onClose: () => void
+  /** Ref to the header input so click-outside knows to ignore it. */
+  inputRef: React.RefObject<HTMLInputElement>
 }
 
-export function SearchPalette({ open, onClose }: Props) {
+export function SearchPalette({ open, query, onClose, inputRef }: Props) {
   const navigate = useNavigate()
-  const { triggerUpload, refresh } = useVault()
-  const [mode, setMode] = useState<Mode>('root')
-  const [query, setQuery] = useState('')
+  const { triggerUpload, triggerNewFolder } = useVault()
   const [hits, setHits] = useState<SearchHit[] | null>(null)
+  // The query string that actually produced the current `hits`. We render
+  // against this — not the live `query` — so the dropdown stays on the last
+  // settled state until a fresh search completes. No mid-typing flicker.
+  const [settledQuery, setSettledQuery] = useState('')
   const [searching, setSearching] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [activeIdx, setActiveIdx] = useState(0)
-  const [busy, setBusy] = useState(false)
-  const [folderList, setFolderList] = useState<string[]>([])
-  const inputRef = useRef<HTMLInputElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
-  const reset = useCallback(() => {
-    setMode('root')
-    setQuery('')
-    setHits(null)
-    setActiveIdx(0)
-    setError(null)
-    setBusy(false)
-  }, [])
-
-  useEffect(() => {
-    if (open) {
-      reset()
-      setTimeout(() => inputRef.current?.focus(), 0)
-    }
-  }, [open, reset])
-
-  // Fetch the folder list once when the palette is opened; used by autocomplete
-  // in new-folder mode.
+  // Reset transient state whenever the palette opens.
   useEffect(() => {
     if (!open) return
-    api.folders().then((r) => setFolderList(r.folders)).catch(() => setFolderList([]))
+    setHits(null)
+    setSettledQuery('')
+    setError(null)
+    setActiveIdx(0)
   }, [open])
 
-  const folderMatches = useMemo(() => {
-    if (mode !== 'new-folder') return [] as string[]
-    const q = query.trim().toLowerCase()
-    const all = folderList
-    if (!q) return all.slice(0, 8)
-    return all.filter((f) => f.toLowerCase().includes(q)).slice(0, 8)
-  }, [mode, query, folderList])
-
-  // Reset cursor on the suggestion list when the query changes.
-  useEffect(() => {
-    if (mode === 'new-folder') setActiveIdx(0)
-  }, [mode, query])
-
-  // Refocus the input whenever the mode changes (e.g. user clicked an action
-  // with the mouse, which would otherwise leave focus on the button).
+  // Debounced live search.
   useEffect(() => {
     if (!open) return
-    inputRef.current?.focus()
-  }, [open, mode])
-
-  // Escape handler — capture phase so we run BEFORE the browser's default
-  // "blur input" action on Escape. preventDefault then suppresses the blur.
-  useEffect(() => {
-    if (!open) return
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
-      e.preventDefault()
-      e.stopImmediatePropagation()
-      if (mode !== 'root') reset()
-      else onClose()
+    if (!query.trim()) {
+      setHits(null)
+      setSettledQuery('')
+      setSearching(false)
+      return
     }
-    window.addEventListener('keydown', onEsc, { capture: true })
-    return () => window.removeEventListener('keydown', onEsc, { capture: true })
-  }, [open, mode, reset, onClose])
-
-  const submitNewFolder = useCallback(
-    async (name: string) => {
-      const clean = name.trim().replace(/^\/+|\/+$/g, '')
-      if (!clean) return
-      setBusy(true)
-      setError(null)
+    let cancel = false
+    setSearching(true)
+    const t = setTimeout(async () => {
       try {
-        await api.mkdir(clean)
-        refresh()
-        onClose()
+        const r = await api.searchKnowledge(query.trim(), 20)
+        if (!cancel) {
+          setHits(r.hits)
+          setSettledQuery(query.trim())
+          setActiveIdx(0)
+        }
       } catch (e) {
-        setError(e instanceof ApiError ? e.message : String(e))
+        if (!cancel) setError(e instanceof ApiError ? e.message : String(e))
       } finally {
-        setBusy(false)
+        if (!cancel) setSearching(false)
       }
+    }, 180)
+    return () => {
+      cancel = true
+      clearTimeout(t)
+    }
+  }, [query, open])
+
+  const openHit = useCallback(
+    (hit: SearchHit) => {
+      const href = '/docs/' + hit.path.split('/').map(encodeURIComponent).join('/')
+      navigate(href)
+      onClose()
     },
-    [refresh, onClose],
+    [navigate, onClose],
   )
 
   const actions: Action[] = useMemo(
@@ -130,10 +101,8 @@ export function SearchPalette({ open, onClose }: Props) {
         icon: FolderPlus,
         match: (q) => /^(new|folder|mkdir|create)/i.test(q.trim()),
         run: () => {
-          setMode('new-folder')
-          setQuery('')
-          setActiveIdx(0)
-          setError(null)
+          triggerNewFolder()
+          onClose()
         },
       },
       {
@@ -148,262 +117,160 @@ export function SearchPalette({ open, onClose }: Props) {
         },
       },
     ],
-    [triggerUpload, onClose],
+    [triggerNewFolder, triggerUpload, onClose],
   )
 
-  // Search effect — only in 'root' mode
-  useEffect(() => {
-    if (!open || mode !== 'root') {
-      setHits(null)
-      setSearching(false)
-      return
-    }
-    if (!query.trim()) {
-      setHits(null)
-      setSearching(false)
-      return
-    }
-    let cancel = false
-    setSearching(true)
-    const t = setTimeout(async () => {
-      try {
-        const r = await api.searchKnowledge(query.trim(), 20)
-        if (!cancel) {
-          setHits(r.hits)
-          setActiveIdx(0)
-        }
-      } catch (e) {
-        if (!cancel) setError(e instanceof ApiError ? e.message : String(e))
-      } finally {
-        if (!cancel) setSearching(false)
-      }
-    }, 180)
-    return () => {
-      cancel = true
-      clearTimeout(t)
-    }
-  }, [query, open, mode])
+  // Show actions until we have settled hits to display. That covers two cases:
+  //   1. Initial open with no query → actions are the only useful thing to show.
+  //   2. User just started typing, first search still in flight (hits is null)
+  //      → keep actions visible instead of leaving the dropdown empty.
+  // Once `hits` is populated, the dropdown is purely results.
+  const visibleActions = hits != null ? [] : actions
 
-  const openHit = useCallback(
-    (hit: SearchHit) => {
-      const href = '/docs/' + hit.path.split('/').map(encodeURIComponent).join('/')
-      navigate(href)
-      onClose()
-    },
-    [navigate, onClose],
-  )
-
-  // Compose the flat list the user navigates with arrow keys
+  // Flat list for keyboard navigation: actions first, then hits.
   const flat = useMemo(() => {
-    if (mode !== 'root') return [] as Array<{ kind: 'action' | 'hit'; idx: number }>
     const out: Array<{ kind: 'action' | 'hit'; idx: number }> = []
-    const visibleActions = query.trim()
-      ? actions.filter((a) => a.match(query) || a.label.toLowerCase().includes(query.trim().toLowerCase()))
-      : actions
     visibleActions.forEach((_, i) => out.push({ kind: 'action', idx: i }))
     if (hits) hits.forEach((_, i) => out.push({ kind: 'hit', idx: i }))
     return out
-  }, [actions, hits, query, mode])
+  }, [visibleActions, hits])
 
-  const visibleActions = useMemo(() => {
-    if (mode !== 'root') return []
-    return query.trim()
-      ? actions.filter((a) => a.match(query) || a.label.toLowerCase().includes(query.trim().toLowerCase()))
-      : actions
-  }, [actions, query, mode])
+  // Clamp activeIdx whenever the list changes.
+  useEffect(() => {
+    setActiveIdx((i) => Math.min(Math.max(0, i), Math.max(0, flat.length - 1)))
+  }, [flat.length])
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Escape is handled by the capture-phase window listener above.
-    if (mode === 'new-folder') {
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        submitNewFolder(query)
-        return
-      }
-      if (folderMatches.length > 0) {
-        if (e.key === 'Tab') {
-          e.preventDefault()
-          const pick = folderMatches[activeIdx] ?? folderMatches[0]
-          if (pick) setQuery(pick)
-          return
-        }
-        if (e.key === 'ArrowDown') {
-          e.preventDefault()
-          setActiveIdx((i) => Math.min(folderMatches.length - 1, i + 1))
-          return
-        }
-        if (e.key === 'ArrowUp') {
-          e.preventDefault()
-          setActiveIdx((i) => Math.max(0, i - 1))
-          return
-        }
-      }
-      return
-    }
-    if (flat.length === 0) return
-    if (e.key === 'ArrowDown') {
-      e.preventDefault()
-      setActiveIdx((i) => Math.min(flat.length - 1, i + 1))
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault()
-      setActiveIdx((i) => Math.max(0, i - 1))
-    } else if (e.key === 'Enter') {
-      e.preventDefault()
-      const pick = flat[activeIdx]
-      if (!pick) return
-      if (pick.kind === 'action') visibleActions[pick.idx]?.run()
-      else if (hits) openHit(hits[pick.idx])
-    }
-  }
-
+  // Keep active row in view.
   useEffect(() => {
     if (!listRef.current) return
     const el = listRef.current.querySelector<HTMLElement>(`[data-pos="${activeIdx}"]`)
     el?.scrollIntoView({ block: 'nearest' })
   }, [activeIdx])
 
-  if (!open) return null
+  // Window keydown — handles Esc, arrows, Enter while the palette is open. The
+  // header input keeps focus the whole time; we just listen at the window level
+  // so the same shortcuts work regardless of which element is technically
+  // active.
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onClose()
+        return
+      }
+      if (flat.length === 0) return
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setActiveIdx((i) => Math.min(flat.length - 1, i + 1))
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setActiveIdx((i) => Math.max(0, i - 1))
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        const pick = flat[activeIdx]
+        if (!pick) return
+        if (pick.kind === 'action') visibleActions[pick.idx]?.run()
+        else if (hits) openHit(hits[pick.idx])
+      }
+    }
+    window.addEventListener('keydown', onKey, { capture: true })
+    return () => window.removeEventListener('keydown', onKey, { capture: true })
+  }, [open, flat, activeIdx, visibleActions, hits, openHit, onClose])
 
-  const placeholder =
-    mode === 'new-folder'
-      ? 'Folder name (use "/" for nesting, e.g. notes/2026)'
-      : 'Search vault, or type "new folder" or "upload"…'
+  // Click-outside: anything that's neither the header input nor the dropdown.
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node | null
+      if (!t) return
+      if (rootRef.current?.contains(t)) return
+      if (inputRef.current?.contains(t)) return
+      onClose()
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [open, onClose, inputRef])
+
+  if (!open) return null
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh] px-4"
-      style={{ background: 'rgba(9, 30, 66, 0.42)' }}
-      onClick={onClose}
+      ref={rootRef}
+      className="absolute top-full left-0 right-0 mt-1.5 z-50 rounded-md overflow-hidden"
+      style={{
+        background: 'var(--panel)',
+        border: '1px solid var(--border)',
+        boxShadow: '0 8px 24px -8px rgba(9,30,66,0.18)',
+        maxHeight: '70vh',
+      }}
     >
-      <div
-        className="w-full max-w-[640px] rounded-lg shadow-card overflow-hidden flex flex-col"
-        style={{ background: 'var(--panel)', maxHeight: '70vh' }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div
-          className="flex items-center gap-2.5 px-4 h-12 border-b shrink-0"
-          style={{ borderColor: 'var(--border-soft)' }}
-        >
-          {mode === 'new-folder' ? (
-            <FolderPlus size={15} className="text-accent shrink-0" />
-          ) : (
-            <SearchIcon size={15} className="text-subtle shrink-0" />
-          )}
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={onKeyDown}
-            placeholder={placeholder}
-            className="flex-1 bg-transparent outline-none text-[14px] text-fg placeholder:text-subtle"
-            disabled={busy}
-          />
-          {(searching || busy) && <Loader2 size={14} className="animate-spin text-subtle" />}
-          <kbd
-            className="text-[10.5px] px-1.5 py-0.5 rounded font-mono shrink-0"
-            style={{ background: 'var(--panel-2)', color: 'var(--fg-subtle)', border: '1px solid var(--border-soft)' }}
-          >
-            esc
-          </kbd>
-        </div>
+      <div ref={listRef} className="overflow-y-auto" style={{ maxHeight: '70vh' }}>
+        {error && (
+          <div className="px-4 py-3 text-[12.5px]" style={{ color: '#BF2600' }}>
+            {error}
+          </div>
+        )}
 
-        <div ref={listRef} className="flex-1 overflow-y-auto py-1">
-          {error && (
-            <div className="px-4 py-3 text-[12.5px]" style={{ color: '#BF2600' }}>
-              {error}
-            </div>
-          )}
-
-          {mode === 'new-folder' && !error && (
-            <>
-              <div className="px-4 py-2.5 text-[11.5px] text-muted flex items-center gap-2">
-                <CornerDownLeft size={11} /> <span>Enter to create · Tab to autocomplete · ↑↓ to pick</span>
-              </div>
-              {folderMatches.length > 0 && (
-                <Section title="Existing folders">
-                  {folderMatches.map((f, i) => (
-                    <div
-                      key={f}
-                      data-pos={i}
-                      onMouseEnter={() => setActiveIdx(i)}
-                      onClick={() => {
-                        setQuery(f)
-                        inputRef.current?.focus()
-                      }}
-                      className="px-3 py-1.5 mx-1 rounded cursor-pointer flex items-center gap-2"
-                      style={{ background: activeIdx === i ? 'var(--selected)' : 'transparent' }}
-                    >
-                      <Folder size={13} className="text-accent shrink-0" />
-                      <span className="text-[12.5px] text-fg truncate">{f}</span>
-                    </div>
-                  ))}
-                </Section>
-              )}
-            </>
-          )}
-
-
-          {mode === 'root' && (
-            <>
-              {visibleActions.length > 0 && (
-                <Section title="Actions">
-                  {visibleActions.map((a, i) => {
-                    const pos = i
-                    const Icon = a.icon
-                    return (
-                      <div
-                        key={a.id}
-                        data-pos={pos}
-                        onMouseEnter={() => setActiveIdx(pos)}
-                        onClick={() => a.run()}
-                        className="px-3 py-2 mx-1 rounded cursor-pointer flex items-center gap-2.5"
-                        style={{ background: activeIdx === pos ? 'var(--selected)' : 'transparent' }}
-                      >
-                        <Icon size={14} className="text-accent shrink-0" />
-                        <div className="flex-1 text-[13px] text-fg">{a.label}</div>
-                        {a.hint && <div className="text-[11px] text-subtle">{a.hint}</div>}
-                      </div>
-                    )
-                  })}
-                </Section>
-              )}
-
-              {!error && query.trim() && hits != null && hits.length === 0 && !searching && (
-                <div className="px-4 py-6 text-center text-[12.5px] text-subtle">
-                  No matches for <span className="text-fg">{query}</span>.
+        {visibleActions.length > 0 && (
+          <Section title="Actions">
+            {visibleActions.map((a, i) => {
+              const pos = i
+              const Icon = a.icon
+              return (
+                <div
+                  key={a.id}
+                  data-pos={pos}
+                  onMouseEnter={() => setActiveIdx(pos)}
+                  onClick={() => a.run()}
+                  className="px-3 py-2 mx-1 rounded cursor-pointer flex items-center gap-2.5"
+                  style={{ background: activeIdx === pos ? 'var(--selected)' : 'transparent' }}
+                >
+                  <Icon size={14} className="text-accent shrink-0" />
+                  <div className="flex-1 text-[13px] text-fg">{a.label}</div>
+                  {a.hint && <div className="text-[11px] text-subtle">{a.hint}</div>}
                 </div>
-              )}
+              )
+            })}
+          </Section>
+        )}
 
-              {!error && hits && hits.length > 0 && (
-                <Section title="Search results">
-                  {hits.map((h, i) => {
-                    const pos = visibleActions.length + i
-                    return (
-                      <HitRow
-                        key={h.docId + (h.chunkIdx ?? 0)}
-                        hit={h}
-                        active={activeIdx === pos}
-                        pos={pos}
-                        onHover={() => setActiveIdx(pos)}
-                        onClick={() => openHit(h)}
-                      />
-                    )
-                  })}
-                </Section>
-              )}
+        {!error && settledQuery && hits != null && hits.length === 0 && (
+          <div className="px-4 py-6 text-center text-[12.5px] text-subtle">
+            No matches for <span className="text-fg">{settledQuery}</span>.
+          </div>
+        )}
 
-              {!error && !query.trim() && (
-                <div className="px-4 py-3 text-[11.5px] text-subtle">
-                  <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↑</kbd>{' '}
-                  <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↓</kbd>{' '}
-                  to navigate ·{' '}
-                  <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↵</kbd>{' '}
-                  to run · type to search documents
-                </div>
-              )}
-            </>
-          )}
-        </div>
+        {!error && hits && hits.length > 0 && (
+          <Section title="Search results">
+            {hits.map((h, i) => {
+              const pos = visibleActions.length + i
+              return (
+                <HitRow
+                  key={h.docId + (h.chunkIdx ?? 0)}
+                  hit={h}
+                  active={activeIdx === pos}
+                  pos={pos}
+                  onHover={() => setActiveIdx(pos)}
+                  onClick={() => openHit(h)}
+                />
+              )
+            })}
+          </Section>
+        )}
+
+        {!error && hits == null && (
+          <div className="px-4 py-3 text-[11.5px] text-subtle flex items-center gap-2 border-t" style={{ borderColor: 'var(--border-soft)' }}>
+            <CornerDownLeft size={11} />
+            <span>
+              <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↑</kbd>{' '}
+              <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↓</kbd>{' '}
+              navigate ·{' '}
+              <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↵</kbd>{' '}
+              run · {searching ? <Loader2 size={11} className="inline animate-spin" /> : 'type to search'}
+            </span>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -450,10 +317,7 @@ function HitRow({
         </span>
         <SourceIcon size={11} className="text-subtle shrink-0" />
       </div>
-      <div
-        className="text-[11.5px] text-muted ml-[19px] truncate"
-        title={hit.snippet}
-      >
+      <div className="text-[11.5px] text-muted ml-[19px] truncate" title={hit.snippet}>
         {hit.snippet}
       </div>
     </div>

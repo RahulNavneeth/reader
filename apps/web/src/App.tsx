@@ -22,12 +22,14 @@ export default function App() {
   const { theme, toggle } = useTheme()
   const [auth, setAuth] = useState<AuthState>({ status: 'loading' })
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
   const [refreshNonce, setRefreshNonce] = useState(0)
   const [uploadingName, setUploadingName] = useState<string | null>(null)
   const [vaultError, setVaultError] = useState<string | null>(null)
   const [pendingFiles, setPendingFiles] = useState<File[] | null>(null)
   const [currentFolder, setCurrentFolder] = useState<string>('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
   const location = useLocation()
 
   useEffect(() => {
@@ -35,7 +37,9 @@ export default function App() {
       const isMod = e.metaKey || e.ctrlKey
       if (isMod && (e.key === 'k' || e.key === 'K')) {
         e.preventDefault()
-        setPaletteOpen((v) => !v)
+        setPaletteOpen(true)
+        // Defer so the input is mounted/visible before we focus it.
+        setTimeout(() => searchInputRef.current?.focus(), 0)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -165,26 +169,52 @@ export default function App() {
 
           <div className="flex-1" />
 
+          <div className="relative z-50 w-[640px] max-w-full">
+            <SearchIcon
+              size={13}
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-subtle pointer-events-none"
+            />
+            <input
+              ref={searchInputRef}
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value)
+                if (!paletteOpen) setPaletteOpen(true)
+              }}
+              onFocus={() => setPaletteOpen(true)}
+              placeholder="Search vault, or type &quot;new folder&quot; or &quot;upload&quot;…"
+              className="w-full h-8 pl-8 pr-12 rounded text-[12.5px] text-fg placeholder:text-subtle outline-none transition-colors"
+              style={{
+                background: 'var(--bg)',
+                border: '1px solid var(--border-soft)',
+              }}
+            />
+            <kbd
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] px-1 py-0.5 rounded font-mono shrink-0 pointer-events-none"
+              style={{
+                background: 'var(--panel)',
+                color: 'var(--fg-subtle)',
+                border: '1px solid var(--border-soft)',
+              }}
+            >
+              ⌘K
+            </kbd>
+            <SearchPalette
+              open={paletteOpen}
+              query={searchQuery}
+              onClose={() => setPaletteOpen(false)}
+              inputRef={searchInputRef}
+            />
+          </div>
+
+          <div className="flex-1" />
+
           {uploadingName && (
             <span className="text-[12px] text-muted inline-flex items-center gap-1.5 mr-1">
               <Loader2 size={12} className="animate-spin text-accent" />
               <span className="truncate max-w-[180px]">{uploadingName}</span>
             </span>
           )}
-
-          <button
-            className="btn-ghost inline-flex items-center gap-1.5 pr-2"
-            onClick={() => setPaletteOpen(true)}
-            title="Open command palette (⌘K)"
-          >
-            <SearchIcon size={13} />
-            <kbd
-              className="text-[10px] px-1 py-0.5 rounded font-mono"
-              style={{ background: 'var(--panel)', color: 'var(--fg-subtle)', border: '1px solid var(--border-soft)' }}
-            >
-              ⌘K
-            </kbd>
-          </button>
 
           <input
             ref={fileInputRef}
@@ -211,7 +241,14 @@ export default function App() {
           <Route path="*" element={<VaultView />} />
         </Routes>
 
-        <SearchPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+        {paletteOpen && (
+          <div
+            className="fixed inset-0 z-40"
+            style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+            onClick={() => setPaletteOpen(false)}
+          />
+        )}
+
         {pendingFiles && (
           <UploadDialog
             files={pendingFiles}
