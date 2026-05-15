@@ -628,7 +628,13 @@ export async function vaultRoutes(app: FastifyInstance) {
       ingest: { status: 'pending', embedded: false },
     }
     await saveMeta(meta)
-    const finalMeta = await ingestDocument(meta, buffer)
+    // Fire ingest as a tracked background job so upload returns immediately.
+    // The SSE channel pushes status updates as the job moves through
+    // extracting → embedding → ready, so the UI updates without polling.
+    const { runJob } = await import('../services/jobs.js')
+    runJob('ingest', finalRel, () => ingestDocument(meta, buffer)).catch((err) => {
+      req.log.warn({ err, rel: finalRel }, 'ingest job failed')
+    })
 
     await audit({
       actor: user.username,
@@ -642,7 +648,7 @@ export async function vaultRoutes(app: FastifyInstance) {
       actor: user.username,
       bytes: buffer.length,
     }).catch(() => null)
-    return reply.code(201).send({ document: finalMeta, path: finalRel })
+    return reply.code(201).send({ document: meta, path: finalRel })
   })
 
   app.post('/api/file/index', async (req, reply) => {
@@ -1072,6 +1078,45 @@ export async function vaultRoutes(app: FastifyInstance) {
       meta: { tags },
     })
     return { document: next }
+  })
+
+  // Version history: list snapshots taken by the watcher whenever the file's
+  // content changed on disk.
+  app.get('/api/file/versions', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    const { path: rel } = req.query as { path?: string }
+    if (!rel) return reply.code(400).send({ error: 'missing path' })
+    const docs = await listAllDocuments()
+    const meta = docs.find((d) => d.storageKey === rel)
+    if (!meta) return reply.code(404).send({ error: 'not indexed' })
+    if (!userCanRead(meta, user.username, user.role) && !userCan(user, 'read', rel)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const { listVersions } = await import('../stores/versions.js')
+    const versions = await listVersions(meta.id)
+    return { versions }
+  })
+
+  // Fetch one historical version's extracted text. We don't reconstruct the
+  // original blob (we'd need to keep raw bytes, which doubles storage); just
+  // the extracted-text plus meta is enough to answer "what did this file say
+  // back then?"
+  app.get('/api/file/version', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    const { path: rel, ts } = req.query as { path?: string; ts?: string }
+    if (!rel || !ts) return reply.code(400).send({ error: 'missing path or ts' })
+    const docs = await listAllDocuments()
+    const meta = docs.find((d) => d.storageKey === rel)
+    if (!meta) return reply.code(404).send({ error: 'not indexed' })
+    if (!userCanRead(meta, user.username, user.role) && !userCan(user, 'read', rel)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const { readVersionText } = await import('../stores/versions.js')
+    const text = await readVersionText(meta.id, Number(ts))
+    if (text == null) return reply.code(404).send({ error: 'version not found' })
+    return { ts: Number(ts), text }
   })
 
   // Audit trail scoped to one file. Same access check as raw/text — the user

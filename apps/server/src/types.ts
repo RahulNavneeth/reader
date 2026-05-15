@@ -83,6 +83,14 @@ export type DocumentMeta = {
     extractedAt?: number
     embeddedAt?: number
   }
+  /** Lightweight regex-extracted entities from the doc's text. */
+  entities?: {
+    dates?: string[]
+    amounts?: string[]
+    emails?: string[]
+    urls?: string[]
+    orgs?: string[]
+  }
 }
 
 export type Chunk = {

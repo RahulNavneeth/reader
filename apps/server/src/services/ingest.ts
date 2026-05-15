@@ -9,6 +9,7 @@ import {
   loadMeta,
 } from '../stores/documents.js'
 import { extractText } from './extract.js'
+import { extractEntities } from './entities.js'
 import { embedBatch, EmbedError } from './embed.js'
 import { generateThumbnail } from './thumbnail.js'
 import {
@@ -86,7 +87,15 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
   }
 
   await writeText(meta.id, text)
-  next = { ...next, updatedAt: Date.now(), ingest: { ...next.ingest, extractedAt: Date.now() } }
+  // Pure-regex entity pass — dates/amounts/emails/urls/orgs — cheap and runs
+  // synchronously here so embeddings and entities land in the same save.
+  const entities = text.trim() ? extractEntities(text) : {}
+  next = {
+    ...next,
+    updatedAt: Date.now(),
+    ingest: { ...next.ingest, extractedAt: Date.now() },
+    entities,
+  }
 
   if (!text.trim()) {
     next = {

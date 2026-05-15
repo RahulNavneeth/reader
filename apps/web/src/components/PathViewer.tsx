@@ -15,6 +15,7 @@ import { FileInfoButton } from './FileInfoButton'
 import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
 import { ShareButton } from './ShareButton'
+import { VersionsButton } from './VersionsButton'
 import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
 
@@ -244,6 +245,7 @@ export function PathViewer({ path }: Props) {
           onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
         />
         <ActivityButton path={path} />
+        <VersionsButton path={path} />
         <ShareButton path={path} />
         <button
           className="btn-ghost"

@@ -110,6 +110,21 @@ export function FileInfoButton({ path, meta }: Props) {
                       }
                     />
                   )}
+                  {meta.entities?.dates && meta.entities.dates.length > 0 && (
+                    <InfoRow label="Dates" value={<EntityChips items={meta.entities.dates} />} />
+                  )}
+                  {meta.entities?.amounts && meta.entities.amounts.length > 0 && (
+                    <InfoRow label="Amounts" value={<EntityChips items={meta.entities.amounts} />} />
+                  )}
+                  {meta.entities?.emails && meta.entities.emails.length > 0 && (
+                    <InfoRow label="Emails" value={<EntityChips items={meta.entities.emails} mono />} />
+                  )}
+                  {meta.entities?.urls && meta.entities.urls.length > 0 && (
+                    <InfoRow label="URLs" value={<EntityChips items={meta.entities.urls} mono />} />
+                  )}
+                  {meta.entities?.orgs && meta.entities.orgs.length > 0 && (
+                    <InfoRow label="Orgs" value={<EntityChips items={meta.entities.orgs} />} />
+                  )}
                   {meta.sha256 && (
                     <InfoRow
                       label="sha256"
@@ -171,4 +186,26 @@ function formatDate(ts: number): string {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+/**
+ * Wrapping chip list with a max-height scroll, used for the entity rows.
+ * `mono` switches to monospace + smaller font, useful for emails / URLs that
+ * otherwise wrap awkwardly.
+ */
+function EntityChips({ items, mono = false }: { items: string[]; mono?: boolean }) {
+  return (
+    <div className="flex flex-wrap gap-1 max-h-[110px] overflow-y-auto">
+      {items.map((s, i) => (
+        <span
+          key={`${s}-${i}`}
+          className={`inline-flex items-center px-1.5 h-[18px] rounded ${mono ? 'text-[10.5px] font-mono' : 'text-[11px]'}`}
+          style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)', color: 'var(--fg)' }}
+          title={s}
+        >
+          <span className="truncate" style={{ maxWidth: 200 }}>{s}</span>
+        </span>
+      ))}
+    </div>
+  )
 }

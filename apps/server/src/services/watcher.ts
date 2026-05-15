@@ -108,6 +108,12 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
     updatedAt: Date.now(),
     ingest: { status: 'pending', embedded: false },
   }
+  // Snapshot the current meta + text + chunks before we overwrite them. Only
+  // for existing docs — first-time ingest has nothing to preserve.
+  if (existing) {
+    const { snapshotVersion } = await import('../stores/versions.js')
+    await snapshotVersion(existing.id).catch(() => null)
+  }
   await saveMeta(meta)
   // Distinguish first-time-seen vs. content edit so the activity log shows
   // "Uploaded" vs. "Edited on disk" for the same file. We don't know the

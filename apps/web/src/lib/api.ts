@@ -57,6 +57,13 @@ export type DocumentMeta = {
     extractedAt?: number
     embeddedAt?: number
   }
+  entities?: {
+    dates?: string[]
+    amounts?: string[]
+    emails?: string[]
+    urls?: string[]
+    orgs?: string[]
+  }
 }
 
 export type VaultNode = {
@@ -286,6 +293,13 @@ export const api = {
         matchedTags: string[]
       }[]
     }>(`/api/files/search${q({ q: qstr, limit })}`),
+  fileVersions: (rel: string) =>
+    get<{ versions: { ts: number; sha256: string; bytes: number; title?: string; hasText: boolean }[] }>(
+      `/api/file/versions${q({ path: rel })}`,
+    ),
+  fileVersionText: (rel: string, ts: number) =>
+    get<{ ts: number; text: string }>(`/api/file/version${q({ path: rel, ts })}`),
+
   fileActivity: (rel: string, limit = 50) =>
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
       `/api/file/activity${q({ path: rel, limit })}`,
@@ -432,6 +446,22 @@ export const api = {
       byOwner: { owner: string; count: number }[]
       recent: { id: string; title: string; storageKey: string; createdAt: number }[]
     }>('/api/admin/stats'),
+  adminJobs: () =>
+    get<{
+      jobs: {
+        id: string
+        type: string
+        target?: string
+        status: 'pending' | 'running' | 'completed' | 'failed'
+        createdAt: number
+        startedAt?: number
+        finishedAt?: number
+        durationMs?: number
+        error?: string
+      }[]
+      counts: { pending: number; running: number; completed: number; failed: number }
+    }>('/api/admin/jobs'),
+
   adminWebhooks: () =>
     get<{
       webhooks: {

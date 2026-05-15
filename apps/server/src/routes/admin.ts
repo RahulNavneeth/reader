@@ -637,4 +637,10 @@ export async function adminRoutes(app: FastifyInstance) {
     const entries = await listAudit({ target, limit: lim })
     return { entries }
   })
+
+  // In-flight + recent background jobs.
+  app.get('/api/admin/jobs', async () => {
+    const { listJobs, jobCounts } = await import('../services/jobs.js')
+    return { jobs: listJobs({ limit: 100 }), counts: jobCounts() }
+  })
 }

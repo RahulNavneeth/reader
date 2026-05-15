@@ -1623,12 +1623,19 @@ function formatBytes(b: number): string {
 
 function StatsPanel() {
   const [data, setData] = useState<Awaited<ReturnType<typeof api.adminStats>> | null>(null)
+  const [jobs, setJobs] = useState<Awaited<ReturnType<typeof api.adminJobs>> | null>(null)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
     api
       .adminStats()
       .then(setData)
       .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+    api.adminJobs().then(setJobs).catch(() => null)
+    // Live refresh job counts so the admin can watch ingest move through.
+    const t = setInterval(() => {
+      api.adminJobs().then(setJobs).catch(() => null)
+    }, 4000)
+    return () => clearInterval(t)
   }, [])
   if (error) return <ErrText text={error} />
   if (!data) return <Muted text="Loading…" />
@@ -1663,6 +1670,70 @@ function StatsPanel() {
           labelCol="Document"
         />
       </Card>
+      {jobs && (
+        <Card title="Background jobs">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+            <Metric label="Running" value={jobs.counts.running.toLocaleString()} />
+            <Metric label="Failed" value={jobs.counts.failed.toLocaleString()} />
+            <Metric label="Completed" value={jobs.counts.completed.toLocaleString()} />
+            <Metric label="Pending" value={jobs.counts.pending.toLocaleString()} />
+          </div>
+          {jobs.jobs.length === 0 ? (
+            <Muted text="No recent jobs." />
+          ) : (
+            <div className="rounded border border-app overflow-hidden">
+              <table className="w-full text-[12.5px]">
+                <thead style={{ background: 'var(--panel)' }}>
+                  <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
+                    <th className="px-3 py-1.5 font-semibold">Type</th>
+                    <th className="px-3 py-1.5 font-semibold">Target</th>
+                    <th className="px-3 py-1.5 font-semibold">Status</th>
+                    <th className="px-3 py-1.5 font-semibold">Duration</th>
+                    <th className="px-3 py-1.5 font-semibold">Started</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {jobs.jobs.slice(0, 20).map((j) => (
+                    <tr
+                      key={j.id}
+                      className="border-t"
+                      style={{ borderColor: 'var(--border-soft)' }}
+                    >
+                      <td className="px-3 py-1.5 text-fg">{j.type}</td>
+                      <td className="px-3 py-1.5 text-muted break-all">{j.target ?? '—'}</td>
+                      <td
+                        className="px-3 py-1.5"
+                        style={{
+                          color:
+                            j.status === 'failed'
+                              ? '#BF2600'
+                              : j.status === 'running'
+                              ? '#974F0C'
+                              : j.status === 'completed'
+                              ? '#00875A'
+                              : 'var(--muted)',
+                        }}
+                      >
+                        {j.status}
+                        {j.error ? ` · ${j.error}` : ''}
+                      </td>
+                      <td
+                        className="px-3 py-1.5 text-muted"
+                        style={{ fontVariantNumeric: 'tabular-nums' }}
+                      >
+                        {j.durationMs != null ? `${(j.durationMs / 1000).toFixed(1)}s` : '—'}
+                      </td>
+                      <td className="px-3 py-1.5 text-muted">
+                        {j.startedAt ? new Date(j.startedAt).toLocaleTimeString() : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+      )}
     </div>
   )
 }
