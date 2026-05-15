@@ -68,6 +68,11 @@ export type DocumentMeta = {
   }
   /** If true, the file's raw, text, and meta endpoints are readable without auth. */
   public?: boolean
+  /** Optional absolute timestamp past which the public link stops working. */
+  publicExpiresAt?: number | null
+  /** Optional scrypt-hashed password ("salt:digest" hex). When set, anonymous
+   *  callers must provide `?p=<password>` to read. */
+  publicPasswordHash?: string | null
   tags: string[]
   collectionId?: string
   createdAt: number

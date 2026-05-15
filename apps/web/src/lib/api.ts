@@ -16,18 +16,6 @@ export type PublicUser = {
   quotaBytes?: number
 }
 
-export type ShareInfo = {
-  id: string
-  storageKey: string
-  docId?: string
-  label?: string
-  createdBy: string
-  createdAt: number
-  expiresAt: number | null
-  hasPassword: boolean
-  lastAccessAt?: number
-  accessCount: number
-}
 
 export type IngestStatus = 'pending' | 'extracting' | 'embedding' | 'ready' | 'failed' | 'no-text'
 
@@ -43,6 +31,8 @@ export type DocumentMeta = {
   owner: string
   acl: { readers: string[]; editors: string[] }
   public?: boolean
+  publicExpiresAt?: number | null
+  publicPasswordHash?: string | null
   tags: string[]
   collectionId?: string
   createdAt: number
@@ -227,20 +217,21 @@ export const api = {
   list: (rel: string) => get<{ path: string; items: VaultNode[] }>(`/api/list${q({ path: rel })}`),
   folders: () => get<{ folders: string[] }>('/api/folders'),
   vaultTree: () => get<{ folders: string[]; files: string[] }>('/api/vault-tree'),
-  fileText: (rel: string) =>
+  fileText: (rel: string, password?: string) =>
     get<{ path: string; content: string; size: number; mtime: number; docId?: string }>(
-      `/api/file/text${q({ path: rel })}`,
+      `/api/file/text${q({ path: rel, p: password })}`,
     ),
-  fileMeta: (rel: string) => get<{ meta: DocumentMeta | null }>(`/api/file/meta${q({ path: rel })}`),
+  fileMeta: (rel: string, password?: string) =>
+    get<{ meta: DocumentMeta | null }>(
+      `/api/file/meta${q({ path: rel, p: password })}`,
+    ),
   /** Canonical browser-facing URL for a file. Vite/server negotiates: document → SPA, else raw bytes. */
-  rawUrl: (rel: string) => '/docs/' + rel.split('/').map(encodeURIComponent).join('/'),
-  thumbnailUrl: (rel: string) => `/api/file/thumbnail${q({ path: rel })}`,
-  /**
-   * Browser-renderable version. For HEIC, returns a JPEG transcoded at
-   * ingest; for other types, just streams the raw bytes. Use rawUrl() when
-   * you specifically need the original (e.g., a download button).
-   */
-  previewUrl: (rel: string) => `/api/file/preview${q({ path: rel })}`,
+  rawUrl: (rel: string, password?: string) =>
+    '/docs/' + rel.split('/').map(encodeURIComponent).join('/') + (password ? `?p=${encodeURIComponent(password)}` : ''),
+  thumbnailUrl: (rel: string, password?: string) =>
+    `/api/file/thumbnail${q({ path: rel, p: password })}`,
+  previewUrl: (rel: string, password?: string) =>
+    `/api/file/preview${q({ path: rel, p: password })}`,
   upload: async (file: File, opts?: { dir?: string; title?: string; tags?: string }) => {
     const fd = new FormData()
     fd.set('file', file)
@@ -259,8 +250,17 @@ export const api = {
     return (await res.json()) as { document: DocumentMeta; path: string }
   },
   indexFile: (rel: string) => post<{ document: DocumentMeta }>('/api/file/index', { path: rel }),
-  setVisibility: (rel: string, isPublic: boolean) =>
-    post<{ document: DocumentMeta }>('/api/file/visibility', { path: rel, public: isPublic }),
+  setVisibility: (
+    rel: string,
+    isPublic: boolean,
+    opts?: { expiresInSeconds?: number | null; password?: string | null },
+  ) =>
+    post<{ document: DocumentMeta }>('/api/file/visibility', {
+      path: rel,
+      public: isPublic,
+      expiresInSeconds: opts?.expiresInSeconds ?? null,
+      password: opts?.password ?? null,
+    }),
   setTags: (rel: string, tags: string[]) =>
     post<{ document: DocumentMeta }>('/api/file/tags', { path: rel, tags }),
   tags: () => get<{ tags: { tag: string; count: number }[] }>('/api/tags'),
@@ -304,16 +304,6 @@ export const api = {
       `/api/file/activity${q({ path: rel, limit })}`,
     ),
 
-  // share links
-  createShare: (rel: string, opts: { expiresInSeconds?: number | null; password?: string; label?: string }) =>
-    post<{ share: ShareInfo }>('/api/file/shares', {
-      path: rel,
-      expiresInSeconds: opts.expiresInSeconds ?? null,
-      password: opts.password || undefined,
-      label: opts.label || undefined,
-    }),
-  listShares: (rel?: string) =>
-    get<{ shares: ShareInfo[] }>(`/api/file/shares${rel ? q({ path: rel }) : ''}`),
   // saved views
   listViews: () =>
     get<{ views: { id: string; name: string; query?: string; tag?: string; createdAt: number }[] }>(
@@ -333,43 +323,6 @@ export const api = {
       return r.json() as Promise<{ ok: true }>
     }),
 
-  // share redemption (anonymous, token-scoped reads)
-  shareInfo: (id: string, password?: string) =>
-    get<{
-      id: string
-      filename: string
-      ext: string
-      mime: string
-      label?: string
-      hasPassword: boolean
-      expiresAt: number | null
-    }>(`/api/share/${encodeURIComponent(id)}/info${password ? q({ p: password }) : ''}`),
-  shareTextUrl: (id: string, password?: string) =>
-    `/api/share/${encodeURIComponent(id)}/text${password ? q({ p: password }) : ''}`,
-  shareText: (id: string, password?: string) =>
-    get<{ content: string; size: number; mtime: number }>(
-      `/api/share/${encodeURIComponent(id)}/text${password ? q({ p: password }) : ''}`,
-    ),
-  shareRawUrl: (id: string, password?: string) =>
-    `/api/share/${encodeURIComponent(id)}/raw${password ? q({ p: password }) : ''}`,
-  sharePreviewUrl: (id: string, password?: string) =>
-    `/api/share/${encodeURIComponent(id)}/preview${password ? q({ p: password }) : ''}`,
-  shareThumbnailUrl: (id: string, password?: string) =>
-    `/api/share/${encodeURIComponent(id)}/thumbnail${password ? q({ p: password }) : ''}`,
-  shareDownloadUrl: (id: string, password?: string) =>
-    `/s/${encodeURIComponent(id)}?raw=1${password ? `&p=${encodeURIComponent(password)}` : ''}`,
-
-  deleteShare: (id: string) =>
-    fetch(`/api/file/shares/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-      credentials: 'include',
-    }).then(async (r) => {
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        throw new ApiError(r.status, data?.error || `HTTP ${r.status}`)
-      }
-      return r.json() as Promise<{ ok: true }>
-    }),
   bulkSetVisibility: (paths: string[], isPublic: boolean) =>
     post<{ ok: number; failed: number }>('/api/file/bulk-visibility', { paths, public: isPublic }),
   bulkDelete: (paths: string[]) =>

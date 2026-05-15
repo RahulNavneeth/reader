@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Globe, Lock } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -14,8 +14,8 @@ import { PathBreadcrumb } from './PathBreadcrumb'
 import { FileInfoButton } from './FileInfoButton'
 import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
-import { ShareButton } from './ShareButton'
 import { VersionsButton } from './VersionsButton'
+import { PublicButton } from './PublicButton'
 import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
 
@@ -196,20 +196,6 @@ export function PathViewer({ path }: Props) {
   const needsReindex = !!meta && !meta.ingest.embedded
   const reindexLabel = meta?.ingest.status === 'ready' ? 'Re-index' : 'Index'
 
-  const [visibilityBusy, setVisibilityBusy] = useState(false)
-  const toggleVisibility = async () => {
-    if (!meta) return
-    setVisibilityBusy(true)
-    try {
-      const r = await api.setVisibility(path, !meta.public)
-      setMeta(r.document)
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setVisibilityBusy(false)
-    }
-  }
-
   return (
     <div className="h-full flex flex-col">
       <header className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0" style={{ background: 'var(--panel-2)' }}>
@@ -246,20 +232,14 @@ export function PathViewer({ path }: Props) {
         />
         <ActivityButton path={path} />
         <VersionsButton path={path} />
-        {/* Share links are pointless when the file is already public — the
-            raw URL works for anyone with the link. Only show the Share
-            control while the file is private. */}
-        {meta && !meta.public && <ShareButton path={path} />}
-        <button
-          className="btn-ghost"
-          disabled={visibilityBusy || !meta}
-          onClick={toggleVisibility}
-          title={meta?.public ? 'Make private (requires auth)' : 'Make public (anyone with link can view)'}
-          style={meta?.public ? { color: '#00875A' } : undefined}
-        >
-          {meta?.public ? <Globe size={13} /> : <Lock size={13} />}
-          {meta?.public ? 'Public' : 'Private'}
-        </button>
+        {meta ? (
+          <PublicButton path={path} meta={meta} onSaved={setMeta} />
+        ) : (
+          <button className="btn-ghost" disabled>
+            <Lock size={13} />
+            Private
+          </button>
+        )}
         <a className="btn-ghost" href={api.rawUrl(path)} download={filename}>
           <Download size={14} />
           Download

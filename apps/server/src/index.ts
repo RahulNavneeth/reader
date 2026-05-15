@@ -15,8 +15,6 @@ import { searchRoutes } from './routes/search.js'
 import { adminRoutes } from './routes/admin.js'
 import { mcpRoutes } from './routes/mcp.js'
 import { eventsRoutes } from './routes/events.js'
-import { sharesRoutes } from './routes/shares.js'
-import { sweepExpiredShares } from './stores/shares.js'
 import { viewsRoutes } from './routes/views.js'
 import { sweepExpired } from './stores/sessions.js'
 import { preheat } from './services/search.js'
@@ -88,7 +86,6 @@ async function main() {
   await app.register(adminRoutes)
   await app.register(mcpRoutes)
   await app.register(eventsRoutes)
-  await app.register(sharesRoutes)
   await app.register(viewsRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
@@ -125,11 +122,6 @@ async function main() {
   sweepExpiredTrash()
     .then((n) => n > 0 && app.log.info({ purged: n }, 'trash sweep'))
     .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
-
-  // Drop expired share links on boot.
-  sweepExpiredShares()
-    .then((n) => n > 0 && app.log.info({ purged: n }, 'share sweep'))
-    .catch((err) => app.log.warn({ err }, 'share sweep failed'))
 
   // Warm the search cache; check Ollama presence (just informational).
   preheat().catch(() => null)

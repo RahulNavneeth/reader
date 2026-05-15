@@ -40,6 +40,7 @@ import { publish } from '../services/events.js'
 import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 import type { DocumentMeta } from '../types.js'
 import { resolveUserVault, userVaultRel, ensureUserVault, userVaultRoot } from '../lib/userVault.js'
+import { hashPassword as hashShareSecret, verifyPassword as verifySharePassword } from '../lib/sharePassword.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
 
@@ -59,6 +60,36 @@ function resolveVault(rel: string | undefined, owner: string): string {
 
 function toVaultRel(abs: string, owner: string): string {
   return userVaultRel(owner, abs)
+}
+
+/** Strip the password hash before sending meta to a client. */
+function redactPublicMeta(meta: DocumentMeta): DocumentMeta {
+  if (!meta.publicPasswordHash) return meta
+  const { publicPasswordHash, ...rest } = meta
+  void publicPasswordHash
+  return { ...rest, publicPasswordHash: null } as DocumentMeta
+}
+
+/**
+ * Check whether a public file is currently reachable by an anonymous caller.
+ * Returns:
+ *   - 'ok'                — public, no password (or correct password supplied)
+ *   - 'expired'           — public flag set but the expiry has passed
+ *   - 'password-required' — public + password hash + caller didn't include `?p=`
+ *   - 'password-wrong'    — `?p=` provided but doesn't match
+ *   - 'not-public'        — file isn't marked public at all
+ */
+function publicGate(
+  meta: { public?: boolean; publicExpiresAt?: number | null; publicPasswordHash?: string | null } | null | undefined,
+  providedPassword: string | undefined,
+): 'ok' | 'expired' | 'password-required' | 'password-wrong' | 'not-public' {
+  if (!meta?.public) return 'not-public'
+  if (meta.publicExpiresAt != null && meta.publicExpiresAt < Date.now()) return 'expired'
+  if (meta.publicPasswordHash) {
+    if (!providedPassword) return 'password-required'
+    if (!verifySharePassword(meta.publicPasswordHash, providedPassword)) return 'password-wrong'
+  }
+  return 'ok'
 }
 
 function httpErr(status: number, message: string): Error & { statusCode: number } {
@@ -335,11 +366,9 @@ export async function vaultRoutes(app: FastifyInstance) {
   // ---- read -----------------------------------------------------------------
 
   app.get('/api/file/text', async (req, reply) => {
-    const { path: rel } = req.query as { path?: string }
+    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
 
-    // Resolution scope: if a public file matches the path use its owner;
-    // otherwise treat the request as the signed-in user's own namespace.
     const docs = await listAllDocuments()
     const requester = req.currentUser?.username
     const meta =
@@ -348,7 +377,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     const owner = meta?.owner ?? requester
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
-    if (!meta?.public) {
+    const gate = publicGate(meta, publicPassword)
+    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+    if (gate === 'password-required' || gate === 'password-wrong') {
+      return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
+    }
+    if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
       if (meta && !userCanRead(meta, u.username, u.role)) {
@@ -417,7 +451,7 @@ export async function vaultRoutes(app: FastifyInstance) {
   })
 
   app.get('/api/file/raw', async (req, reply) => {
-    const { path: rel } = req.query as { path?: string }
+    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
 
     const docs = await listAllDocuments()
@@ -428,7 +462,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     const owner = meta?.owner ?? requester
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
-    if (!meta?.public) {
+    const gate = publicGate(meta, publicPassword)
+    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+    if (gate === 'password-required' || gate === 'password-wrong') {
+      return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
+    }
+    if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
       if (meta && !userCanRead(meta, u.username, u.role)) {
@@ -479,7 +518,7 @@ export async function vaultRoutes(app: FastifyInstance) {
   // streams the raw bytes. Use /api/file/raw when you want the original
   // (e.g., download links).
   app.get('/api/file/preview', async (req, reply) => {
-    const { path: rel } = req.query as { path?: string }
+    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
     const docs = await listAllDocuments()
     const requester = req.currentUser?.username
@@ -489,7 +528,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     const owner = meta?.owner ?? requester
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
-    if (!meta?.public) {
+    const gate = publicGate(meta, publicPassword)
+    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+    if (gate === 'password-required' || gate === 'password-wrong') {
+      return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
+    }
+    if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
       if (meta && !userCanRead(meta, u.username, u.role)) {
@@ -542,7 +586,7 @@ export async function vaultRoutes(app: FastifyInstance) {
   // Tiny PNG preview for the folder grid. Cached on disk per doc. If the
   // thumbnail hasn't been generated yet, we render-on-demand and persist.
   app.get('/api/file/thumbnail', async (req, reply) => {
-    const { path: rel } = req.query as { path?: string }
+    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
 
     const docs = await listAllDocuments()
@@ -553,7 +597,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     const owner = meta?.owner ?? requester
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
-    if (!meta?.public) {
+    const gate = publicGate(meta, publicPassword)
+    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+    if (gate === 'password-required' || gate === 'password-wrong') {
+      return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
+    }
+    if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
       if (meta && !userCanRead(meta, u.username, u.role)) {
@@ -959,7 +1008,7 @@ export async function vaultRoutes(app: FastifyInstance) {
   // index record (e.g. markdown read straight from disk) we return a stub so
   // the client can render the visibility toggle on the first open.
   app.get('/api/file/meta', async (req, reply) => {
-    const { path: rel } = req.query as { path?: string }
+    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
     const docs = await listAllDocuments()
     const requester = req.currentUser?.username
@@ -967,13 +1016,32 @@ export async function vaultRoutes(app: FastifyInstance) {
       docs.find((d) => d.storageKey === rel && d.owner === requester) ??
       docs.find((d) => d.storageKey === rel && d.public)
     if (meta) {
-      if (meta.public) return { meta }
+      // Redact the password hash from public meta so the UI can show
+      // "password required" without leaking the hash.
+      const safe = redactPublicMeta(meta)
+      if (meta.public) {
+        const gate = publicGate(meta, publicPassword)
+        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+        if (gate === 'password-required' || gate === 'password-wrong') {
+          // Expose just enough so the UI can render a password prompt
+          // without giving away anything sensitive.
+          return reply
+            .code(401)
+            .send({
+              error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+              passwordRequired: true,
+              filename: meta.originalFilename,
+              ext: path.extname(meta.storageKey).toLowerCase(),
+            })
+        }
+        return { meta: safe }
+      }
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
       if (!userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
-      return { meta }
+      return { meta: safe }
     }
     // No persisted meta — synthesize a stub if the file exists in the user's vault.
     if (!requireAuth(req, reply)) return
@@ -1007,7 +1075,12 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.post('/api/file/visibility', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
-    const body = req.body as { path?: string; public?: boolean }
+    const body = req.body as {
+      path?: string
+      public?: boolean
+      expiresInSeconds?: number | null
+      password?: string | null
+    }
     if (!body?.path) return reply.code(400).send({ error: 'missing path' })
     if (typeof body.public !== 'boolean') return reply.code(400).send({ error: 'missing public flag' })
     const abs = resolveVault(body.path, user.username)
@@ -1036,7 +1109,32 @@ export async function vaultRoutes(app: FastifyInstance) {
     } else if (!userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
-    const next: DocumentMeta = { ...meta, public: body.public, updatedAt: Date.now() }
+    // Resolve expiry: null/undefined → no expiry (or carry over existing if
+    // unchanged); a number → seconds from now. Password: empty/null → clear.
+    let publicExpiresAt: number | null = null
+    if (body.expiresInSeconds === null || body.expiresInSeconds === undefined) {
+      // Inherit existing expiry if we're flipping the same flag with no
+      // explicit override, otherwise default to no-expiry.
+      publicExpiresAt = body.public ? meta.publicExpiresAt ?? null : null
+    } else if (typeof body.expiresInSeconds === 'number') {
+      publicExpiresAt = Date.now() + Math.max(60, Math.floor(body.expiresInSeconds)) * 1000
+    }
+    let publicPasswordHash: string | null
+    if (body.password === undefined) {
+      publicPasswordHash = body.public ? meta.publicPasswordHash ?? null : null
+    } else if (body.password === null || body.password === '') {
+      publicPasswordHash = null
+    } else {
+      publicPasswordHash = hashShareSecret(body.password)
+    }
+
+    const next: DocumentMeta = {
+      ...meta,
+      public: body.public,
+      publicExpiresAt: body.public ? publicExpiresAt : null,
+      publicPasswordHash: body.public ? publicPasswordHash : null,
+      updatedAt: Date.now(),
+    }
     await saveMeta(next)
     publish({ type: 'visibility', path: body.path, public: body.public })
     dispatchWebhook({
@@ -1049,9 +1147,13 @@ export async function vaultRoutes(app: FastifyInstance) {
       actor: user.username,
       action: 'vault.visibility',
       target: body.path,
-      meta: { public: body.public },
+      meta: {
+        public: body.public,
+        hasPassword: !!publicPasswordHash,
+        expiresAt: publicExpiresAt,
+      },
     })
-    return { document: next }
+    return { document: redactPublicMeta(next) }
   })
 
   // ---- tags ---------------------------------------------------------------

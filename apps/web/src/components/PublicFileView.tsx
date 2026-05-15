@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Download, FileText, Globe, AlertCircle, Loader2 } from 'lucide-react'
+import { Download, FileText, Globe, AlertCircle, Loader2, Lock } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -14,11 +14,25 @@ type Props = {
   onNotPublic: () => void
 }
 
+/**
+ * Anonymous viewer for public files. Public access now carries an optional
+ * password and expiry (no more /s/<token> tokens), so this component also
+ * handles:
+ *
+ *   - rendering an in-app password prompt when /api/file/meta says 401 +
+ *     passwordRequired,
+ *   - rendering an "expired" card on 410.
+ */
 export function PublicFileView({ path, onNotPublic }: Props) {
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
   const [text, setText] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [expired, setExpired] = useState(false)
+  const [passwordRequired, setPasswordRequired] = useState(false)
+  const [passwordWrong, setPasswordWrong] = useState(false)
+  const [password, setPassword] = useState('')
+  const [submittedPwd, setSubmittedPwd] = useState<string>('')
 
   const ext = useMemo(() => {
     const i = path.lastIndexOf('.')
@@ -57,9 +71,12 @@ export function PublicFileView({ path, onNotPublic }: Props) {
     let cancelled = false
     setLoading(true)
     setError(null)
+    setExpired(false)
+    setPasswordRequired(false)
+    setPasswordWrong(false)
     api
-      .fileMeta(path)
-      .then((r) => {
+      .fileMeta(path, submittedPwd || undefined)
+      .then(async (r) => {
         if (cancelled) return
         if (!r.meta || !r.meta.public) {
           onNotPublic()
@@ -67,22 +84,33 @@ export function PublicFileView({ path, onNotPublic }: Props) {
         }
         setMeta(r.meta)
         if (isMarkdown || isText || isHtml || isOfficeDoc) {
-          return api
-            .fileText(path)
-            .then((t) => {
-              if (!cancelled) setText(t.content)
-            })
-            .catch((e) => {
-              if (!cancelled) setError(e instanceof ApiError ? e.message : String(e))
-            })
+          try {
+            const t = await api.fileText(path, submittedPwd || undefined)
+            if (!cancelled) setText(t.content)
+          } catch (e) {
+            if (!cancelled) setError(e instanceof ApiError ? e.message : String(e))
+          }
         }
       })
       .catch((e) => {
         if (cancelled) return
-        if (e instanceof ApiError && (e.status === 401 || e.status === 404)) {
-          onNotPublic()
+        if (e instanceof ApiError) {
+          if (e.status === 401) {
+            setPasswordRequired(true)
+            if (submittedPwd) setPasswordWrong(true)
+            return
+          }
+          if (e.status === 410) {
+            setExpired(true)
+            return
+          }
+          if (e.status === 404) {
+            onNotPublic()
+            return
+          }
+          setError(e.message)
         } else {
-          setError(e instanceof ApiError ? e.message : String(e))
+          setError(String(e))
         }
       })
       .finally(() => {
@@ -91,9 +119,62 @@ export function PublicFileView({ path, onNotPublic }: Props) {
     return () => {
       cancelled = true
     }
-  }, [path, isMarkdown, isText, isHtml, isOfficeDoc, onNotPublic])
+  }, [path, isMarkdown, isText, isHtml, isOfficeDoc, onNotPublic, submittedPwd])
 
   const filename = path.split('/').pop() || path
+
+  if (passwordRequired) {
+    return (
+      <div className="h-full min-h-screen flex items-center justify-center surface">
+        <form
+          className="w-[340px] p-6 rounded-lg shadow-card"
+          style={{ background: 'var(--panel)' }}
+          onSubmit={(e) => {
+            e.preventDefault()
+            setSubmittedPwd(password)
+          }}
+        >
+          <div className="flex items-center gap-2 mb-1">
+            <Lock size={16} className="text-accent" />
+            <div className="text-fg font-semibold">Password required</div>
+          </div>
+          <div className="text-[12.5px] text-muted mb-3">
+            This file is shared with a password.
+          </div>
+          <input
+            type="password"
+            className="input"
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+          />
+          <button className="btn-primary w-full mt-3" type="submit">
+            <Lock size={14} /> Open file
+          </button>
+          {passwordWrong && (
+            <div className="text-[12px] mt-2" style={{ color: '#BF2600' }}>
+              Incorrect password. Try again.
+            </div>
+          )}
+        </form>
+      </div>
+    )
+  }
+
+  if (expired) {
+    return (
+      <div className="h-full min-h-screen flex items-center justify-center surface">
+        <div className="text-center max-w-md p-6">
+          <AlertCircle size={20} style={{ color: '#BF2600' }} className="mx-auto mb-2" />
+          <div className="text-fg font-semibold">This link has expired</div>
+          <div className="text-[13px] text-muted mt-1">
+            Ask the owner for a fresh public link.
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   if (loading) {
     return (
@@ -110,7 +191,7 @@ export function PublicFileView({ path, onNotPublic }: Props) {
       <div className="h-full flex items-center justify-center surface">
         <div className="text-center max-w-md p-6">
           <AlertCircle size={20} style={{ color: '#BF2600' }} className="mx-auto mb-2" />
-          <div className="text-fg font-semibold">Couldn’t open this file</div>
+          <div className="text-fg font-semibold">Couldn't open this file</div>
           <div className="text-[13px] text-muted mt-1">{error}</div>
         </div>
       </div>
@@ -118,6 +199,9 @@ export function PublicFileView({ path, onNotPublic }: Props) {
   }
 
   if (!meta) return null
+
+  const rawUrl = api.rawUrl(path, submittedPwd || undefined)
+  const previewUrl = api.previewUrl(path, submittedPwd || undefined)
 
   return (
     <div className="h-full flex flex-col surface">
@@ -127,14 +211,11 @@ export function PublicFileView({ path, onNotPublic }: Props) {
       >
         <FileText size={14} className="text-accent shrink-0" />
         <div className="text-[13.5px] font-semibold text-fg truncate">{filename}</div>
-        <span
-          className="btn-ghost cursor-default"
-          style={{ color: '#00875A' }}
-        >
+        <span className="btn-ghost cursor-default" style={{ color: '#00875A' }}>
           <Globe size={13} /> Public
         </span>
         <div className="flex-1" />
-        <a className="btn-ghost" href={api.rawUrl(path)} download={filename}>
+        <a className="btn-ghost" href={rawUrl} download={filename}>
           <Download size={14} />
           Download
         </a>
@@ -143,7 +224,7 @@ export function PublicFileView({ path, onNotPublic }: Props) {
       <div className="flex-1 overflow-y-auto">
         {isPdf && (
           <iframe
-            src={api.rawUrl(path)}
+            src={rawUrl}
             title={filename}
             className="w-full h-full border-0"
             style={{ background: 'var(--panel)' }}
@@ -153,7 +234,7 @@ export function PublicFileView({ path, onNotPublic }: Props) {
         {isImage && (
           <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
             <img
-              src={needsPreview ? api.previewUrl(path) : api.rawUrl(path)}
+              src={needsPreview ? previewUrl : rawUrl}
               alt={filename}
               className="max-w-full max-h-full rounded shadow-card"
             />
@@ -163,8 +244,8 @@ export function PublicFileView({ path, onNotPublic }: Props) {
         {isVideo && (
           <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
             <video
-              src={api.rawUrl(path)}
-              poster={api.previewUrl(path)}
+              src={rawUrl}
+              poster={previewUrl}
               controls
               playsInline
               preload="metadata"
@@ -198,7 +279,7 @@ export function PublicFileView({ path, onNotPublic }: Props) {
           <div className="h-full flex items-center justify-center">
             <div className="text-center">
               <div className="text-fg font-semibold mb-1">Preview unavailable</div>
-              <a className="btn-primary mt-3" href={api.rawUrl(path)} download={filename}>
+              <a className="btn-primary mt-3" href={rawUrl} download={filename}>
                 <Download size={14} /> Download
               </a>
             </div>
