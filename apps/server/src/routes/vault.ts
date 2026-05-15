@@ -1075,6 +1075,68 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { tags: out }
   })
 
+  // Cross-folder filename + tag search, ranked. Used by the sidebar filter
+  // input so typing matches by tag as well as by name without needing to
+  // expand every folder. Pure metadata — no chunk/embedding work, so it's
+  // cheap enough to call on every keystroke.
+  app.get('/api/files/search', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    const { q = '', limit } = req.query as { q?: string; limit?: string }
+    const needle = q.trim().toLowerCase()
+    const lim = Math.min(Number(limit) || 50, 200)
+    if (!needle) return { q: '', items: [] }
+    const docs = await listAllDocuments()
+    type Hit = {
+      path: string
+      name: string
+      ext: string
+      docId: string
+      tags: string[]
+      public: boolean
+      score: number
+      matchedTags: string[]
+    }
+    const hits: Hit[] = []
+    for (const d of docs) {
+      if (!userCanRead(d, user.username, user.role)) continue
+      const name = path.basename(d.storageKey).toLowerCase()
+      const title = (d.title || '').toLowerCase()
+      const tags = d.tags ?? []
+      const matchedTags: string[] = []
+      let score = 0
+      if (name === needle) score += 6
+      else if (name.startsWith(needle)) score += 4
+      else if (name.includes(needle)) score += 2
+      if (title.includes(needle)) score += 1
+      for (const t of tags) {
+        if (t === needle) {
+          score += 5
+          matchedTags.push(t)
+        } else if (t.startsWith(needle)) {
+          score += 3
+          matchedTags.push(t)
+        } else if (needle.length >= 3 && t.includes(needle)) {
+          score += 1.5
+          matchedTags.push(t)
+        }
+      }
+      if (score === 0) continue
+      hits.push({
+        path: d.storageKey,
+        name: path.basename(d.storageKey),
+        ext: path.extname(d.storageKey).toLowerCase(),
+        docId: d.id,
+        tags,
+        public: !!d.public,
+        score,
+        matchedTags,
+      })
+    }
+    hits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+    return { q: needle, items: hits.slice(0, lim) }
+  })
+
   // List every (visible) file carrying a given tag — fuels the "tag click in
   // sidebar filters the grid" UX.
   app.get('/api/files/by-tag', async (req, reply) => {

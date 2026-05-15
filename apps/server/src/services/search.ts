@@ -172,6 +172,34 @@ export async function searchKnowledge(opts: {
   }
   lex.sort((a, b) => b.score - a.score)
 
+  // Metadata-only matches: hits against filename/title and tags. These never
+  // produce body snippets, but they're strong signals (a user typing "receipt"
+  // wants files tagged or titled that way even if the chunks don't mention
+  // the word). The scoring is intentionally simple — exact tag hit > prefix
+  // tag hit > title substring — and the resulting docId set joins the RRF
+  // fuse below.
+  const qLower = q.toLowerCase()
+  const meta: Array<{ docId: string; score: number; sample: string }> = []
+  for (const d of allowed) {
+    let s = 0
+    let sample = ''
+    const title = (d.title || '').toLowerCase()
+    if (title === qLower) s += 4
+    else if (title.includes(qLower)) s += 2
+    const tags = d.tags ?? []
+    for (const t of tags) {
+      if (t === qLower) s += 5
+      else if (t.startsWith(qLower)) s += 3
+      else if (qLower.length >= 3 && t.includes(qLower)) s += 1.5
+    }
+    if (s > 0) {
+      if (tags.length) sample = `Tags: ${tags.map((t) => `#${t}`).join(' ')}`
+      else sample = d.title || ''
+      meta.push({ docId: d.id, score: s, sample })
+    }
+  }
+  meta.sort((a, b) => b.score - a.score)
+
   // Semantic: embed query, score each chunk, take top-k.
   //
   // Two thresholds: a hard floor (anything below is noise on nomic-embed-text)
@@ -220,6 +248,14 @@ export async function searchKnowledge(opts: {
     const add = 1 / (k + i + 1)
     if (cur) fused.set(h.docId, { score: cur.score + add, sample: h.sample, chunkIdx: h.chunkIdx })
     else fused.set(h.docId, { score: add, sample: h.sample, chunkIdx: h.chunkIdx })
+  })
+  // Metadata matches (title/tags) contribute to RRF too. They win their own
+  // bucket when neither the chunk text nor embeddings know about the query.
+  meta.forEach((h, i) => {
+    const cur = fused.get(h.docId)
+    const add = 1 / (k + i + 1)
+    if (cur) fused.set(h.docId, { ...cur, score: cur.score + add })
+    else fused.set(h.docId, { score: add, sample: h.sample })
   })
 
   const lexIds = new Set(lex.map((h) => h.docId))

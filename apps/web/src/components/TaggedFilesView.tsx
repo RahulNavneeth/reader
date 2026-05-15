@@ -1,5 +1,15 @@
 import { useEffect, useState } from 'react'
-import { Tag, ChevronLeft, Loader2 } from 'lucide-react'
+import {
+  Tag,
+  ChevronLeft,
+  Loader2,
+  FileText,
+  FileType,
+  FileImage,
+  FileVideo,
+  FileSpreadsheet,
+  FileCode,
+} from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { ApiError, api } from '../lib/api'
 
@@ -74,23 +84,91 @@ export function TaggedFilesView() {
         )}
 
         {items && items.length > 0 && (
-          <ul className="space-y-1">
+          <div
+            className="grid gap-3"
+            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))' }}
+          >
             {items.map((it) => (
-              <li key={it.path}>
-                <button
-                  className="w-full text-left px-2 h-8 rounded hover:bg-hover flex items-center gap-2"
-                  onClick={() =>
-                    navigate('/docs/' + it.path.split('/').map(encodeURIComponent).join('/'))
-                  }
-                >
-                  <span className="truncate text-[13px] text-fg">{it.name}</span>
-                  <span className="text-[11px] text-subtle truncate">{it.path}</span>
-                </button>
-              </li>
+              <TaggedTile
+                key={it.path}
+                item={it}
+                onOpen={() =>
+                  navigate('/docs/' + it.path.split('/').map(encodeURIComponent).join('/'))
+                }
+              />
             ))}
-          </ul>
+          </div>
         )}
       </div>
     </div>
   )
+}
+
+function TaggedTile({ item, onOpen }: { item: Item; onOpen: () => void }) {
+  const [hover, setHover] = useState(false)
+  const [thumbFailed, setThumbFailed] = useState(false)
+  const ext = item.ext
+  const tryThumb = [
+    '.pdf',
+    '.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif', '.bmp', '.ico',
+    '.heic', '.heif', '.tiff', '.tif', '.jxl',
+    '.mp4', '.mov', '.m4v', '.mkv', '.webm',
+    '.avi', '.3gp', '.3gpp', '.mts', '.m2ts',
+    '.mpg', '.mpeg', '.wmv', '.flv', '.ogv',
+  ].includes(ext)
+
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onClick={onOpen}
+      className="flex flex-col items-center justify-start gap-2 p-3 rounded-md cursor-pointer text-left transition-colors"
+      style={{ background: hover ? 'var(--border)' : 'transparent' }}
+    >
+      <div className="w-full h-20 flex items-center justify-center overflow-hidden rounded">
+        {tryThumb && !thumbFailed ? (
+          <img
+            src={api.thumbnailUrl(item.path)}
+            alt=""
+            className="max-w-full max-h-full object-contain"
+            onError={() => setThumbFailed(true)}
+          />
+        ) : (
+          <BigTypeIcon ext={ext} />
+        )}
+      </div>
+      <div className="w-full text-[11.5px] text-fg text-center leading-tight">
+        <span className="line-clamp-2 break-words">{item.name}</span>
+        <div className="text-[10.5px] text-subtle truncate mt-0.5">{folderOf(item.path)}</div>
+      </div>
+    </div>
+  )
+}
+
+function folderOf(p: string): string {
+  const i = p.lastIndexOf('/')
+  return i < 0 ? 'Vault root' : p.slice(0, i)
+}
+
+function BigTypeIcon({ ext }: { ext: string }) {
+  const e = ext.toLowerCase()
+  const props = { size: 42, strokeWidth: 1.3 } as const
+  if (e === '.pdf') return <FileType {...props} className="text-muted" />
+  if ([
+    '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+    '.avif', '.bmp', '.ico',
+    '.heic', '.heif', '.tiff', '.tif', '.jxl',
+  ].includes(e))
+    return <FileImage {...props} className="text-muted" />
+  if ([
+    '.mp4', '.mov', '.m4v', '.mkv', '.webm',
+    '.avi', '.3gp', '.3gpp', '.mts', '.m2ts',
+    '.mpg', '.mpeg', '.wmv', '.flv', '.ogv',
+  ].includes(e))
+    return <FileVideo {...props} className="text-muted" />
+  if (['.xlsx', '.xls', '.csv'].includes(e))
+    return <FileSpreadsheet {...props} style={{ color: '#00875A' }} />
+  if (['.json', '.yaml', '.yml', '.toml', '.html', '.htm'].includes(e))
+    return <FileCode {...props} className="text-subtle" />
+  return <FileText {...props} className="text-subtle" />
 }

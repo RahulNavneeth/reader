@@ -109,6 +109,16 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
     ingest: { status: 'pending', embedded: false },
   }
   await saveMeta(meta)
+  // Distinguish first-time-seen vs. content edit so the activity log shows
+  // "Uploaded" vs. "Edited on disk" for the same file. We don't know the
+  // editor's identity from the filesystem, so attribute to "system".
+  const { audit } = await import('../stores/audit.js')
+  await audit({
+    actor: 'system',
+    action: existing ? 'vault.edit' : 'vault.upload',
+    target: rel,
+    meta: { source: 'watcher', bytes: buffer.length },
+  })
   try {
     await ingestDocument(meta, buffer)
     log.info({ rel }, 'watcher: re-ingested')

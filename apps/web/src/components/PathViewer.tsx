@@ -219,6 +219,10 @@ export function PathViewer({ path }: Props) {
           onBack={() => goToFolder(parentDir)}
         />
         <div className="flex-1" />
+        {/* Default rendering: visibility starts as "Private" (the safe
+            default — most files are private) and flips to "Public" only
+            after meta confirms. Tags/Sparkles render with empty/false state
+            until meta arrives. */}
         {meta?.ingest.embedded && (
           <Sparkles size={13} className="text-accent shrink-0 mx-1" aria-label="indexed for AI search" />
         )}
@@ -241,7 +245,7 @@ export function PathViewer({ path }: Props) {
         <ActivityButton path={path} />
         <button
           className="btn-ghost"
-          disabled={visibilityBusy}
+          disabled={visibilityBusy || !meta}
           onClick={toggleVisibility}
           title={meta?.public ? 'Make private (requires auth)' : 'Make public (anyone with link can view)'}
           style={meta?.public ? { color: '#00875A' } : undefined}
@@ -409,5 +413,6 @@ export function PathViewer({ path }: Props) {
     </div>
   )
 }
+
 
 

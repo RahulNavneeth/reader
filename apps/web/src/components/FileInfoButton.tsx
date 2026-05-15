@@ -91,7 +91,24 @@ export function FileInfoButton({ path, meta }: Props) {
                   />
                   <InfoRow label="Indexed" value={<IngestStatus meta={meta} />} />
                   {meta.tags?.length > 0 && (
-                    <InfoRow label="Tags" value={meta.tags.join(', ')} />
+                    <InfoRow
+                      label="Tags"
+                      value={
+                        // Chips wrap; cap height so a doc with 100s of tags
+                        // doesn't blow out the popover.
+                        <div className="flex flex-wrap gap-1 max-h-[120px] overflow-y-auto">
+                          {meta.tags.map((t) => (
+                            <span
+                              key={t}
+                              className="inline-flex items-center px-1.5 h-[18px] rounded text-[11px]"
+                              style={{ background: 'var(--selected)', color: 'var(--accent)' }}
+                            >
+                              {t}
+                            </span>
+                          ))}
+                        </div>
+                      }
+                    />
                   )}
                   {meta.sha256 && (
                     <InfoRow

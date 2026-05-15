@@ -84,6 +84,8 @@ export function ActivityPanel({ path }: { path: string }) {
 function prettyAction(a: string): string {
   switch (a) {
     case 'vault.upload': return 'Uploaded'
+    case 'vault.edit': return 'Edited on disk'
+    case 'vault.replace': return 'Replaced'
     case 'vault.trash': return 'Moved to Trash'
     case 'vault.delete': return 'Deleted'
     case 'vault.move': return 'Moved'
@@ -103,7 +105,13 @@ function summarizeMeta(meta: Record<string, any> | undefined): string {
   if (!meta) return ''
   if (typeof meta.public === 'boolean') return meta.public ? 'made public' : 'made private'
   if (Array.isArray(meta.tags)) {
-    return meta.tags.length ? `[${meta.tags.join(', ')}]` : '(no tags)'
+    if (meta.tags.length === 0) return '(no tags)'
+    // Inline preview is only useful when you can scan all of it. Past 5 tags
+    // the slice is alphabetical noise — just show the count.
+    if (meta.tags.length <= 5) {
+      return `${meta.tags.length} tag${meta.tags.length === 1 ? '' : 's'} (${meta.tags.join(', ')})`
+    }
+    return `${meta.tags.length} tags`
   }
   if (typeof meta.count === 'number') return `${meta.count} files`
   return ''

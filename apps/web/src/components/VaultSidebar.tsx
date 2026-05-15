@@ -1,10 +1,21 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { VaultTree } from './VaultTree'
 import { useVault } from '../lib/vault-context'
+
+type FlatHit = {
+  path: string
+  name: string
+  ext: string
+  docId: string
+  tags: string[]
+  public: boolean
+  score: number
+  matchedTags: string[]
+}
 
 /**
  * The left rail used by both VaultView and the workspace-settings page.
@@ -24,10 +35,15 @@ export function VaultSidebar() {
 
   const [tree, setTree] = useState<VaultNode[] | null>(null)
   const [tags, setTags] = useState<Array<{ tag: string; count: number }> | null>(null)
-  const [tagsOpen, setTagsOpen] = useState(true)
+  // Collapsed by default — when the vault grows large the file tree is the
+  // primary nav; tags are a secondary index the user expands when needed.
+  const [tagsOpen, setTagsOpen] = useState(false)
+  const [tagFilter, setTagFilter] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
   const [dragOver, setDragOver] = useState(false)
+  const [searchHits, setSearchHits] = useState<FlatHit[] | null>(null)
+  const [searching, setSearching] = useState(false)
 
   const refetch = useCallback(async () => {
     try {
@@ -54,12 +70,33 @@ export function VaultSidebar() {
     e.dataTransfer.types.includes('Files') &&
     !e.dataTransfer.types.includes('application/x-reader-path')
 
-  const visibleTree = useMemo(() => {
-    if (!tree) return tree
-    const q = filter.trim().toLowerCase()
-    if (!q) return tree
-    return tree.filter((n) => n.name.toLowerCase().includes(q))
-  }, [tree, filter])
+  // Server-side filename + tag search for matches that live inside folders
+  // (which the top-level tree filter above can't see). Debounced so quick
+  // typing doesn't generate a request per keystroke.
+  useEffect(() => {
+    const q = filter.trim()
+    if (!q) {
+      setSearchHits(null)
+      setSearching(false)
+      return
+    }
+    setSearching(true)
+    let cancelled = false
+    const t = setTimeout(async () => {
+      try {
+        const r = await api.filesSearch(q, 50)
+        if (!cancelled) setSearchHits(r.items)
+      } catch {
+        if (!cancelled) setSearchHits([])
+      } finally {
+        if (!cancelled) setSearching(false)
+      }
+    }, 120)
+    return () => {
+      cancelled = true
+      clearTimeout(t)
+    }
+  }, [filter])
 
   return (
     <aside className="panel border-r border-app overflow-y-auto shrink-0 w-[320px] flex flex-col">
@@ -97,24 +134,10 @@ export function VaultSidebar() {
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
       >
-        {!tree ? (
-          <div className="px-3 py-2 text-[12.5px] text-muted">Loading…</div>
-        ) : tree.length === 0 ? null : visibleTree && visibleTree.length === 0 ? (
-          <div className="px-3 py-2 text-[12.5px] text-subtle">No files match "{filter}"</div>
-        ) : (
-          visibleTree?.map((node) => (
-            <VaultTree
-              key={node.path}
-              node={node}
-              depth={0}
-              selectedPath={openPath}
-              activePath={activePath}
-            />
-          ))
-        )}
-
-        {tags && tags.length > 0 && (
-          <div className="mt-3 mx-1">
+        {/* Tags live above the file tree so they stay reachable even when
+            the vault grows to hundreds of files. Collapsed by default. */}
+        {!filter.trim() && tags && tags.length > 0 && (
+          <div className="mb-2 mx-1">
             <button
               className="w-full flex items-center gap-1 px-2 h-6 text-[10.5px] uppercase tracking-wider font-semibold text-subtle hover:bg-hover rounded"
               onClick={() => setTagsOpen((v) => !v)}
@@ -128,31 +151,167 @@ export function VaultSidebar() {
               <span className="text-subtle font-normal normal-case ml-1">({tags.length})</span>
             </button>
             {tagsOpen && (
-              <div className="mt-0.5 space-y-0.5">
-                {tags.map((t) => {
-                  const isActive = activeTag === t.tag
-                  return (
-                    <button
-                      key={t.tag}
-                      onClick={() => navigate(`/tags/${encodeURIComponent(t.tag)}`)}
-                      className={clsx(
-                        'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
-                        !isActive && 'hover:bg-hover',
-                      )}
-                      style={{
-                        background: isActive ? 'var(--selected)' : 'transparent',
-                        color: isActive ? 'var(--accent)' : 'var(--fg)',
-                      }}
-                    >
-                      <Tag size={11} className={isActive ? 'text-accent' : 'text-muted'} />
-                      <span className="truncate flex-1">{t.tag}</span>
-                      <span className="text-[10.5px] text-subtle">{t.count}</span>
-                    </button>
-                  )
-                })}
-              </div>
+              <>
+                {tags.length > 12 && (
+                  <input
+                    className="w-full mt-1 mb-1 px-2 h-6 rounded text-[11.5px] outline-none"
+                    style={{
+                      background: 'var(--bg)',
+                      border: '1px solid var(--border)',
+                      color: 'var(--fg)',
+                    }}
+                    placeholder={`Filter ${tags.length} tags…`}
+                    value={tagFilter}
+                    onChange={(e) => setTagFilter(e.target.value)}
+                  />
+                )}
+                <div className="space-y-0.5 max-h-[240px] overflow-y-auto">
+                  {(() => {
+                    const q = tagFilter.trim().toLowerCase()
+                    const filtered = q
+                      ? tags.filter((t) => t.tag.includes(q))
+                      : tags
+                    const slice = filtered.slice(0, 200)
+                    if (filtered.length === 0) {
+                      return (
+                        <div className="px-2 py-1 text-[11px] text-subtle">
+                          No tags match "{tagFilter}"
+                        </div>
+                      )
+                    }
+                    return (
+                      <>
+                        {slice.map((t) => {
+                          const isActive = activeTag === t.tag
+                          return (
+                            <button
+                              key={t.tag}
+                              onClick={() => navigate(`/tags/${encodeURIComponent(t.tag)}`)}
+                              className={clsx(
+                                'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
+                                !isActive && 'hover:bg-hover',
+                              )}
+                              style={{
+                                background: isActive ? 'var(--selected)' : 'transparent',
+                                color: isActive ? 'var(--accent)' : 'var(--fg)',
+                              }}
+                            >
+                              <Tag size={11} className={isActive ? 'text-accent' : 'text-muted'} />
+                              <span className="truncate flex-1">{t.tag}</span>
+                              <span className="text-[10.5px] text-subtle">{t.count}</span>
+                            </button>
+                          )
+                        })}
+                        {filtered.length > slice.length && (
+                          <div className="px-2 py-1 text-[10.5px] text-subtle">
+                            …and {filtered.length - slice.length} more — refine the filter
+                          </div>
+                        )}
+                      </>
+                    )
+                  })()}
+                </div>
+              </>
             )}
           </div>
+        )}
+
+        {/* When filtering, render two flat sections — Tag names (click → tag
+            view) and File matches (click → doc viewer). The user explicitly
+            wants typing in this input to surface tag pages themselves, not
+            just files that carry the tag. */}
+        {filter.trim() ? (
+          (() => {
+            const q = filter.trim().toLowerCase()
+            const matchedTags = (tags ?? []).filter((t) => t.tag.includes(q)).slice(0, 8)
+            if (searchHits == null && searching && matchedTags.length === 0) {
+              return (
+                <div className="px-3 py-2 text-[12.5px] text-muted flex items-center gap-1.5">
+                  <Loader2 size={12} className="animate-spin" /> Searching…
+                </div>
+              )
+            }
+            if (matchedTags.length === 0 && (!searchHits || searchHits.length === 0)) {
+              return (
+                <div className="px-3 py-2 text-[12.5px] text-subtle">No matches for "{filter}"</div>
+              )
+            }
+            return (
+              <div className="space-y-2">
+                {matchedTags.length > 0 && (
+                  <div className="space-y-0.5">
+                    <div className="px-2 pt-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+                      Tags
+                    </div>
+                    {matchedTags.map((t) => {
+                      const isActive = activeTag === t.tag
+                      return (
+                        <button
+                          key={t.tag}
+                          onClick={() => navigate(`/tags/${encodeURIComponent(t.tag)}`)}
+                          className={clsx(
+                            'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
+                            !isActive && 'hover:bg-hover',
+                          )}
+                          style={{
+                            background: isActive ? 'var(--selected)' : 'transparent',
+                            color: isActive ? 'var(--accent)' : 'var(--fg)',
+                          }}
+                          title={`#${t.tag}`}
+                        >
+                          <Tag size={11} className={isActive ? 'text-accent' : 'text-muted'} />
+                          <span className="truncate flex-1">{t.tag}</span>
+                          <span className="text-[10.5px] text-subtle">{t.count}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+                {searchHits && searchHits.length > 0 && (
+                  <div className="space-y-0.5">
+                    <div className="px-2 pt-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+                      Files
+                    </div>
+                    {searchHits.map((h) => {
+                      const isActive = openPath === h.path
+                      return (
+                        <button
+                          key={h.path}
+                          onClick={() =>
+                            navigate('/docs/' + h.path.split('/').map(encodeURIComponent).join('/'))
+                          }
+                          className={clsx(
+                            'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
+                            !isActive && 'hover:bg-hover',
+                          )}
+                          style={{
+                            background: isActive ? 'var(--selected)' : 'transparent',
+                            color: isActive ? 'var(--accent)' : 'var(--fg)',
+                          }}
+                          title={h.path}
+                        >
+                          <FileText size={11} className={isActive ? 'text-accent' : 'text-muted'} />
+                          <span className="truncate flex-1">{h.name}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+          })()
+        ) : !tree ? (
+          <div className="px-3 py-2 text-[12.5px] text-muted">Loading…</div>
+        ) : tree.length === 0 ? null : (
+          tree.map((node) => (
+            <VaultTree
+              key={node.path}
+              node={node}
+              depth={0}
+              selectedPath={openPath}
+              activePath={activePath}
+            />
+          ))
         )}
 
         {(uploadingName || vaultError || error) && (

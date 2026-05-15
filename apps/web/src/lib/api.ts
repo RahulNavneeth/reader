@@ -256,6 +256,21 @@ export const api = {
         public: boolean
       }[]
     }>(`/api/files/by-tag${q({ tag })}`),
+  /** Cross-folder filename + tag search. Cheap; safe to call on each keystroke. */
+  filesSearch: (qstr: string, limit = 50) =>
+    get<{
+      q: string
+      items: {
+        path: string
+        name: string
+        ext: string
+        docId: string
+        tags: string[]
+        public: boolean
+        score: number
+        matchedTags: string[]
+      }[]
+    }>(`/api/files/search${q({ q: qstr, limit })}`),
   fileActivity: (rel: string, limit = 50) =>
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
       `/api/file/activity${q({ path: rel, limit })}`,
