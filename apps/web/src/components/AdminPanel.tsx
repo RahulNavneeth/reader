@@ -26,19 +26,11 @@ import {
   ApiError,
   api,
   type ApiTokenInfo,
-  type Grant,
   type PublicUser,
   type Role,
   type SystemInfo,
   type WorkspaceSettings,
 } from '../lib/api'
-import { PermissionTree } from './PermissionTree'
-
-const ROLE_PRESETS: Record<Role, Grant[]> = {
-  admin: [],
-  editor: [{ path: '', read: true, write: true, create: true }],
-  viewer: [{ path: '', read: true, write: false, create: false }],
-}
 
 type Section = 'general' | 'users' | 'trash' | 'stats' | 'duplicates' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens' | 'webhooks'
 
@@ -1169,14 +1161,9 @@ function UsersPanel() {
   const [newUsername, setNewUsername] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [newRole, setNewRole] = useState<Role>('viewer')
-  const [newGrants, setNewGrants] = useState<Grant[]>(ROLE_PRESETS.viewer)
   const [busy, setBusy] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
-  const [editGrants, setEditGrants] = useState<Grant[]>([])
   const [editQuotaMB, setEditQuotaMB] = useState<string>('')
-  const [defaultGrants, setDefaultGrants] = useState<Grant[]>([])
-  const [savingDefaults, setSavingDefaults] = useState(false)
-  const [defaultsMsg, setDefaultsMsg] = useState<string | null>(null)
 
   const refresh = () =>
     api
@@ -1186,27 +1173,17 @@ function UsersPanel() {
 
   useEffect(() => {
     refresh()
-    api
-      .adminSettings()
-      .then((r) => setDefaultGrants(r.settings.defaultGrants ?? ROLE_PRESETS.viewer))
-      .catch(() => {})
   }, [])
-
-  const setRolePreset = (role: Role) => {
-    setNewRole(role)
-    setNewGrants(role === 'admin' ? [] : ROLE_PRESETS[role])
-  }
 
   const create = async () => {
     if (!newUsername.trim() || newPassword.length < 8) return
     setBusy(true)
     setError(null)
     try {
-      await api.adminCreateUser(newUsername.trim(), newPassword, newRole, newGrants)
+      await api.adminCreateUser(newUsername.trim(), newPassword, newRole)
       setNewUsername('')
       setNewPassword('')
       setNewRole('viewer')
-      setNewGrants(ROLE_PRESETS.viewer)
       setAddOpen(false)
       refresh()
     } catch (e) {
@@ -1220,14 +1197,12 @@ function UsersPanel() {
     setNewUsername('')
     setNewPassword('')
     setNewRole('viewer')
-    setNewGrants(ROLE_PRESETS.viewer)
     setError(null)
     setAddOpen(true)
   }
 
   const startEdit = (u: PublicUser) => {
     setEditing(u.username)
-    setEditGrants(u.grants ?? ROLE_PRESETS[u.role])
     setEditQuotaMB(u.quotaBytes ? String(Math.round(u.quotaBytes / (1024 * 1024))) : '')
   }
 
@@ -1236,25 +1211,11 @@ function UsersPanel() {
     try {
       const parsed = editQuotaMB.trim() === '' ? null : Math.max(0, Number(editQuotaMB))
       const quotaBytes = parsed == null ? null : Math.round(parsed * 1024 * 1024)
-      await api.adminPatchUser(editing, { grants: editGrants, quotaBytes })
+      await api.adminPatchUser(editing, { quotaBytes })
       setEditing(null)
       refresh()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
-    }
-  }
-
-  const saveDefaults = async () => {
-    setSavingDefaults(true)
-    setDefaultsMsg(null)
-    try {
-      await api.adminPatchSettings({ defaultGrants })
-      setDefaultsMsg('Saved.')
-      setTimeout(() => setDefaultsMsg(null), 2500)
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setSavingDefaults(false)
     }
   }
 
@@ -1316,26 +1277,23 @@ function UsersPanel() {
             <select
               className="input"
               value={newRole}
-              onChange={(e) => setRolePreset(e.target.value as Role)}
+              onChange={(e) => setNewRole(e.target.value as Role)}
             >
               <option value="viewer">viewer</option>
               <option value="editor">editor</option>
               <option value="admin">admin</option>
             </select>
           </div>
-          {newRole !== 'admin' && (
-            <div className="mt-3">
-              <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
-                Access
-              </div>
-              <PermissionTree grants={newGrants} onChange={setNewGrants} />
-            </div>
-          )}
           {error && (
             <div className="text-[12px] mt-2" style={{ color: '#BF2600' }}>
               {error}
             </div>
           )}
+          <Hint>
+            New users start with an empty, isolated workspace. They can create
+            and upload anything under their own vault; cross-user access is via
+            explicit shares.
+          </Hint>
           <div className="flex justify-end gap-2 mt-4">
             <button className="btn-ghost" onClick={() => setAddOpen(false)}>
               Cancel
@@ -1351,21 +1309,6 @@ function UsersPanel() {
           </div>
         </Modal>
       )}
-
-      <Card title="Default access for new sign-ups">
-        <PermissionTree grants={defaultGrants} onChange={setDefaultGrants} />
-        <div className="flex items-center gap-3">
-          <button className="btn-primary" onClick={saveDefaults} disabled={savingDefaults}>
-            {savingDefaults ? <Loader2 size={13} className="animate-spin" /> : null}
-            Save defaults
-          </button>
-          {defaultsMsg && (
-            <span className="text-[11.5px]" style={{ color: '#00875A' }}>
-              {defaultsMsg}
-            </span>
-          )}
-        </div>
-      </Card>
 
       {error && <ErrText text={error} />}
 
@@ -1426,10 +1369,9 @@ function UsersPanel() {
                       </button>
                     </td>
                   </tr>
-                  {editing === u.username && u.role !== 'admin' && (
+                  {editing === u.username && (
                     <tr style={{ borderTop: '1px solid var(--border-soft)' }}>
                       <td colSpan={5} className="px-3 py-3 space-y-3" style={{ background: 'var(--panel)' }}>
-                        <PermissionTree grants={editGrants} onChange={setEditGrants} />
                         <div className="flex items-center gap-2">
                           <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle w-[120px]">
                             Upload quota
@@ -1453,16 +1395,6 @@ function UsersPanel() {
                             Save
                           </button>
                         </div>
-                      </td>
-                    </tr>
-                  )}
-                  {editing === u.username && u.role === 'admin' && (
-                    <tr style={{ borderTop: '1px solid var(--border-soft)' }}>
-                      <td colSpan={5} className="px-3 py-3 text-[12.5px] text-muted" style={{ background: 'var(--panel)' }}>
-                        Admins have full access — no per-path grants needed.
-                        <button className="btn-ghost ml-3" onClick={() => setEditing(null)}>
-                          Close
-                        </button>
                       </td>
                     </tr>
                   )}

@@ -13,7 +13,7 @@ import {
   publicUser,
   saveUser,
 } from '../stores/users.js'
-import { ROLE_PRESETS, sanitizeGrants } from '../lib/grants.js'
+import { ensureUserVault } from '../lib/userVault.js'
 import { createToken, deleteToken, listTokens } from '../stores/tokens.js'
 import { loadSettings, saveSettings, RESTART_REQUIRED_KEYS, type WorkspaceSettings } from '../stores/settings.js'
 import { hashPassword } from '../services/auth.js'
@@ -45,23 +45,12 @@ export async function adminRoutes(app: FastifyInstance) {
         role: roleSchema.optional(),
         disabled: z.boolean().optional(),
         quotaBytes: z.number().int().min(0).nullable().optional(),
-        grants: z
-          .array(
-            z.object({
-              path: z.string(),
-              read: z.boolean(),
-              write: z.boolean(),
-              create: z.boolean(),
-            }),
-          )
-          .optional(),
       })
       .parse(req.body)
     const next: User = {
       ...u,
       role: (body.role ?? u.role) as Role,
       disabled: body.disabled ?? u.disabled,
-      grants: body.grants ? sanitizeGrants(body.grants) : u.grants,
       quotaBytes:
         body.quotaBytes === undefined ? u.quotaBytes : body.quotaBytes ?? undefined,
     }
@@ -70,28 +59,17 @@ export async function adminRoutes(app: FastifyInstance) {
       actor: req.currentUser!.username,
       action: 'admin.user.patch',
       target: username,
-      meta: { ...body, grants: body.grants ? body.grants.length : undefined },
+      meta: { ...body },
     })
     return { user: publicUser(next) }
   })
 
   app.post('/api/admin/users', async (req, reply) => {
-    const grantSchema = z
-      .array(
-        z.object({
-          path: z.string(),
-          read: z.boolean(),
-          write: z.boolean(),
-          create: z.boolean(),
-        }),
-      )
-      .optional()
     const body = z
       .object({
         username: z.string().min(2).max(32),
         password: z.string().min(8).max(256),
         role: roleSchema.default('viewer'),
-        grants: grantSchema,
       })
       .parse(req.body)
     if (!isValidUsername(body.username)) {
@@ -100,20 +78,19 @@ export async function adminRoutes(app: FastifyInstance) {
     if (await getUser(body.username)) {
       return reply.code(409).send({ error: 'username taken' })
     }
-    const grants = body.grants ? sanitizeGrants(body.grants) : ROLE_PRESETS[body.role]
     const user: User = {
       username: body.username,
       passwordHash: await hashPassword(body.password),
       role: body.role,
       createdAt: Date.now(),
-      grants,
     }
     await saveUser(user)
+    await ensureUserVault(user.username).catch(() => null)
     await audit({
       actor: req.currentUser!.username,
       action: 'admin.user.create',
       target: user.username,
-      meta: { role: user.role, grantCount: grants.length },
+      meta: { role: user.role },
     })
     return reply.code(201).send({ user: publicUser(user) })
   })
@@ -136,18 +113,9 @@ export async function adminRoutes(app: FastifyInstance) {
   })
 
   app.patch('/api/admin/settings', async (req, reply) => {
-    const grantArr = z.array(
-      z.object({
-        path: z.string(),
-        read: z.boolean(),
-        write: z.boolean(),
-        create: z.boolean(),
-      }),
-    )
     const body = z
       .object({
         allowOpenSignup: z.boolean().optional(),
-        defaultGrants: grantArr.optional(),
         vaultRoot: z.string().optional(),
         ingest: z
           .object({
@@ -210,7 +178,6 @@ export async function adminRoutes(app: FastifyInstance) {
       ...current,
       ...(body.allowOpenSignup !== undefined && { allowOpenSignup: body.allowOpenSignup }),
       ...(body.vaultRoot !== undefined && { vaultRoot: body.vaultRoot }),
-      ...(body.defaultGrants !== undefined && { defaultGrants: sanitizeGrants(body.defaultGrants) }),
       ingest: { ...(current.ingest ?? {}), ...(body.ingest ?? {}) },
       ollama: { ...(current.ollama ?? {}), ...(body.ollama ?? {}) },
       storage: {

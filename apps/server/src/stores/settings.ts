@@ -2,7 +2,6 @@ import { readFile, writeFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { config } from '../config.js'
 import { ensureDir } from '../lib/fs.js'
-import type { Grant } from '../types.js'
 
 /**
  * Runtime workspace settings — persisted to `data/settings.json` and applied
@@ -13,8 +12,6 @@ import type { Grant } from '../types.js'
 export type WorkspaceSettings = {
   allowOpenSignup: boolean
   vaultRoot?: string
-  /** Default path-level grants seeded onto newly created or self-signed-up users. */
-  defaultGrants?: Grant[]
   ingest?: {
     maxFileBytes?: number
     chunkChars?: number

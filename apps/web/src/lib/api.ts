@@ -12,7 +12,6 @@ export type PublicUser = {
   role: Role
   createdAt: number
   disabled?: boolean
-  grants?: Grant[]
   /** Per-user upload cap in bytes. Unset/0 = unlimited. */
   quotaBytes?: number
 }
@@ -97,7 +96,6 @@ export type SearchHit = {
 export type WorkspaceSettings = {
   allowOpenSignup: boolean
   vaultRoot?: string
-  defaultGrants?: Grant[]
   ingest?: {
     maxFileBytes?: number
     chunkChars?: number
@@ -420,11 +418,11 @@ export const api = {
 
   // admin — users
   adminUsers: () => get<{ users: PublicUser[] }>('/api/admin/users'),
-  adminCreateUser: (username: string, password: string, role: Role, grants?: Grant[]) =>
-    post<{ user: PublicUser }>('/api/admin/users', { username, password, role, grants }),
+  adminCreateUser: (username: string, password: string, role: Role) =>
+    post<{ user: PublicUser }>('/api/admin/users', { username, password, role }),
   adminPatchUser: (
     username: string,
-    patch: { role?: Role; disabled?: boolean; grants?: Grant[]; quotaBytes?: number | null },
+    patch: { role?: Role; disabled?: boolean; quotaBytes?: number | null },
   ) =>
     request<{ user: PublicUser }>('PATCH', `/api/admin/users/${encodeURIComponent(username)}`, patch),
   adminDeleteUser: (username: string) =>

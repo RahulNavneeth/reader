@@ -15,12 +15,14 @@ const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000
 
 export type TrashEntry = {
   id: string
-  /** Original vault-relative path. */
+  /** Original vault-relative path inside `owner`'s namespace. */
   storageKey: string
   /** Filename (basename of storageKey). */
   filename: string
   /** Optional document meta id, if the file had an index record. */
   docId?: string
+  /** Username whose vault the file came out of (so restore puts it back). */
+  owner: string
   bytes: number
   trashedAt: number
   trashedBy: string
@@ -48,6 +50,7 @@ export async function moveToTrash(opts: {
   storageKey: string
   vaultAbs: string
   docId?: string
+  owner: string
   bytes: number
   trashedBy: string
 }): Promise<TrashEntry> {
@@ -71,6 +74,7 @@ export async function moveToTrash(opts: {
     storageKey: opts.storageKey,
     filename,
     docId: opts.docId,
+    owner: opts.owner,
     bytes: opts.bytes,
     trashedAt: Date.now(),
     trashedBy: opts.trashedBy,

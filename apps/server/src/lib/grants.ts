@@ -1,89 +1,46 @@
-import type { Grant, Role, User } from '../types.js'
+/**
+ * Access control in the per-user vault layout.
+ *
+ * Every vault path is now scoped to one user's namespace via
+ * `resolveUserVault` — there is no shared root anymore. As a result, the
+ * old path-level grant system collapses to two cases:
+ *
+ *   - admin: full access everywhere (still useful for cross-user reads)
+ *   - everyone else: full access inside *their own* namespace
+ *
+ * Cross-user access lives in the share store (Phase 3) and is checked at
+ * the share-boundary, not here.
+ *
+ * The helpers stay around so the existing call sites compile, but they're
+ * now trivial — they return true for the path resolver's guarantees plus
+ * admin override.
+ */
+import type { Role } from '../types.js'
 
 export type Op = 'read' | 'write' | 'create'
 
-function normalize(p: string): string {
-  return (p ?? '').replace(/^\/+|\/+$/g, '')
+export function userCan(user: { role: Role }, _op: Op, _vaultRelPath: string): boolean {
+  // Path is constrained to the user's namespace by resolveUserVault; if the
+  // request got here, the user implicitly owns it.
+  void _op
+  void _vaultRelPath
+  return user.role !== 'viewer' || _op === 'read'
 }
 
-function matches(grantPath: string, target: string): boolean {
-  const g = normalize(grantPath)
-  const t = normalize(target)
-  if (g === '') return true
-  if (g === t) return true
-  return t.startsWith(g + '/')
+export function canNavigateTo(_user: { role: Role }, _vaultRelPath: string): boolean {
+  void _user
+  void _vaultRelPath
+  return true
 }
 
-/**
- * Resolve effective grants for a user. Admins implicitly have full access. For
- * non-admins, grants come from the user record; legacy users without a grants
- * field get a sensible role-based default so the system stays usable.
- */
-export function effectiveGrants(user: { role: Role; grants?: Grant[] | null }): Grant[] {
-  if (user.role === 'admin') return [{ path: '', read: true, write: true, create: true }]
-  if (user.grants && user.grants.length) return user.grants
-  if (user.role === 'editor') return [{ path: '', read: true, write: true, create: true }]
-  if (user.role === 'viewer') return [{ path: '', read: true, write: false, create: false }]
-  return []
-}
-
-export function userCan(user: { role: Role; grants?: Grant[] | null }, op: Op, vaultRelPath: string): boolean {
-  const grants = effectiveGrants(user)
-  for (const g of grants) {
-    if (matches(g.path, vaultRelPath) && g[op]) return true
-  }
-  return false
-}
-
-/**
- * True if the user can at least navigate to `vaultRelPath` — i.e. they can
- * read it directly, an ancestor grants read, or a descendant grants read
- * (so the user needs the parent listing to reach the descendant).
- */
-export function canNavigateTo(user: { role: Role; grants?: Grant[] | null }, vaultRelPath: string): boolean {
-  const grants = effectiveGrants(user)
-  const t = normalize(vaultRelPath)
-  for (const g of grants) {
-    if (!g.read) continue
-    const gp = normalize(g.path)
-    if (gp === '') return true
-    if (t === '') return true
-    if (gp === t) return true
-    if (t.startsWith(gp + '/')) return true
-    if (gp.startsWith(t + '/')) return true
-  }
-  return false
-}
-
-/** Built-in presets used by the role dropdown. */
-export const ROLE_PRESETS: Record<Role, Grant[]> = {
+/** Built-in role presets — kept for back-compat with the old user-create flow. */
+export const ROLE_PRESETS = {
   admin: [],
-  editor: [{ path: '', read: true, write: true, create: true }],
-  viewer: [{ path: '', read: true, write: false, create: false }],
-}
+  editor: [],
+  viewer: [],
+} as const
 
-export function sanitizeGrants(input: unknown): Grant[] {
-  if (!Array.isArray(input)) return []
-  const out: Grant[] = []
-  const seen = new Set<string>()
-  for (const raw of input) {
-    if (!raw || typeof raw !== 'object') continue
-    const r = raw as Record<string, unknown>
-    const path = typeof r.path === 'string' ? normalize(r.path) : ''
-    if (seen.has(path)) continue
-    seen.add(path)
-    out.push({
-      path,
-      read: r.read === true,
-      write: r.write === true,
-      create: r.create === true,
-    })
-  }
-  return out
-}
-
-export function publicUserWithGrants(u: User) {
-  const { passwordHash: _ph, ...rest } = u
-  void _ph
-  return rest
+/** Used by the old admin user-patch endpoint; preserved as a no-op shim. */
+export function sanitizeGrants(_input: unknown): [] {
+  return []
 }

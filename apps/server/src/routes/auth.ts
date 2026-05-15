@@ -6,7 +6,7 @@ import { audit } from '../stores/audit.js'
 import { createSession, deleteSession } from '../stores/sessions.js'
 import { loadSettings } from '../stores/settings.js'
 import { getUser, isValidUsername, saveUser, userCount } from '../stores/users.js'
-import { ROLE_PRESETS, sanitizeGrants } from '../lib/grants.js'
+import { ensureUserVault } from '../lib/userVault.js'
 import type { User } from '../types.js'
 
 const credSchema = z.object({
@@ -32,20 +32,16 @@ export async function authRoutes(app: FastifyInstance) {
     }
     const passwordHash = await hashPassword(password)
     const role: User['role'] = existingCount === 0 ? 'admin' : 'viewer'
-    const grants =
-      role === 'admin'
-        ? ROLE_PRESETS.admin
-        : settings.defaultGrants?.length
-        ? sanitizeGrants(settings.defaultGrants)
-        : ROLE_PRESETS[role]
     const user: User = {
       username,
       passwordHash,
       role,
       createdAt: Date.now(),
-      grants,
     }
     await saveUser(user)
+    // Every new user gets their own empty vault subdir. Best-effort — a failure
+    // here doesn't block signup; first /api/list / upload will create it anyway.
+    await ensureUserVault(username).catch(() => null)
     const session = await createSession(username)
     app.setSessionCookie(reply, session.token, config.session.ttlMs)
     await audit({ actor: username, action: 'auth.signup', meta: { role }, ip: req.ip })

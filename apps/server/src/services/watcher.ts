@@ -12,6 +12,7 @@ import {
 } from '../stores/documents.js'
 import { ingestDocument } from './ingest.js'
 import { invalidateSearchCache } from './search.js'
+import { ownerFromAbs } from '../lib/userVault.js'
 import type { DocumentMeta } from '../types.js'
 
 const SUPPORTED_EXTS = new Set([
@@ -56,14 +57,6 @@ let current: FSWatcher | null = null
 let currentRoot: string | null = null
 const debounces = new Map<string, NodeJS.Timeout>()
 
-function vaultRel(abs: string): string {
-  const root = path.resolve(config.vault.root)
-  const a = path.resolve(abs)
-  if (a === root) return ''
-  if (!a.startsWith(root + path.sep)) return ''
-  return a.slice(root.length + 1)
-}
-
 function isSupported(rel: string): boolean {
   if (!rel) return false
   // Skip hidden files / dotfile components anywhere in the path.
@@ -73,7 +66,12 @@ function isSupported(rel: string): boolean {
 }
 
 async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<void> {
-  const rel = vaultRel(absPath)
+  // Derive the owner from the path's leading username segment. Loose files
+  // sitting directly under the shared root (no owner segment) are ignored —
+  // they're either marker files or pre-migration leftovers.
+  const owned = ownerFromAbs(absPath)
+  if (!owned) return
+  const { owner, rel } = owned
   if (!isSupported(rel)) return
   let buffer: Buffer
   let s
@@ -86,7 +84,7 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
   }
   const sha = sha256Of(buffer)
   const docs = await listAllDocuments()
-  const existing = docs.find((d) => d.storageKey === rel)
+  const existing = docs.find((d) => d.storageKey === rel && d.owner === owner)
   // No-op if disk content matches stored sha — saves work when the daemon
   // itself triggered the write (uploads, our own ingest writes, etc.).
   if (existing && existing.sha256 === sha) return
@@ -100,7 +98,7 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
     bytes: buffer.length,
     sha256: sha,
     storageKey: rel,
-    owner: existing?.owner ?? 'system',
+    owner: existing?.owner ?? owner,
     acl: existing?.acl ?? { readers: [], editors: [] },
     public: existing?.public,
     tags: existing?.tags ?? [],
@@ -134,14 +132,16 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
 }
 
 async function dropPath(absPath: string, log: FastifyBaseLogger): Promise<void> {
-  const rel = vaultRel(absPath)
+  const owned = ownerFromAbs(absPath)
+  if (!owned) return
+  const { owner, rel } = owned
   if (!rel) return
   const docs = await listAllDocuments()
-  const meta = docs.find((d) => d.storageKey === rel)
+  const meta = docs.find((d) => d.storageKey === rel && d.owner === owner)
   if (!meta) return
   await deleteDocument(meta.id)
   invalidateSearchCache()
-  log.info({ rel }, 'watcher: dropped index for deleted file')
+  log.info({ owner, rel }, 'watcher: dropped index for deleted file')
 }
 
 function schedule(absPath: string, action: () => Promise<void>): void {

@@ -21,7 +21,7 @@ import {
   writePreview,
 } from '../stores/documents.js'
 import { audit } from '../stores/audit.js'
-import { userCan } from '../lib/grants.js'
+import { userVaultRoot } from '../lib/userVault.js'
 import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 
 /**
@@ -52,16 +52,15 @@ export async function sharesRoutes(app: FastifyInstance) {
     }
     if (!body?.path) return reply.code(400).send({ error: 'missing path' })
 
-    // Must own / be an editor / have a write grant on the file.
-    const abs = path.join(config.vault.root, body.path)
+    // The path is interpreted within the requesting user's namespace.
+    const abs = path.join(userVaultRoot(user.username), body.path)
     const st = await stat(abs).catch(() => null)
     if (!st || !st.isFile()) return reply.code(404).send({ error: 'not found' })
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === body.path)
-    const canShare = meta
-      ? userCanEdit(meta, user.username, user.role)
-      : userCan(user, 'write', body.path) || user.role === 'admin'
-    if (!canShare) return reply.code(403).send({ error: 'forbidden' })
+    const meta = docs.find((d) => d.storageKey === body.path && d.owner === user.username)
+    if (meta && !userCanEdit(meta, user.username, user.role)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
 
     const exp =
       body.expiresInSeconds === null || body.expiresInSeconds === undefined
@@ -164,7 +163,7 @@ export async function sharesRoutes(app: FastifyInstance) {
       id: share.id,
       filename: path.basename(share.storageKey),
       ext: path.extname(share.storageKey).toLowerCase(),
-      mime: mimeFor(path.join(config.vault.root, share.storageKey)),
+      mime: mimeFor(path.join(userVaultRoot(share.createdBy), share.storageKey)),
       label: share.label,
       hasPassword: !!share.passwordHash,
       expiresAt: share.expiresAt,
@@ -174,7 +173,7 @@ export async function sharesRoutes(app: FastifyInstance) {
   app.get('/api/share/:id/text', async (req, reply) => {
     const share = await resolveShare(req, reply, req.params as { id: string })
     if (!share) return
-    const abs = path.join(config.vault.root, share.storageKey)
+    const abs = path.join(userVaultRoot(share.createdBy), share.storageKey)
     const ext = path.extname(abs).toLowerCase()
     // Native text types — read straight from disk so md edits are live.
     if (['.md', '.markdown', '.mdx', '.txt', '.csv', '.json', '.html', '.htm', '.yaml', '.yml', '.toml'].includes(ext)) {
@@ -218,7 +217,7 @@ export async function sharesRoutes(app: FastifyInstance) {
   app.get('/api/share/:id/preview', async (req, reply) => {
     const share = await resolveShare(req, reply, req.params as { id: string })
     if (!share) return
-    const abs = path.join(config.vault.root, share.storageKey)
+    const abs = path.join(userVaultRoot(share.createdBy), share.storageKey)
     const st = await stat(abs).catch(() => null)
     if (!st || !st.isFile()) return reply.code(404).send({ error: 'file missing' })
     const ext = path.extname(abs).toLowerCase()
@@ -325,7 +324,7 @@ async function serveRaw(
       return reply.code(401).send({ error: 'incorrect password' })
     }
   }
-  const abs = path.join(config.vault.root, share.storageKey)
+  const abs = path.join(userVaultRoot(share.createdBy), share.storageKey)
   const st = await stat(abs).catch(() => null)
   if (!st || !st.isFile()) return reply.code(404).send({ error: 'file missing' })
   await recordShareAccess(id)

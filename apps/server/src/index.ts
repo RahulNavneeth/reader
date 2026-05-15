@@ -24,6 +24,7 @@ import { isAvailable as ollamaUp } from './services/embed.js'
 import { loadSettings } from './stores/settings.js'
 import { startVaultWatcher } from './services/watcher.js'
 import { sweepExpiredTrash } from './stores/trash.js'
+import { migrateLegacyVault } from './services/migrate.js'
 
 async function main() {
   // Make sure all data subdirs exist before any store touches them.
@@ -135,6 +136,12 @@ async function main() {
   ollamaUp()
     .then((up) => app.log.info({ ollama: up ? 'reachable' : 'down', model: config.ollama.embedModel }, 'embed backend'))
     .catch(() => null)
+
+  // Migrate the legacy single-vault layout into per-user namespaces. Idempotent
+  // (drops a marker after the first run) so subsequent boots are no-ops.
+  await migrateLegacyVault(app.log).catch((err) =>
+    app.log.warn({ err }, 'vault migration failed'),
+  )
 
   // Watch the vault for external edits (Obsidian, vim, Finder) and re-ingest.
   startVaultWatcher(app.log).catch((err) => app.log.warn({ err }, 'vault watcher start failed'))

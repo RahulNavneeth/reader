@@ -35,32 +35,30 @@ import { generateThumbnail } from '../services/thumbnail.js'
 import { writeThumbnail, writePreview } from '../stores/documents.js'
 import { moveToTrash } from '../stores/trash.js'
 import { ingestDocument } from '../services/ingest.js'
-import { userCan, canNavigateTo } from '../lib/grants.js'
 import { invalidateSearchCache } from '../services/search.js'
 import { publish } from '../services/events.js'
 import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 import type { DocumentMeta } from '../types.js'
+import { resolveUserVault, userVaultRel, ensureUserVault, userVaultRoot } from '../lib/userVault.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
 
-function resolveVault(rel: string | undefined): string {
-  const r = (rel ?? '').replace(/^\/+/, '')
-  // Refuse traversal explicitly even though resolve() normalizes it.
-  if (r.includes('..')) throw httpErr(400, 'invalid path')
-  const abs = path.resolve(config.vault.root, r)
-  const root = path.resolve(config.vault.root)
-  if (abs !== root && !abs.startsWith(root + path.sep)) {
-    throw httpErr(403, 'path outside vault')
+/**
+ * Resolve a vault-relative path inside `owner`'s namespace. Every authed
+ * route passes `req.currentUser.username`; anonymous routes look up the
+ * file's DocumentMeta first to learn the owner from `meta.owner`.
+ */
+function resolveVault(rel: string | undefined, owner: string): string {
+  try {
+    return resolveUserVault(owner, rel)
+  } catch (e: any) {
+    if (e?.statusCode) throw e
+    throw httpErr(400, 'invalid path')
   }
-  return abs
 }
 
-function toVaultRel(abs: string): string {
-  const root = path.resolve(config.vault.root)
-  const a = path.resolve(abs)
-  if (a === root) return ''
-  if (!a.startsWith(root + path.sep)) throw new Error('not inside vault')
-  return a.slice(root.length + 1)
+function toVaultRel(abs: string, owner: string): string {
+  return userVaultRel(owner, abs)
 }
 
 function httpErr(status: number, message: string): Error & { statusCode: number } {
@@ -204,13 +202,17 @@ export async function vaultRoutes(app: FastifyInstance) {
 
   app.get('/api/home', async (req, reply) => {
     if (!requireAuth(req, reply)) return
-    return { vault: config.vault.root, separator: path.sep }
+    // Surface the requesting user's vault root (not the shared parent) so
+    // the UI / breadcrumbs are accurate per-user.
+    const user = req.currentUser!
+    return { vault: userVaultRoot(user.username), separator: path.sep }
   })
 
-  // Recursive list of every folder path in the vault — used by client-side
-  // autocomplete in the ⌘K palette (new-folder mode).
+  // Recursive list of every folder path in the user's vault.
   app.get('/api/folders', async (req, reply) => {
     if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    await ensureUserVault(user.username).catch(() => null)
     const out: string[] = []
     async function walk(absDir: string, rel: string): Promise<void> {
       let entries: import('node:fs').Dirent[]
@@ -227,15 +229,16 @@ export async function vaultRoutes(app: FastifyInstance) {
         await walk(path.join(absDir, e.name), childRel)
       }
     }
-    await walk(config.vault.root, '')
+    await walk(userVaultRoot(user.username), '')
     out.sort()
     return { folders: out }
   })
 
-  // Full vault tree (folders + files) — used by the permission picker UI so
-  // admins can grant access on either a folder or an individual file.
+  // Full vault tree (folders + files) for the requesting user.
   app.get('/api/vault-tree', async (req, reply) => {
     if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    await ensureUserVault(user.username).catch(() => null)
     const folders: string[] = []
     const files: string[] = []
     async function walk(absDir: string, rel: string): Promise<void> {
@@ -258,7 +261,7 @@ export async function vaultRoutes(app: FastifyInstance) {
         }
       }
     }
-    await walk(config.vault.root, '')
+    await walk(userVaultRoot(user.username), '')
     folders.sort()
     files.sort()
     return { folders, files }
@@ -270,10 +273,8 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
     const { path: rel = '' } = req.query as { path?: string }
-    if (!canNavigateTo(user, rel)) {
-      return reply.code(403).send({ error: 'forbidden' })
-    }
-    const dir = resolveVault(rel)
+    await ensureUserVault(user.username).catch(() => null)
+    const dir = resolveVault(rel, user.username)
 
     let entries: import('node:fs').Dirent[]
     try {
@@ -283,10 +284,12 @@ export async function vaultRoutes(app: FastifyInstance) {
       throw e
     }
 
-    // Build a map of vault-rel path → indexed-doc meta so we can decorate the tree.
+    // Build a map of vault-rel path → indexed-doc meta (scoped to files this
+    // user owns) so we can decorate the tree with index status.
     const docs = await listAllDocuments()
     const indexedByPath = new Map<string, DocumentMeta>()
     for (const d of docs) {
+      if (d.owner !== user.username) continue
       if (d.storageKey) indexedByPath.set(d.storageKey, d)
     }
 
@@ -294,17 +297,13 @@ export async function vaultRoutes(app: FastifyInstance) {
     for (const e of entries) {
       if (shouldSkipName(e.name)) continue
       const abs = path.join(dir, e.name)
-      const childRel = toVaultRel(abs)
+      const childRel = toVaultRel(abs, user.username)
       if (e.isDirectory()) {
-        // Hide subfolders the user can't read or navigate into.
-        if (!canNavigateTo(user, childRel)) continue
         items.push({ name: e.name, path: childRel, type: 'dir', hasChildren: true })
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase()
         if (!SUPPORTED_EXTS.has(ext)) continue
-        // Hide files the user can't read (unless they're public).
         const indexed = indexedByPath.get(childRel)
-        if (!userCan(user, 'read', childRel) && !indexed?.public) continue
         let size: number | undefined, mtime: number | undefined
         try {
           const s = await stat(abs)
@@ -338,22 +337,25 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/text', async (req, reply) => {
     const { path: rel } = req.query as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
 
+    // Resolution scope: if a public file matches the path use its owner;
+    // otherwise treat the request as the signed-in user's own namespace.
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
+    const requester = req.currentUser?.username
+    const meta =
+      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
+      docs.find((d) => d.storageKey === rel && d.public)
+    const owner = meta?.owner ?? requester
+    if (!owner) return reply.code(401).send({ error: 'auth required' })
 
-    // Allow without auth if explicitly public; otherwise require user + read access
-    // (grant on the path OR file ACL).
     if (!meta?.public) {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
-      const aclOk = !meta || userCanRead(meta, u.username, u.role)
-      const grantOk = userCan(u, 'read', rel)
-      if (!aclOk && !grantOk) {
+      if (meta && !userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
+    const abs = resolveVault(rel, owner)
 
     // If the on-disk file is gone (deleted out of band) but a doc record
     // lingers, drop the stale record so the next list call hides it. Returns
@@ -417,12 +419,15 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/raw', async (req, reply) => {
     const { path: rel } = req.query as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
-    const s = await stat(abs).catch(() => null)
-    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
 
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
+    const requester = req.currentUser?.username
+    const meta =
+      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
+      docs.find((d) => d.storageKey === rel && d.public)
+    const owner = meta?.owner ?? requester
+    if (!owner) return reply.code(401).send({ error: 'auth required' })
+
     if (!meta?.public) {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
@@ -430,6 +435,9 @@ export async function vaultRoutes(app: FastifyInstance) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
+    const abs = resolveVault(rel, owner)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
 
     const mime = inferMime(abs)
     const disposition = `inline; filename="${path.basename(abs).replace(/"/g, '')}"`
@@ -473,12 +481,14 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/preview', async (req, reply) => {
     const { path: rel } = req.query as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
-    const s = await stat(abs).catch(() => null)
-    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
-
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
+    const requester = req.currentUser?.username
+    const meta =
+      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
+      docs.find((d) => d.storageKey === rel && d.public)
+    const owner = meta?.owner ?? requester
+    if (!owner) return reply.code(401).send({ error: 'auth required' })
+
     if (!meta?.public) {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
@@ -486,6 +496,9 @@ export async function vaultRoutes(app: FastifyInstance) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
+    const abs = resolveVault(rel, owner)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
 
     const { isImageNeedingTranscode, isVideo, transcodeImageToJpeg, videoFrameAt } =
       await import('../services/media.js')
@@ -531,10 +544,15 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/thumbnail', async (req, reply) => {
     const { path: rel } = req.query as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
 
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
+    const requester = req.currentUser?.username
+    const meta =
+      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
+      docs.find((d) => d.storageKey === rel && d.public)
+    const owner = meta?.owner ?? requester
+    if (!owner) return reply.code(401).send({ error: 'auth required' })
+
     if (!meta?.public) {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
@@ -542,6 +560,7 @@ export async function vaultRoutes(app: FastifyInstance) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
+    const abs = resolveVault(rel, owner)
 
     if (meta) {
       const cached = await readThumbnail(meta.id)
@@ -601,12 +620,13 @@ export async function vaultRoutes(app: FastifyInstance) {
     const tagsCSV = ((fields?.tags as any)?.value as string | undefined) || ''
     const titleField = ((fields?.title as any)?.value as string | undefined) || ''
 
-    const targetDir = resolveVault(targetRel)
+    await ensureUserVault(user.username).catch(() => null)
+    const targetDir = resolveVault(targetRel, user.username)
     await mkdir(targetDir, { recursive: true })
 
     const filename = safeFilename(part.filename || 'upload.bin')
     const finalAbs = await uniquePath(targetDir, filename)
-    const finalRel = toVaultRel(finalAbs)
+    const finalRel = toVaultRel(finalAbs, user.username)
     await import('node:fs/promises').then(({ writeFile }) => writeFile(finalAbs, buffer))
 
     const mime = inferMime(filename, part.mimetype || undefined)
@@ -657,7 +677,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const { path: rel } = req.body as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
+    const abs = resolveVault(rel, user.username)
     const s = await stat(abs).catch(() => null)
     if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
 
@@ -665,9 +685,9 @@ export async function vaultRoutes(app: FastifyInstance) {
     const sha256 = sha256Of(buffer)
     const now = Date.now()
 
-    // Replace any existing index for this path.
+    // Replace any existing index for this path scoped to this user's owned files.
     const docs = await listAllDocuments()
-    const existing = docs.find((d) => d.storageKey === rel)
+    const existing = docs.find((d) => d.storageKey === rel && d.owner === user.username)
     const id = existing?.id ?? nanoid()
     if (existing) await deleteDocument(existing.id)
 
@@ -699,11 +719,11 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const { path: rel } = req.query as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
+    const abs = resolveVault(rel, user.username)
 
     // ACL: if an index exists, only owner / admin / listed editor can delete.
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
+    const meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
     if (meta && !userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
@@ -717,6 +737,7 @@ export async function vaultRoutes(app: FastifyInstance) {
         storageKey: rel,
         vaultAbs: abs,
         docId: meta?.id,
+        owner: user.username,
         bytes: s.size,
         trashedBy: user.username,
       }).catch((err) => {
@@ -735,8 +756,15 @@ export async function vaultRoutes(app: FastifyInstance) {
 
   app.get('/api/trash', async (req, reply) => {
     if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
     const { listTrash } = await import('../stores/trash.js')
-    const entries = await listTrash()
+    const all = await listTrash()
+    // Non-admins only see their own trash. Older entries (pre-owner-field)
+    // were owned by whoever trashed them — surface those to that user.
+    const entries =
+      user.role === 'admin'
+        ? all
+        : all.filter((e) => e.owner === user.username || (!e.owner && e.trashedBy === user.username))
     return { entries }
   })
 
@@ -749,8 +777,11 @@ export async function vaultRoutes(app: FastifyInstance) {
     const all = await listTrash()
     const entry = all.find((e) => e.id === id)
     if (!entry) return reply.code(404).send({ error: 'not found in trash' })
-    // Restore vault file.
-    const targetAbs = resolveVault(entry.storageKey)
+    // Restore vault file under the original owner's namespace.
+    if (entry.owner !== user.username && user.role !== 'admin') {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const targetAbs = resolveVault(entry.storageKey, entry.owner)
     await mkdir(path.dirname(targetAbs), { recursive: true })
     const blobName = entry.filename.replace(/\.\./g, '_').replace(/[\/\\]/g, '_')
     const src = path.join(config.paths.trash, entry.id, blobName)
@@ -800,13 +831,13 @@ export async function vaultRoutes(app: FastifyInstance) {
     let failed = 0
     for (const rel of body.paths) {
       try {
-        const abs = resolveVault(rel)
+        const abs = resolveVault(rel, user.username)
         const s = await stat(abs).catch(() => null)
         if (!s?.isFile()) {
           failed++
           continue
         }
-        let meta = docs.find((d) => d.storageKey === rel)
+        let meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
         if (!meta) {
           // Create stub meta so the public flag has somewhere to live.
           const filename = path.basename(abs)
@@ -858,8 +889,8 @@ export async function vaultRoutes(app: FastifyInstance) {
     let failed = 0
     for (const rel of body.paths) {
       try {
-        const abs = resolveVault(rel)
-        const meta = docs.find((d) => d.storageKey === rel)
+        const abs = resolveVault(rel, user.username)
+        const meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
         if (meta && !userCanEdit(meta, user.username, user.role)) {
           failed++
           continue
@@ -870,6 +901,7 @@ export async function vaultRoutes(app: FastifyInstance) {
             storageKey: rel,
             vaultAbs: abs,
             docId: meta?.id,
+            owner: user.username,
             bytes: s.size,
             trashedBy: user.username,
           })
@@ -894,7 +926,8 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const { path: rel } = req.body as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
+    await ensureUserVault(user.username).catch(() => null)
+    const abs = resolveVault(rel, user.username)
     await mkdir(abs, { recursive: true })
     await audit({ actor: user.username, action: 'vault.mkdir', target: rel })
     return { ok: true, path: rel }
@@ -906,14 +939,14 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const { from, to } = req.body as { from?: string; to?: string }
     if (!from || !to) return reply.code(400).send({ error: 'missing from/to' })
-    const absFrom = resolveVault(from)
-    const absTo = resolveVault(to)
+    const absFrom = resolveVault(from, user.username)
+    const absTo = resolveVault(to, user.username)
     await mkdir(path.dirname(absTo), { recursive: true })
     await rename(absFrom, absTo)
 
     // If indexed, update the storageKey.
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === from)
+    const meta = docs.find((d) => d.storageKey === from && d.owner === user.username)
     if (meta) {
       await saveMeta({ ...meta, storageKey: to, updatedAt: Date.now() })
     }
@@ -928,9 +961,11 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/meta', async (req, reply) => {
     const { path: rel } = req.query as { path?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const abs = resolveVault(rel)
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
+    const requester = req.currentUser?.username
+    const meta =
+      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
+      docs.find((d) => d.storageKey === rel && d.public)
     if (meta) {
       if (meta.public) return { meta }
       if (!requireAuth(req, reply)) return
@@ -940,11 +975,12 @@ export async function vaultRoutes(app: FastifyInstance) {
       }
       return { meta }
     }
-    // No persisted meta — synthesize a stub if the file exists in the vault.
-    const s = await stat(abs).catch(() => null)
-    if (!s || !s.isFile()) return { meta: null }
+    // No persisted meta — synthesize a stub if the file exists in the user's vault.
     if (!requireAuth(req, reply)) return
     const u = req.currentUser!
+    const abs = resolveVault(rel, u.username)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isFile()) return { meta: null }
     const filename = path.basename(abs)
     const stub: DocumentMeta = {
       id: '',
@@ -974,11 +1010,11 @@ export async function vaultRoutes(app: FastifyInstance) {
     const body = req.body as { path?: string; public?: boolean }
     if (!body?.path) return reply.code(400).send({ error: 'missing path' })
     if (typeof body.public !== 'boolean') return reply.code(400).send({ error: 'missing public flag' })
-    const abs = resolveVault(body.path)
+    const abs = resolveVault(body.path, user.username)
     const s = await stat(abs).catch(() => null)
     if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
     const docs = await listAllDocuments()
-    let meta = docs.find((d) => d.storageKey === body.path)
+    let meta = docs.find((d) => d.storageKey === body.path && d.owner === user.username)
     if (!meta) {
       // Create a minimal record — no ingest, just enough to track visibility.
       const filename = path.basename(abs)
@@ -1036,11 +1072,11 @@ export async function vaultRoutes(app: FastifyInstance) {
           .filter((t) => t.length > 0 && t.length <= 40),
       ),
     ).sort()
-    const abs = resolveVault(body.path)
+    const abs = resolveVault(body.path, user.username)
     const s = await stat(abs).catch(() => null)
     if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
     const docs = await listAllDocuments()
-    let meta = docs.find((d) => d.storageKey === body.path)
+    let meta = docs.find((d) => d.storageKey === body.path && d.owner === user.username)
     if (!meta) {
       const filename = path.basename(abs)
       meta = {
@@ -1090,7 +1126,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     const docs = await listAllDocuments()
     const meta = docs.find((d) => d.storageKey === rel)
     if (!meta) return reply.code(404).send({ error: 'not indexed' })
-    if (!userCanRead(meta, user.username, user.role) && !userCan(user, 'read', rel)) {
+    if (!userCanRead(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     const { listVersions } = await import('../stores/versions.js')
@@ -1110,7 +1146,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     const docs = await listAllDocuments()
     const meta = docs.find((d) => d.storageKey === rel)
     if (!meta) return reply.code(404).send({ error: 'not indexed' })
-    if (!userCanRead(meta, user.username, user.role) && !userCan(user, 'read', rel)) {
+    if (!userCanRead(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     const { readVersionText } = await import('../stores/versions.js')
@@ -1129,7 +1165,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!rel) return reply.code(400).send({ error: 'missing path' })
     const docs = await listAllDocuments()
     const meta = docs.find((d) => d.storageKey === rel)
-    if (meta && !userCanRead(meta, user.username, user.role) && !userCan(user, 'read', rel)) {
+    if (meta && !userCanRead(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     const { listAudit } = await import('../stores/audit.js')
@@ -1232,18 +1268,16 @@ export async function vaultRoutes(app: FastifyInstance) {
         if (shouldSkipName(e.name)) continue
         if (!e.isDirectory()) continue
         const childRel = rel ? `${rel}/${e.name}` : e.name
-        if (canNavigateTo(user, childRel)) {
-          const name = e.name.toLowerCase()
-          let score = 0
-          if (name === needle) score += 6
-          else if (name.startsWith(needle)) score += 4
-          else if (name.includes(needle)) score += 2
-          if (score > 0) folderHits.push({ path: childRel, name: e.name, score })
-        }
+        const name = e.name.toLowerCase()
+        let score = 0
+        if (name === needle) score += 6
+        else if (name.startsWith(needle)) score += 4
+        else if (name.includes(needle)) score += 2
+        if (score > 0) folderHits.push({ path: childRel, name: e.name, score })
         await walkFolders(path.join(absDir, e.name), childRel)
       }
     }
-    await walkFolders(config.vault.root, '')
+    await walkFolders(userVaultRoot(user.username), '')
     folderHits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
 
     return {
