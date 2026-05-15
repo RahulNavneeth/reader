@@ -20,6 +20,8 @@ export type User = {
   disabled?: boolean
   /** Path-level access grants. Admins ignore this — they always have full access. */
   grants?: Grant[]
+  /** Per-user upload cap in bytes. Undefined / 0 / negative = unlimited. */
+  quotaBytes?: number
 }
 
 export type Session = {

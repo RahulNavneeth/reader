@@ -44,6 +44,7 @@ export async function adminRoutes(app: FastifyInstance) {
       .object({
         role: roleSchema.optional(),
         disabled: z.boolean().optional(),
+        quotaBytes: z.number().int().min(0).nullable().optional(),
         grants: z
           .array(
             z.object({
@@ -61,6 +62,8 @@ export async function adminRoutes(app: FastifyInstance) {
       role: (body.role ?? u.role) as Role,
       disabled: body.disabled ?? u.disabled,
       grants: body.grants ? sanitizeGrants(body.grants) : u.grants,
+      quotaBytes:
+        body.quotaBytes === undefined ? u.quotaBytes : body.quotaBytes ?? undefined,
     }
     await saveUser(next)
     await audit({
@@ -581,6 +584,48 @@ export async function adminRoutes(app: FastifyInstance) {
     }
     out.sort((a, b) => b.docs.length - a.docs.length || b.bytes - a.bytes)
     return { groups: out }
+  })
+
+  // Webhook config CRUD. Stored in workspace settings — global, not per-user.
+  app.get('/api/admin/webhooks', async () => {
+    const s = await loadSettings()
+    return { webhooks: s.webhooks ?? [] }
+  })
+
+  app.post('/api/admin/webhooks', async (req, reply) => {
+    const body = z
+      .object({
+        url: z.string().url(),
+        events: z.array(z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility'])).min(1),
+        secret: z.string().optional(),
+        enabled: z.boolean().optional(),
+      })
+      .parse(req.body)
+    const s = await loadSettings()
+    const id = (await import('nanoid')).nanoid()
+    const hook = {
+      id,
+      url: body.url,
+      events: body.events,
+      secret: body.secret,
+      enabled: body.enabled ?? true,
+      createdAt: Date.now(),
+    }
+    const next = { ...s, webhooks: [...(s.webhooks ?? []), hook] }
+    await saveSettings(next)
+    await audit({ actor: req.currentUser!.username, action: 'admin.webhook.create', target: id })
+    return reply.code(201).send({ webhook: hook })
+  })
+
+  app.delete('/api/admin/webhooks/:id', async (req, reply) => {
+    const { id } = req.params as { id: string }
+    const s = await loadSettings()
+    const before = s.webhooks ?? []
+    const after = before.filter((h) => h.id !== id)
+    if (after.length === before.length) return reply.code(404).send({ error: 'not found' })
+    await saveSettings({ ...s, webhooks: after })
+    await audit({ actor: req.currentUser!.username, action: 'admin.webhook.delete', target: id })
+    return { ok: true }
   })
 
   // Per-item audit trail — the admin panel + the doc viewer's activity tab

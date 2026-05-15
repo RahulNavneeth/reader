@@ -73,6 +73,8 @@ export const config = {
     audit: path.join(dataDir, 'audit'),
     settings: path.join(dataDir, 'settings.json'),
     trash: path.join(dataDir, 'trash'),
+    shares: path.join(dataDir, 'shares'),
+    views: path.join(dataDir, 'views'),
   },
   storage: {
     /** 'local' = files under data/blobs/. 's3' = S3-compatible (MinIO/R2/AWS). */

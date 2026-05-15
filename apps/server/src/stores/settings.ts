@@ -54,6 +54,19 @@ export type WorkspaceSettings = {
     from?: string
     secure?: boolean
   }
+  webhooks?: WebhookConfig[]
+}
+
+export type WebhookConfig = {
+  id: string
+  url: string
+  /** Bitmask of events the hook subscribes to. */
+  events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+  /** Optional shared secret — sent as `X-Reader-Signature` (HMAC-SHA256 hex). */
+  secret?: string
+  enabled?: boolean
+  createdAt: number
+  lastDelivery?: { ts: number; status: number | null; error?: string }
 }
 
 const FILE = config.paths.settings

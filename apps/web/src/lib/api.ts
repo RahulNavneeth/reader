@@ -13,6 +13,21 @@ export type PublicUser = {
   createdAt: number
   disabled?: boolean
   grants?: Grant[]
+  /** Per-user upload cap in bytes. Unset/0 = unlimited. */
+  quotaBytes?: number
+}
+
+export type ShareInfo = {
+  id: string
+  storageKey: string
+  docId?: string
+  label?: string
+  createdBy: string
+  createdAt: number
+  expiresAt: number | null
+  hasPassword: boolean
+  lastAccessAt?: number
+  accessCount: number
 }
 
 export type IngestStatus = 'pending' | 'extracting' | 'embedding' | 'ready' | 'failed' | 'no-text'
@@ -275,6 +290,47 @@ export const api = {
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
       `/api/file/activity${q({ path: rel, limit })}`,
     ),
+
+  // share links
+  createShare: (rel: string, opts: { expiresInSeconds?: number | null; password?: string; label?: string }) =>
+    post<{ share: ShareInfo }>('/api/file/shares', {
+      path: rel,
+      expiresInSeconds: opts.expiresInSeconds ?? null,
+      password: opts.password || undefined,
+      label: opts.label || undefined,
+    }),
+  listShares: (rel?: string) =>
+    get<{ shares: ShareInfo[] }>(`/api/file/shares${rel ? q({ path: rel }) : ''}`),
+  // saved views
+  listViews: () =>
+    get<{ views: { id: string; name: string; query?: string; tag?: string; createdAt: number }[] }>(
+      '/api/views',
+    ),
+  createView: (v: { name: string; query?: string; tag?: string }) =>
+    post<{ view: { id: string; name: string; query?: string; tag?: string; createdAt: number } }>(
+      '/api/views',
+      v,
+    ),
+  deleteView: (id: string) =>
+    fetch(`/api/views/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    }).then(async (r) => {
+      if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
+      return r.json() as Promise<{ ok: true }>
+    }),
+
+  deleteShare: (id: string) =>
+    fetch(`/api/file/shares/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    }).then(async (r) => {
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}))
+        throw new ApiError(r.status, data?.error || `HTTP ${r.status}`)
+      }
+      return r.json() as Promise<{ ok: true }>
+    }),
   bulkSetVisibility: (paths: string[], isPublic: boolean) =>
     post<{ ok: number; failed: number }>('/api/file/bulk-visibility', { paths, public: isPublic }),
   bulkDelete: (paths: string[]) =>
@@ -327,7 +383,7 @@ export const api = {
     post<{ user: PublicUser }>('/api/admin/users', { username, password, role, grants }),
   adminPatchUser: (
     username: string,
-    patch: { role?: Role; disabled?: boolean; grants?: Grant[] },
+    patch: { role?: Role; disabled?: boolean; grants?: Grant[]; quotaBytes?: number | null },
   ) =>
     request<{ user: PublicUser }>('PATCH', `/api/admin/users/${encodeURIComponent(username)}`, patch),
   adminDeleteUser: (username: string) =>
@@ -376,6 +432,33 @@ export const api = {
       byOwner: { owner: string; count: number }[]
       recent: { id: string; title: string; storageKey: string; createdAt: number }[]
     }>('/api/admin/stats'),
+  adminWebhooks: () =>
+    get<{
+      webhooks: {
+        id: string
+        url: string
+        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+        secret?: string
+        enabled?: boolean
+        createdAt: number
+        lastDelivery?: { ts: number; status: number | null; error?: string }
+      }[]
+    }>('/api/admin/webhooks'),
+  adminCreateWebhook: (body: {
+    url: string
+    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+    secret?: string
+    enabled?: boolean
+  }) =>
+    post<{ webhook: any }>('/api/admin/webhooks', body),
+  adminDeleteWebhook: (id: string) =>
+    fetch(`/api/admin/webhooks/${id}`, { method: 'DELETE', credentials: 'include' }).then(
+      async (r) => {
+        if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
+        return r.json() as Promise<{ ok: true }>
+      },
+    ),
+
   adminDuplicates: () =>
     get<{
       groups: {

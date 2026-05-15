@@ -40,7 +40,7 @@ const ROLE_PRESETS: Record<Role, Grant[]> = {
   viewer: [{ path: '', read: true, write: false, create: false }],
 }
 
-type Section = 'general' | 'users' | 'trash' | 'stats' | 'duplicates' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens'
+type Section = 'general' | 'users' | 'trash' | 'stats' | 'duplicates' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens' | 'webhooks'
 
 type Group = {
   label: string
@@ -73,6 +73,7 @@ const GROUPS: Group[] = [
     label: 'Access',
     items: [
       { id: 'tokens', label: 'API tokens', icon: KeyRound },
+      { id: 'webhooks', label: 'Webhooks', icon: Send },
       { id: 'advanced', label: 'Server & sessions', icon: Settings },
     ],
   },
@@ -157,6 +158,7 @@ export function AdminPanel() {
             {section === 'mail' && <MailPanel />}
             {section === 'advanced' && <AdvancedPanel />}
             {section === 'tokens' && <TokensPanel />}
+            {section === 'webhooks' && <WebhooksPanel />}
           </div>
         </div>
       </main>
@@ -1171,6 +1173,7 @@ function UsersPanel() {
   const [busy, setBusy] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
   const [editGrants, setEditGrants] = useState<Grant[]>([])
+  const [editQuotaMB, setEditQuotaMB] = useState<string>('')
   const [defaultGrants, setDefaultGrants] = useState<Grant[]>([])
   const [savingDefaults, setSavingDefaults] = useState(false)
   const [defaultsMsg, setDefaultsMsg] = useState<string | null>(null)
@@ -1225,12 +1228,15 @@ function UsersPanel() {
   const startEdit = (u: PublicUser) => {
     setEditing(u.username)
     setEditGrants(u.grants ?? ROLE_PRESETS[u.role])
+    setEditQuotaMB(u.quotaBytes ? String(Math.round(u.quotaBytes / (1024 * 1024))) : '')
   }
 
   const saveEdit = async () => {
     if (!editing) return
     try {
-      await api.adminPatchUser(editing, { grants: editGrants })
+      const parsed = editQuotaMB.trim() === '' ? null : Math.max(0, Number(editQuotaMB))
+      const quotaBytes = parsed == null ? null : Math.round(parsed * 1024 * 1024)
+      await api.adminPatchUser(editing, { grants: editGrants, quotaBytes })
       setEditing(null)
       refresh()
     } catch (e) {
@@ -1422,9 +1428,24 @@ function UsersPanel() {
                   </tr>
                   {editing === u.username && u.role !== 'admin' && (
                     <tr style={{ borderTop: '1px solid var(--border-soft)' }}>
-                      <td colSpan={5} className="px-3 py-3" style={{ background: 'var(--panel)' }}>
+                      <td colSpan={5} className="px-3 py-3 space-y-3" style={{ background: 'var(--panel)' }}>
                         <PermissionTree grants={editGrants} onChange={setEditGrants} />
-                        <div className="flex justify-end gap-2 mt-2">
+                        <div className="flex items-center gap-2">
+                          <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle w-[120px]">
+                            Upload quota
+                          </div>
+                          <input
+                            type="number"
+                            min={0}
+                            className="input h-7 text-[12px]"
+                            style={{ width: 140 }}
+                            placeholder="Unlimited"
+                            value={editQuotaMB}
+                            onChange={(e) => setEditQuotaMB(e.target.value)}
+                          />
+                          <span className="text-[11.5px] text-subtle">MB (blank = unlimited)</span>
+                        </div>
+                        <div className="flex justify-end gap-2">
                           <button className="btn-ghost" onClick={() => setEditing(null)}>
                             Cancel
                           </button>
@@ -1775,6 +1796,203 @@ function DuplicatesPanel() {
           </div>
         </Card>
       ))}
+    </div>
+  )
+}
+
+// ─── Webhooks ───────────────────────────────────────────────────────────────
+
+type Hook = {
+  id: string
+  url: string
+  events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+  secret?: string
+  enabled?: boolean
+  createdAt: number
+  lastDelivery?: { ts: number; status: number | null; error?: string }
+}
+
+const HOOK_EVENTS: Hook['events'] = ['upload', 'edit', 'delete', 'share', 'tags', 'visibility']
+
+function WebhooksPanel() {
+  const [hooks, setHooks] = useState<Hook[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [newUrl, setNewUrl] = useState('')
+  const [newSecret, setNewSecret] = useState('')
+  const [newEvents, setNewEvents] = useState<Set<Hook['events'][number]>>(new Set(['upload', 'delete']))
+  const [creating, setCreating] = useState(false)
+
+  const refresh = () =>
+    api
+      .adminWebhooks()
+      .then((r) => setHooks(r.webhooks))
+      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+
+  useEffect(() => {
+    refresh()
+  }, [])
+
+  const create = async () => {
+    if (!newUrl.trim() || newEvents.size === 0) return
+    setCreating(true)
+    setError(null)
+    try {
+      await api.adminCreateWebhook({
+        url: newUrl.trim(),
+        events: Array.from(newEvents),
+        secret: newSecret.trim() || undefined,
+        enabled: true,
+      })
+      setNewUrl('')
+      setNewSecret('')
+      setNewEvents(new Set(['upload', 'delete']))
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const remove = async (id: string) => {
+    if (!confirm('Delete this webhook? Future events will not be delivered.')) return
+    try {
+      await api.adminDeleteWebhook(id)
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      <Card title="New webhook">
+        <FieldRow label="URL">
+          <input
+            className="input"
+            placeholder="https://example.com/hook"
+            value={newUrl}
+            onChange={(e) => setNewUrl(e.target.value)}
+          />
+        </FieldRow>
+        <FieldRow label="HMAC secret">
+          <input
+            className="input"
+            placeholder="optional — signs payload as X-Reader-Signature"
+            value={newSecret}
+            onChange={(e) => setNewSecret(e.target.value)}
+          />
+        </FieldRow>
+        <div>
+          <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
+            Events
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {HOOK_EVENTS.map((ev) => {
+              const on = newEvents.has(ev)
+              return (
+                <button
+                  key={ev}
+                  className="px-2 h-6 rounded text-[11.5px]"
+                  style={{
+                    background: on ? 'var(--selected)' : 'var(--panel)',
+                    color: on ? 'var(--accent)' : 'var(--fg)',
+                    border: `1px solid ${on ? 'var(--accent)' : 'var(--border)'}`,
+                  }}
+                  onClick={() => {
+                    const next = new Set(newEvents)
+                    if (on) next.delete(ev)
+                    else next.add(ev)
+                    setNewEvents(next)
+                  }}
+                >
+                  {ev}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+        <div className="flex items-center gap-3 pt-1">
+          <button
+            className="btn-primary"
+            onClick={create}
+            disabled={creating || !newUrl.trim() || newEvents.size === 0}
+          >
+            {creating ? <Loader2 size={13} className="animate-spin" /> : <Plus size={14} />}
+            Create
+          </button>
+          {error && (
+            <span className="text-[12px]" style={{ color: '#BF2600' }}>
+              {error}
+            </span>
+          )}
+        </div>
+        <Hint>
+          Payload is JSON: <code className="text-subtle">{`{ type, path, actor, ts, ... }`}</code>. If
+          a secret is set, requests include <code className="text-subtle">X-Reader-Signature</code>
+          (HMAC-SHA256 hex over the body).
+        </Hint>
+      </Card>
+
+      <div>
+        <SectionLabel>
+          {hooks ? `${hooks.length} webhook${hooks.length === 1 ? '' : 's'}` : ''}
+        </SectionLabel>
+        {!hooks && <Muted text="Loading…" />}
+        {hooks && hooks.length === 0 && <Muted text="No webhooks configured." />}
+        {hooks && hooks.length > 0 && (
+          <div className="rounded border border-app overflow-hidden">
+            <table className="w-full text-[13px]">
+              <thead style={{ background: 'var(--panel)' }}>
+                <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
+                  <th className="px-3 py-2 font-semibold">URL</th>
+                  <th className="px-3 py-2 font-semibold">Events</th>
+                  <th className="px-3 py-2 font-semibold">Last delivery</th>
+                  <th className="px-3 py-2"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {hooks.map((h) => (
+                  <tr key={h.id} className="border-t" style={{ borderColor: 'var(--border-soft)' }}>
+                    <td className="px-3 py-2 text-fg break-all" style={{ maxWidth: 280 }}>
+                      {h.url}
+                    </td>
+                    <td className="px-3 py-2 text-muted text-[11.5px]">
+                      {h.events.join(', ')}
+                    </td>
+                    <td className="px-3 py-2 text-[11.5px]">
+                      {h.lastDelivery ? (
+                        h.lastDelivery.error ? (
+                          <span style={{ color: '#BF2600' }}>
+                            {new Date(h.lastDelivery.ts).toLocaleString()} · {h.lastDelivery.error}
+                          </span>
+                        ) : (
+                          <span style={{ color: '#00875A' }}>
+                            {new Date(h.lastDelivery.ts).toLocaleString()} ·{' '}
+                            {h.lastDelivery.status ?? 'ok'}
+                          </span>
+                        )
+                      ) : (
+                        <span className="text-subtle">—</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        className="btn-ghost"
+                        onClick={() => remove(h.id)}
+                        title="Delete"
+                        style={{ color: '#BF2600' }}
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

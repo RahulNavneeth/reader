@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText } from 'lucide-react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Bookmark, Save } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
@@ -39,6 +39,10 @@ export function VaultSidebar() {
   // primary nav; tags are a secondary index the user expands when needed.
   const [tagsOpen, setTagsOpen] = useState(false)
   const [tagFilter, setTagFilter] = useState('')
+  const [views, setViews] = useState<
+    Array<{ id: string; name: string; query?: string; tag?: string; createdAt: number }>
+  >([])
+  const [viewsOpen, setViewsOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
   const [dragOver, setDragOver] = useState(false)
@@ -47,9 +51,14 @@ export function VaultSidebar() {
 
   const refetch = useCallback(async () => {
     try {
-      const [list, tagsR] = await Promise.all([api.list(''), api.tags().catch(() => ({ tags: [] }))])
+      const [list, tagsR, viewsR] = await Promise.all([
+        api.list(''),
+        api.tags().catch(() => ({ tags: [] })),
+        api.listViews().catch(() => ({ views: [] })),
+      ])
       setTree(list.items)
       setTags(tagsR.tags)
+      setViews(viewsR.views)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     }
@@ -107,18 +116,36 @@ export function VaultSidebar() {
         <div className="relative w-full">
           <Filter size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-subtle pointer-events-none" />
           <input
-            className="input pl-8 h-7 text-[12.5px]"
+            className="input pl-8 pr-7 h-7 text-[12.5px]"
             placeholder="Filter files (⌘K for search)…"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
           />
           {filter && (
-            <button
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 btn-ghost h-5 w-5 px-0"
-              onClick={() => setFilter('')}
-            >
-              <X size={11} />
-            </button>
+            <>
+              <button
+                className="absolute right-7 top-1/2 -translate-y-1/2 btn-ghost h-5 w-5 px-0"
+                onClick={async () => {
+                  const name = window.prompt('Save this filter as a view. Name?')
+                  if (!name?.trim()) return
+                  try {
+                    await api.createView({ name: name.trim(), query: filter.trim() })
+                    refetch()
+                  } catch (e) {
+                    setError(e instanceof ApiError ? e.message : String(e))
+                  }
+                }}
+                title="Save current filter as a view"
+              >
+                <Save size={11} />
+              </button>
+              <button
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 btn-ghost h-5 w-5 px-0"
+                onClick={() => setFilter('')}
+              >
+                <X size={11} />
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -134,6 +161,63 @@ export function VaultSidebar() {
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
       >
+        {/* Saved views — quick re-apply of past filter combos. Only renders
+            when the user has actually saved at least one; collapsed by
+            default to stay out of the way. */}
+        {!filter.trim() && views.length > 0 && (
+          <div className="mb-2 mx-1">
+            <button
+              className="w-full flex items-center gap-1 px-2 h-6 text-[10.5px] uppercase tracking-wider font-semibold text-subtle hover:bg-hover rounded"
+              onClick={() => setViewsOpen((v) => !v)}
+            >
+              <ChevronRight
+                size={11}
+                className="transition-transform"
+                style={{ transform: viewsOpen ? 'rotate(90deg)' : undefined }}
+              />
+              Views
+              <span className="text-subtle font-normal normal-case ml-1">({views.length})</span>
+            </button>
+            {viewsOpen && (
+              <div className="space-y-0.5 mt-0.5">
+                {views.map((v) => (
+                  <div
+                    key={v.id}
+                    className="group flex items-center gap-1 px-2 h-7 rounded hover:bg-hover"
+                  >
+                    <button
+                      className="flex-1 flex items-center gap-2 text-[12.5px] text-fg text-left min-w-0"
+                      onClick={() => {
+                        if (v.tag) navigate(`/tags/${encodeURIComponent(v.tag)}`)
+                        else if (v.query) setFilter(v.query)
+                      }}
+                      title={v.tag ? `#${v.tag}` : v.query}
+                    >
+                      <Bookmark size={11} className="text-muted shrink-0" />
+                      <span className="truncate">{v.name}</span>
+                    </button>
+                    <button
+                      className="opacity-0 group-hover:opacity-100 btn-ghost h-5 w-5 px-0"
+                      onClick={async () => {
+                        if (!window.confirm(`Delete view "${v.name}"?`)) return
+                        try {
+                          await api.deleteView(v.id)
+                          refetch()
+                        } catch {
+                          /* ignore */
+                        }
+                      }}
+                      title="Delete view"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Tags live above the file tree so they stay reachable even when
             the vault grows to hundreds of files. Collapsed by default. */}
         {!filter.trim() && tags && tags.length > 0 && (

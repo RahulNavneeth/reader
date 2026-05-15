@@ -38,6 +38,7 @@ import { ingestDocument } from '../services/ingest.js'
 import { userCan, canNavigateTo } from '../lib/grants.js'
 import { invalidateSearchCache } from '../services/search.js'
 import { publish } from '../services/events.js'
+import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 import type { DocumentMeta } from '../types.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
@@ -579,6 +580,22 @@ export async function vaultRoutes(app: FastifyInstance) {
     const buffer = await part.toBuffer()
     if (buffer.length === 0) return reply.code(400).send({ error: 'empty file' })
 
+    // Quota check. Sums bytes across docs the user owns; rejects if this
+    // upload would push them over their configured cap. Admins are exempt
+    // because they're the one setting the limits.
+    if (user.role !== 'admin' && user.quotaBytes && user.quotaBytes > 0) {
+      const docs = await listAllDocuments()
+      const used = docs.reduce((sum, d) => (d.owner === user.username ? sum + (d.bytes || 0) : sum), 0)
+      if (used + buffer.length > user.quotaBytes) {
+        return reply.code(413).send({
+          error: 'quota exceeded',
+          quota: user.quotaBytes,
+          used,
+          incoming: buffer.length,
+        })
+      }
+    }
+
     const fields = part.fields as Record<string, { value: string } | undefined>
     const targetRel = ((fields?.path as any)?.value as string | undefined) || ''
     const tagsCSV = ((fields?.tags as any)?.value as string | undefined) || ''
@@ -619,6 +636,12 @@ export async function vaultRoutes(app: FastifyInstance) {
       target: finalRel,
       meta: { bytes: buffer.length, mime },
     })
+    dispatchWebhook({
+      type: 'upload',
+      path: finalRel,
+      actor: user.username,
+      bytes: buffer.length,
+    }).catch(() => null)
     return reply.code(201).send({ document: finalMeta, path: finalRel })
   })
 
@@ -697,6 +720,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     invalidateSearchCache()
     publish({ type: 'trash', path: rel })
+    dispatchWebhook({ type: 'delete', path: rel, actor: user.username }).catch(() => null)
     await audit({ actor: user.username, action: 'vault.trash', target: rel })
     return { ok: true }
   })
@@ -973,6 +997,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     const next: DocumentMeta = { ...meta, public: body.public, updatedAt: Date.now() }
     await saveMeta(next)
     publish({ type: 'visibility', path: body.path, public: body.public })
+    dispatchWebhook({
+      type: 'visibility',
+      path: body.path,
+      actor: user.username,
+      public: body.public,
+    }).catch(() => null)
     await audit({
       actor: user.username,
       action: 'vault.visibility',
@@ -1029,6 +1059,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     await saveMeta(next)
     invalidateSearchCache()
     publish({ type: 'tags', path: body.path, tags })
+    dispatchWebhook({
+      type: 'tags',
+      path: body.path,
+      actor: user.username,
+      tags,
+    }).catch(() => null)
     await audit({
       actor: user.username,
       action: 'vault.tags',
