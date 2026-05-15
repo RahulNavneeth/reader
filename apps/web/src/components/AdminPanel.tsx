@@ -40,7 +40,7 @@ const ROLE_PRESETS: Record<Role, Grant[]> = {
   viewer: [{ path: '', read: true, write: false, create: false }],
 }
 
-type Section = 'general' | 'users' | 'trash' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens'
+type Section = 'general' | 'users' | 'trash' | 'stats' | 'duplicates' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens'
 
 type Group = {
   label: string
@@ -59,6 +59,8 @@ const GROUPS: Group[] = [
   {
     label: 'Data',
     items: [
+      { id: 'stats', label: 'Stats', icon: Database },
+      { id: 'duplicates', label: 'Duplicates', icon: Copy },
       { id: 'embeddings', label: 'Search & embeddings', icon: Sparkles },
       { id: 'storage', label: 'Storage', icon: Database },
     ],
@@ -148,6 +150,8 @@ export function AdminPanel() {
             {section === 'general' && <GeneralPanel />}
             {section === 'users' && <UsersPanel />}
             {section === 'trash' && <TrashPanel />}
+            {section === 'stats' && <StatsPanel />}
+            {section === 'duplicates' && <DuplicatesPanel />}
             {section === 'embeddings' && <EmbeddingsPanel />}
             {section === 'storage' && <StoragePanel />}
             {section === 'mail' && <MailPanel />}
@@ -1592,6 +1596,187 @@ function formatBytes(b: number): string {
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
   if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`
   return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+// ─── Stats ──────────────────────────────────────────────────────────────────
+
+function StatsPanel() {
+  const [data, setData] = useState<Awaited<ReturnType<typeof api.adminStats>> | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    api
+      .adminStats()
+      .then(setData)
+      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+  }, [])
+  if (error) return <ErrText text={error} />
+  if (!data) return <Muted text="Loading…" />
+  return (
+    <div className="space-y-5">
+      <Card title="Totals">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          <Metric label="Documents" value={data.totals.documents.toLocaleString()} />
+          <Metric label="Users" value={data.totals.users.toLocaleString()} />
+          <Metric label="Public" value={data.totals.publicDocs.toLocaleString()} />
+          <Metric label="Embedded" value={data.totals.embeddedDocs.toLocaleString()} />
+          <Metric label="Total size" value={formatBytes(data.totals.bytes)} />
+        </div>
+      </Card>
+      <Card title="Ingest status">
+        <StatTable
+          rows={Object.entries(data.byStatus).map(([k, v]) => [k, v.toLocaleString()])}
+          labelCol="Status"
+        />
+      </Card>
+      <Card title="By extension">
+        <StatTable rows={data.byExt.slice(0, 15).map((r) => [r.ext, r.count.toLocaleString()])} labelCol="Ext" />
+      </Card>
+      <Card title="By owner">
+        <StatTable rows={data.byOwner.map((r) => [r.owner, r.count.toLocaleString()])} labelCol="User" />
+      </Card>
+      <Card title="Recent uploads">
+        <StatTable
+          rows={data.recent
+            .slice(0, 10)
+            .map((r) => [r.title || r.storageKey, new Date(r.createdAt).toLocaleString()])}
+          labelCol="Document"
+        />
+      </Card>
+    </div>
+  )
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div
+      className="rounded border px-3 py-2"
+      style={{ borderColor: 'var(--border-soft)', background: 'var(--panel)' }}
+    >
+      <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">{label}</div>
+      <div className="text-[16px] font-semibold text-fg mt-0.5" style={{ fontVariantNumeric: 'tabular-nums' }}>
+        {value}
+      </div>
+    </div>
+  )
+}
+
+function StatTable({ rows, labelCol }: { rows: [string, string][]; labelCol: string }) {
+  if (rows.length === 0) return <Muted text="No data." />
+  return (
+    <div className="rounded border border-app overflow-hidden">
+      <table className="w-full text-[12.5px]">
+        <thead style={{ background: 'var(--panel)' }}>
+          <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
+            <th className="px-3 py-1.5 font-semibold">{labelCol}</th>
+            <th className="px-3 py-1.5 font-semibold text-right">Count</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([k, v]) => (
+            <tr key={k} className="border-t" style={{ borderColor: 'var(--border-soft)' }}>
+              <td className="px-3 py-1.5 text-fg break-all">{k}</td>
+              <td className="px-3 py-1.5 text-right text-muted" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                {v}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+// ─── Duplicates ─────────────────────────────────────────────────────────────
+
+function DuplicatesPanel() {
+  const [groups, setGroups] = useState<Awaited<ReturnType<typeof api.adminDuplicates>>['groups'] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  const refresh = () =>
+    api
+      .adminDuplicates()
+      .then((r) => setGroups(r.groups))
+      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+
+  useEffect(() => {
+    refresh()
+  }, [])
+
+  const trash = async (storageKey: string) => {
+    if (!confirm(`Move "${storageKey}" to Trash?`)) return
+    setBusy(storageKey)
+    setError(null)
+    try {
+      await api.deleteFile(storageKey)
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  if (error) return <ErrText text={error} />
+  if (!groups) return <Muted text="Loading…" />
+  if (groups.length === 0) return <Muted text="No duplicates — every file's sha256 is unique." />
+
+  return (
+    <div className="space-y-5">
+      <Hint>
+        Groups of files that share a sha256. Keep one and Trash the rest, or Trash all to clear them.
+      </Hint>
+      {groups.map((g) => (
+        <Card key={g.sha256} title={`${g.docs.length} copies • ${formatBytes(g.bytes)} each`}>
+          <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+            sha256
+          </div>
+          <code className="text-[11px] text-muted break-all block mb-2">{g.sha256}</code>
+          <div className="rounded border border-app overflow-hidden">
+            <table className="w-full text-[12.5px]">
+              <thead style={{ background: 'var(--panel)' }}>
+                <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
+                  <th className="px-3 py-1.5 font-semibold">Path</th>
+                  <th className="px-3 py-1.5 font-semibold">Owner</th>
+                  <th className="px-3 py-1.5 font-semibold">Uploaded</th>
+                  <th className="px-3 py-1.5"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {g.docs.map((d, i) => (
+                  <tr key={d.id} className="border-t" style={{ borderColor: 'var(--border-soft)' }}>
+                    <td className="px-3 py-1.5 text-fg break-all">
+                      {d.storageKey}
+                      {i === 0 && (
+                        <span className="ml-1 text-[10.5px] text-subtle">(oldest)</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5 text-muted">{d.owner}</td>
+                    <td className="px-3 py-1.5 text-muted">{new Date(d.createdAt).toLocaleString()}</td>
+                    <td className="px-3 py-1.5 text-right">
+                      <button
+                        className="btn-ghost"
+                        disabled={busy === d.storageKey}
+                        onClick={() => trash(d.storageKey)}
+                        style={{ color: '#BF2600' }}
+                      >
+                        {busy === d.storageKey ? (
+                          <Loader2 size={12} className="animate-spin" />
+                        ) : (
+                          <Trash2 size={12} />
+                        )}
+                        Trash
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      ))}
+    </div>
+  )
 }
 
 // ─── API tokens ─────────────────────────────────────────────────────────────

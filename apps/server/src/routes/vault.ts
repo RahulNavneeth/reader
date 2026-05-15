@@ -1038,6 +1038,24 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { document: next }
   })
 
+  // Audit trail scoped to one file. Same access check as raw/text — the user
+  // must be able to read the file to see its activity. Doc viewer renders this
+  // in an "Activity" panel.
+  app.get('/api/file/activity', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    const { path: rel, limit } = req.query as { path?: string; limit?: string }
+    if (!rel) return reply.code(400).send({ error: 'missing path' })
+    const docs = await listAllDocuments()
+    const meta = docs.find((d) => d.storageKey === rel)
+    if (meta && !userCanRead(meta, user.username, user.role) && !userCan(user, 'read', rel)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const { listAudit } = await import('../stores/audit.js')
+    const entries = await listAudit({ target: rel, limit: Math.min(Number(limit) || 50, 200) })
+    return { entries }
+  })
+
   // The full set of tags in use across the vault, with the doc count for each
   // — populates the sidebar / picker.
   app.get('/api/tags', async (req, reply) => {

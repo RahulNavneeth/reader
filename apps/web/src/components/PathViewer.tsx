@@ -13,6 +13,7 @@ import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { FileInfoButton } from './FileInfoButton'
 import { TagsButton } from './TagsButton'
+import { ActivityButton } from './ActivityButton'
 import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
 
@@ -237,6 +238,7 @@ export function PathViewer({ path }: Props) {
           tags={meta?.tags ?? []}
           onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
         />
+        <ActivityButton path={path} />
         <button
           className="btn-ghost"
           disabled={visibilityBusy}

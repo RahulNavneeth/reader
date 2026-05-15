@@ -256,6 +256,10 @@ export const api = {
         public: boolean
       }[]
     }>(`/api/files/by-tag${q({ tag })}`),
+  fileActivity: (rel: string, limit = 50) =>
+    get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
+      `/api/file/activity${q({ path: rel, limit })}`,
+    ),
   bulkSetVisibility: (paths: string[], isPublic: boolean) =>
     post<{ ok: number; failed: number }>('/api/file/bulk-visibility', { paths, public: isPublic }),
   bulkDelete: (paths: string[]) =>
@@ -349,6 +353,22 @@ export const api = {
       failed: number
       errors: { id: string; error: string }[]
     }>('/api/admin/reembed-all'),
+  adminStats: () =>
+    get<{
+      totals: { documents: number; bytes: number; users: number; publicDocs: number; embeddedDocs: number }
+      byStatus: Record<string, number>
+      byExt: { ext: string; count: number }[]
+      byOwner: { owner: string; count: number }[]
+      recent: { id: string; title: string; storageKey: string; createdAt: number }[]
+    }>('/api/admin/stats'),
+  adminDuplicates: () =>
+    get<{
+      groups: {
+        sha256: string
+        bytes: number
+        docs: { id: string; storageKey: string; title: string; bytes: number; createdAt: number; owner: string }[]
+      }[]
+    }>('/api/admin/duplicates'),
   adminOllamaModels: () =>
     get<{ models: string[]; error?: string }>('/api/admin/ollama/models'),
 

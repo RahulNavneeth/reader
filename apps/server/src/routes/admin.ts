@@ -504,4 +504,92 @@ export async function adminRoutes(app: FastifyInstance) {
     await audit({ actor: req.currentUser!.username, action: 'admin.token.delete', target: id })
     return { ok: true }
   })
+
+  // Aggregate corpus stats — powers the admin Stats panel.
+  app.get('/api/admin/stats', async () => {
+    const docs = await listAllDocuments()
+    let totalBytes = 0
+    const byStatus: Record<string, number> = {}
+    const byExt: Record<string, number> = {}
+    const byOwner: Record<string, number> = {}
+    let publicCount = 0
+    let embeddedCount = 0
+    const recent: Array<{ id: string; title: string; storageKey: string; createdAt: number }> = []
+    for (const d of docs) {
+      totalBytes += d.bytes || 0
+      const status = d.ingest?.status ?? 'unknown'
+      byStatus[status] = (byStatus[status] ?? 0) + 1
+      const ext = path.extname(d.storageKey || d.originalFilename).toLowerCase() || '<none>'
+      byExt[ext] = (byExt[ext] ?? 0) + 1
+      byOwner[d.owner] = (byOwner[d.owner] ?? 0) + 1
+      if (d.public) publicCount++
+      if (d.ingest?.embedded) embeddedCount++
+      recent.push({ id: d.id, title: d.title, storageKey: d.storageKey, createdAt: d.createdAt })
+    }
+    recent.sort((a, b) => b.createdAt - a.createdAt)
+    const users = await listUsers()
+    return {
+      totals: {
+        documents: docs.length,
+        bytes: totalBytes,
+        users: users.length,
+        publicDocs: publicCount,
+        embeddedDocs: embeddedCount,
+      },
+      byStatus,
+      byExt: Object.entries(byExt)
+        .map(([ext, count]) => ({ ext, count }))
+        .sort((a, b) => b.count - a.count),
+      byOwner: Object.entries(byOwner)
+        .map(([owner, count]) => ({ owner, count }))
+        .sort((a, b) => b.count - a.count),
+      recent: recent.slice(0, 20),
+    }
+  })
+
+  // Groups of documents sharing a sha256. The "keep" candidate is the oldest;
+  // the admin can trash the rest from the UI.
+  app.get('/api/admin/duplicates', async () => {
+    const docs = await listAllDocuments()
+    const groups = new Map<string, typeof docs>()
+    for (const d of docs) {
+      if (!d.sha256) continue
+      const arr = groups.get(d.sha256) ?? []
+      arr.push(d)
+      groups.set(d.sha256, arr)
+    }
+    const out: Array<{
+      sha256: string
+      bytes: number
+      docs: Array<{ id: string; storageKey: string; title: string; bytes: number; createdAt: number; owner: string }>
+    }> = []
+    for (const [sha256, arr] of groups) {
+      if (arr.length < 2) continue
+      arr.sort((a, b) => a.createdAt - b.createdAt)
+      out.push({
+        sha256,
+        bytes: arr[0].bytes,
+        docs: arr.map((d) => ({
+          id: d.id,
+          storageKey: d.storageKey,
+          title: d.title,
+          bytes: d.bytes,
+          createdAt: d.createdAt,
+          owner: d.owner,
+        })),
+      })
+    }
+    out.sort((a, b) => b.docs.length - a.docs.length || b.bytes - a.bytes)
+    return { groups: out }
+  })
+
+  // Per-item audit trail — the admin panel + the doc viewer's activity tab
+  // both consume this.
+  app.get('/api/admin/activity', async (req) => {
+    const { target, limit } = req.query as { target?: string; limit?: string }
+    const lim = Math.min(Number(limit) || 100, 500)
+    const { listAudit } = await import('../stores/audit.js')
+    const entries = await listAudit({ target, limit: lim })
+    return { entries }
+  })
 }
