@@ -217,21 +217,25 @@ export const api = {
   list: (rel: string) => get<{ path: string; items: VaultNode[] }>(`/api/list${q({ path: rel })}`),
   folders: () => get<{ folders: string[] }>('/api/folders'),
   vaultTree: () => get<{ folders: string[]; files: string[] }>('/api/vault-tree'),
-  fileText: (rel: string, password?: string) =>
+  fileText: (rel: string, opts?: { password?: string; owner?: string }) =>
     get<{ path: string; content: string; size: number; mtime: number; docId?: string }>(
-      `/api/file/text${q({ path: rel, p: password })}`,
+      `/api/file/text${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
     ),
-  fileMeta: (rel: string, password?: string) =>
+  fileMeta: (rel: string, opts?: { password?: string; owner?: string }) =>
     get<{ meta: DocumentMeta | null }>(
-      `/api/file/meta${q({ path: rel, p: password })}`,
+      `/api/file/meta${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
     ),
-  /** Canonical browser-facing URL for a file. Vite/server negotiates: document → SPA, else raw bytes. */
-  rawUrl: (rel: string, password?: string) =>
-    '/docs/' + rel.split('/').map(encodeURIComponent).join('/') + (password ? `?p=${encodeURIComponent(password)}` : ''),
-  thumbnailUrl: (rel: string, password?: string) =>
-    `/api/file/thumbnail${q({ path: rel, p: password })}`,
-  previewUrl: (rel: string, password?: string) =>
-    `/api/file/preview${q({ path: rel, p: password })}`,
+  rawUrl: (rel: string, opts?: { password?: string; owner?: string }) => {
+    const base = '/docs/' + rel.split('/').map(encodeURIComponent).join('/')
+    const params: string[] = []
+    if (opts?.password) params.push(`p=${encodeURIComponent(opts.password)}`)
+    if (opts?.owner) params.push(`owner=${encodeURIComponent(opts.owner)}`)
+    return params.length ? `${base}?${params.join('&')}` : base
+  },
+  thumbnailUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
+    `/api/file/thumbnail${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
+  previewUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
+    `/api/file/preview${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
   upload: async (file: File, opts?: { dir?: string; title?: string; tags?: string }) => {
     const fd = new FormData()
     fd.set('file', file)
@@ -303,6 +307,58 @@ export const api = {
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
       `/api/file/activity${q({ path: rel, limit })}`,
     ),
+
+  // user-to-user shares
+  createUserShare: (body: { path: string; recipient: string; canEdit?: boolean; label?: string }) =>
+    post<{
+      share: {
+        id: string
+        owner: string
+        recipient: string
+        storageKey: string
+        isFolder: boolean
+        canEdit: boolean
+        label?: string
+        createdAt: number
+      }
+    }>('/api/file/share-with', body),
+  listUserSharesFrom: () =>
+    get<{
+      shares: {
+        id: string
+        owner: string
+        recipient: string
+        storageKey: string
+        isFolder: boolean
+        canEdit: boolean
+        label?: string
+        createdAt: number
+      }[]
+    }>('/api/file/shares-from'),
+  listUserSharesTo: () =>
+    get<{
+      shares: {
+        id: string
+        owner: string
+        recipient: string
+        storageKey: string
+        isFolder: boolean
+        canEdit: boolean
+        label?: string
+        createdAt: number
+        name: string
+        ext: string
+        docId?: string
+      }[]
+    }>('/api/file/shares-to'),
+  deleteUserShare: (id: string) =>
+    fetch(`/api/file/share-with/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    }).then(async (r) => {
+      if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
+      return r.json() as Promise<{ ok: true }>
+    }),
 
   // saved views
   listViews: () =>

@@ -16,6 +16,7 @@ import { adminRoutes } from './routes/admin.js'
 import { mcpRoutes } from './routes/mcp.js'
 import { eventsRoutes } from './routes/events.js'
 import { viewsRoutes } from './routes/views.js'
+import { userSharesRoutes } from './routes/userShares.js'
 import { sweepExpired } from './stores/sessions.js'
 import { preheat } from './services/search.js'
 import { isAvailable as ollamaUp } from './services/embed.js'
@@ -87,6 +88,7 @@ async function main() {
   await app.register(mcpRoutes)
   await app.register(eventsRoutes)
   await app.register(viewsRoutes)
+  await app.register(userSharesRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
   // SPA fallback rewrites unknown paths to index.html so React Router-style

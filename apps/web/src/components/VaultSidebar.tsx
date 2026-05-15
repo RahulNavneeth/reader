@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save } from 'lucide-react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save, Users } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
@@ -56,6 +56,18 @@ export function VaultSidebar() {
     Array<{ id: string; name: string; query?: string; tag?: string; createdAt: number }>
   >([])
   const [viewsOpen, setViewsOpen] = useState(false)
+  const [sharedWithMe, setSharedWithMe] = useState<
+    Array<{
+      id: string
+      owner: string
+      storageKey: string
+      isFolder: boolean
+      canEdit: boolean
+      name: string
+      ext: string
+    }>
+  >([])
+  const [sharedOpen, setSharedOpen] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
   const [dragOver, setDragOver] = useState(false)
@@ -65,18 +77,18 @@ export function VaultSidebar() {
 
   const refetch = useCallback(async () => {
     try {
-      const [list, tagsR, viewsR] = await Promise.all([
+      const [list, tagsR, viewsR, sharesR] = await Promise.all([
         api.list(''),
         api.tags().catch(() => ({ tags: [] })),
         api.listViews().catch(() => ({ views: [] })),
+        api.listUserSharesTo().catch(() => ({ shares: [] })),
       ])
-      // Only replace state when the payload actually differs. A visibility
-      // toggle on one file flips a `public` flag but produces an array that
-      // would otherwise be a new reference on every event — replacing every
-      // time causes a full subtree re-render (flicker).
       setTree((prev) => (sameJson(prev, list.items) ? prev : list.items))
       setTags((prev) => (sameJson(prev, tagsR.tags) ? prev : tagsR.tags))
       setViews((prev) => (sameJson(prev, viewsR.views) ? prev : viewsR.views))
+      setSharedWithMe((prev) =>
+        sameJson(prev, sharesR.shares) ? prev : (sharesR.shares as typeof prev),
+      )
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     }
@@ -241,6 +253,56 @@ export function VaultSidebar() {
                       <X size={10} />
                     </button>
                   </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Files / folders other users have shared with the caller. Each
+            click opens the doc viewer with ?owner=<their username> so the
+            read endpoints resolve to the owner's namespace. */}
+        {!filter.trim() && sharedWithMe.length > 0 && (
+          <div className="mb-2 mx-1">
+            <button
+              className="w-full flex items-center gap-1 px-2 h-6 text-[10.5px] uppercase tracking-wider font-semibold text-subtle hover:bg-hover rounded"
+              onClick={() => setSharedOpen((v) => !v)}
+            >
+              <ChevronRight
+                size={11}
+                className="transition-transform"
+                style={{ transform: sharedOpen ? 'rotate(90deg)' : undefined }}
+              />
+              Shared with me
+              <span className="text-subtle font-normal normal-case ml-1">
+                ({sharedWithMe.length})
+              </span>
+            </button>
+            {sharedOpen && (
+              <div className="mt-0.5 space-y-0.5">
+                {sharedWithMe.map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() =>
+                      navigate(
+                        '/docs/' +
+                          s.storageKey.split('/').map(encodeURIComponent).join('/') +
+                          `?owner=${encodeURIComponent(s.owner)}`,
+                      )
+                    }
+                    className="w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left text-fg hover:bg-hover"
+                    title={`${s.storageKey} · shared by ${s.owner}${s.canEdit ? ' · editable' : ''}`}
+                  >
+                    {s.isFolder ? (
+                      <Folder size={11} className="text-accent shrink-0" />
+                    ) : (
+                      <Users size={11} className="text-muted shrink-0" />
+                    )}
+                    <span className="truncate flex-1">{s.name}</span>
+                    <span className="text-[10px] text-subtle truncate" style={{ maxWidth: 80 }}>
+                      {s.owner}
+                    </span>
+                  </button>
                 ))}
               </div>
             )}

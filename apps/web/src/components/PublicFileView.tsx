@@ -74,8 +74,9 @@ export function PublicFileView({ path, onNotPublic }: Props) {
     setExpired(false)
     setPasswordRequired(false)
     setPasswordWrong(false)
+    const pwdOpt = submittedPwd ? { password: submittedPwd } : undefined
     api
-      .fileMeta(path, submittedPwd || undefined)
+      .fileMeta(path, pwdOpt)
       .then(async (r) => {
         if (cancelled) return
         if (!r.meta || !r.meta.public) {
@@ -85,7 +86,7 @@ export function PublicFileView({ path, onNotPublic }: Props) {
         setMeta(r.meta)
         if (isMarkdown || isText || isHtml || isOfficeDoc) {
           try {
-            const t = await api.fileText(path, submittedPwd || undefined)
+            const t = await api.fileText(path, pwdOpt)
             if (!cancelled) setText(t.content)
           } catch (e) {
             if (!cancelled) setError(e instanceof ApiError ? e.message : String(e))
@@ -200,8 +201,8 @@ export function PublicFileView({ path, onNotPublic }: Props) {
 
   if (!meta) return null
 
-  const rawUrl = api.rawUrl(path, submittedPwd || undefined)
-  const previewUrl = api.previewUrl(path, submittedPwd || undefined)
+  const rawUrl = api.rawUrl(path, submittedPwd ? { password: submittedPwd } : undefined)
+  const previewUrl = api.previewUrl(path, submittedPwd ? { password: submittedPwd } : undefined)
 
   return (
     <div className="h-full flex flex-col surface">

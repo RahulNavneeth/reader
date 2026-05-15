@@ -75,6 +75,7 @@ export const config = {
     trash: path.join(dataDir, 'trash'),
     shares: path.join(dataDir, 'shares'),
     views: path.join(dataDir, 'views'),
+    userShares: path.join(dataDir, 'user-shares'),
   },
   storage: {
     /** 'local' = files under data/blobs/. 's3' = S3-compatible (MinIO/R2/AWS). */

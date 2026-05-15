@@ -41,6 +41,7 @@ import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 import type { DocumentMeta } from '../types.js'
 import { resolveUserVault, userVaultRel, ensureUserVault, userVaultRoot } from '../lib/userVault.js'
 import { hashPassword as hashShareSecret, verifyPassword as verifySharePassword } from '../lib/sharePassword.js'
+import { findShareForPath } from '../stores/userShares.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
 
@@ -68,6 +69,45 @@ function redactPublicMeta(meta: DocumentMeta): DocumentMeta {
   const { publicPasswordHash, ...rest } = meta
   void publicPasswordHash
   return { ...rest, publicPasswordHash: null } as DocumentMeta
+}
+
+/**
+ * Resolve the effective owner/meta for a read request. Handles three cases:
+ *
+ *   1. Request includes `?owner=` and that owner != the caller →
+ *      cross-user share path. We look up the doc record in the owner's
+ *      namespace and verify a UserShare grant exists. Returns null if not.
+ *   2. Public file matches the path (anonymous or any user) → return its
+ *      record so the public gate applies.
+ *   3. Otherwise scope to the caller's own namespace.
+ *
+ * Returns `{ meta, owner, sharedGrant }` where `sharedGrant` carries the
+ * canEdit flag when this is a cross-user shared access.
+ */
+async function resolveReadContext(opts: {
+  rel: string
+  ownerHint?: string
+  requester?: string
+}): Promise<{
+  meta: DocumentMeta | null
+  owner: string | null
+  sharedGrant: { canEdit: boolean } | null
+}> {
+  const { rel, ownerHint, requester } = opts
+  const docs = await listAllDocuments()
+
+  if (ownerHint && requester && ownerHint !== requester) {
+    const grant = await findShareForPath(requester, ownerHint, rel)
+    if (!grant) return { meta: null, owner: null, sharedGrant: null }
+    const meta = docs.find((d) => d.owner === ownerHint && d.storageKey === rel) ?? null
+    return { meta, owner: ownerHint, sharedGrant: { canEdit: grant.canEdit } }
+  }
+
+  const own = docs.find((d) => d.storageKey === rel && d.owner === requester)
+  const pub = docs.find((d) => d.storageKey === rel && d.public)
+  const meta = own ?? pub ?? null
+  const owner = meta?.owner ?? requester ?? null
+  return { meta, owner, sharedGrant: null }
 }
 
 /**
@@ -366,15 +406,17 @@ export async function vaultRoutes(app: FastifyInstance) {
   // ---- read -----------------------------------------------------------------
 
   app.get('/api/file/text', async (req, reply) => {
-    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
+    const { path: rel, p: publicPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
 
-    const docs = await listAllDocuments()
     const requester = req.currentUser?.username
-    const meta =
-      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
-      docs.find((d) => d.storageKey === rel && d.public)
-    const owner = meta?.owner ?? requester
+    const ctx = await resolveReadContext({ rel, ownerHint, requester })
+    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const meta = ctx.meta
+    const owner = ctx.owner
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
@@ -451,15 +493,17 @@ export async function vaultRoutes(app: FastifyInstance) {
   })
 
   app.get('/api/file/raw', async (req, reply) => {
-    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
+    const { path: rel, p: publicPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
 
-    const docs = await listAllDocuments()
     const requester = req.currentUser?.username
-    const meta =
-      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
-      docs.find((d) => d.storageKey === rel && d.public)
-    const owner = meta?.owner ?? requester
+    const ctx = await resolveReadContext({ rel, ownerHint, requester })
+    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const meta = ctx.meta
+    const owner = ctx.owner
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
@@ -518,14 +562,16 @@ export async function vaultRoutes(app: FastifyInstance) {
   // streams the raw bytes. Use /api/file/raw when you want the original
   // (e.g., download links).
   app.get('/api/file/preview', async (req, reply) => {
-    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
+    const { path: rel, p: publicPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const docs = await listAllDocuments()
     const requester = req.currentUser?.username
-    const meta =
-      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
-      docs.find((d) => d.storageKey === rel && d.public)
-    const owner = meta?.owner ?? requester
+    const ctx = await resolveReadContext({ rel, ownerHint, requester })
+    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const meta = ctx.meta
+    const owner = ctx.owner
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
@@ -586,15 +632,17 @@ export async function vaultRoutes(app: FastifyInstance) {
   // Tiny PNG preview for the folder grid. Cached on disk per doc. If the
   // thumbnail hasn't been generated yet, we render-on-demand and persist.
   app.get('/api/file/thumbnail', async (req, reply) => {
-    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
+    const { path: rel, p: publicPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
 
-    const docs = await listAllDocuments()
     const requester = req.currentUser?.username
-    const meta =
-      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
-      docs.find((d) => d.storageKey === rel && d.public)
-    const owner = meta?.owner ?? requester
+    const ctx = await resolveReadContext({ rel, ownerHint, requester })
+    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const meta = ctx.meta
+    const owner = ctx.owner
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
@@ -1008,13 +1056,15 @@ export async function vaultRoutes(app: FastifyInstance) {
   // index record (e.g. markdown read straight from disk) we return a stub so
   // the client can render the visibility toggle on the first open.
   app.get('/api/file/meta', async (req, reply) => {
-    const { path: rel, p: publicPassword } = req.query as { path?: string; p?: string }
+    const { path: rel, p: publicPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const docs = await listAllDocuments()
     const requester = req.currentUser?.username
-    const meta =
-      docs.find((d) => d.storageKey === rel && d.owner === requester) ??
-      docs.find((d) => d.storageKey === rel && d.public)
+    const ctx = await resolveReadContext({ rel, ownerHint, requester })
+    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const meta = ctx.meta
     if (meta) {
       // Redact the password hash from public meta so the UI can show
       // "password required" without leaking the hash.

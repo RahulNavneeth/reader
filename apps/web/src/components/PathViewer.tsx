@@ -6,7 +6,7 @@ import rehypeHighlight from 'rehype-highlight'
 import rehypeSlug from 'rehype-slug'
 import rehypeAutolinkHeadings from 'rehype-autolink-headings'
 import 'highlight.js/styles/github.css'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { setFaviconForFile } from '../lib/favicon'
@@ -16,6 +16,7 @@ import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
 import { VersionsButton } from './VersionsButton'
 import { PublicButton } from './PublicButton'
+import { ShareWithUserButton } from './ShareWithUserButton'
 import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
 
@@ -25,6 +26,12 @@ type Props = {
 
 export function PathViewer({ path }: Props) {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  // When opened from a "Shared with me" entry the URL carries ?owner=<other
+  // user>. All read API calls in this component thread it through so we
+  // resolve under the right namespace instead of the requester's.
+  const ownerOpt = searchParams.get('owner') || undefined
+  const callerOpts = ownerOpt ? { owner: ownerOpt } : undefined
   const { setCurrentFolder, refresh } = useVault()
   const [text, setText] = useState<string | null>(null)
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
@@ -47,7 +54,7 @@ export function PathViewer({ path }: Props) {
     let cancelled = false
     const t = setInterval(async () => {
       try {
-        const r = await api.fileMeta(path)
+        const r = await api.fileMeta(path, callerOpts)
         if (cancelled || !r.meta) return
         const wasEmbedded = meta.ingest.embedded
         setMeta(r.meta)
@@ -113,7 +120,7 @@ export function PathViewer({ path }: Props) {
     setText(null)
     setMeta(null)
     setError(null)
-    api.fileMeta(path).then((r) => setMeta(r.meta)).catch(() => null)
+    api.fileMeta(path, callerOpts).then((r) => setMeta(r.meta)).catch(() => null)
     if (isMarkdown || isText || isCsv || isJson || isHtml || wantsExtractedText) {
       api
         .fileText(path)
@@ -144,9 +151,9 @@ export function PathViewer({ path }: Props) {
     setIndexing(true)
     try {
       await api.indexFile(path)
-      const r = await api.fileText(path).catch(() => null)
+      const r = await api.fileText(path, callerOpts).catch(() => null)
       if (r) setText(r.content)
-      const m = await api.fileMeta(path).catch(() => null)
+      const m = await api.fileMeta(path, callerOpts).catch(() => null)
       if (m) setMeta(m.meta)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -232,6 +239,7 @@ export function PathViewer({ path }: Props) {
         />
         <ActivityButton path={path} />
         <VersionsButton path={path} />
+        {meta && <ShareWithUserButton path={path} />}
         {meta ? (
           <PublicButton path={path} meta={meta} onSaved={setMeta} />
         ) : (
@@ -240,7 +248,7 @@ export function PathViewer({ path }: Props) {
             Private
           </button>
         )}
-        <a className="btn-ghost" href={api.rawUrl(path)} download={filename}>
+        <a className="btn-ghost" href={api.rawUrl(path, callerOpts)} download={filename}>
           <Download size={14} />
           Download
         </a>
@@ -262,7 +270,7 @@ export function PathViewer({ path }: Props) {
 
         {!error && isPdf && (
           <iframe
-            src={api.rawUrl(path)}
+            src={api.rawUrl(path, callerOpts)}
             title={filename}
             className="w-full h-full border-0"
             style={{ background: 'var(--panel)' }}
@@ -272,7 +280,7 @@ export function PathViewer({ path }: Props) {
         {!error && isImage && (
           <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
             <img
-              src={needsPreview ? api.previewUrl(path) : api.rawUrl(path)}
+              src={needsPreview ? api.previewUrl(path, callerOpts) : api.rawUrl(path, callerOpts)}
               alt={filename}
               className="max-w-full max-h-full rounded shadow-card"
             />
@@ -282,8 +290,8 @@ export function PathViewer({ path }: Props) {
         {!error && isVideo && (
           <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
             <video
-              src={api.rawUrl(path)}
-              poster={api.previewUrl(path)}
+              src={api.rawUrl(path, callerOpts)}
+              poster={api.previewUrl(path, callerOpts)}
               controls
               playsInline
               preload="metadata"
@@ -351,7 +359,7 @@ export function PathViewer({ path }: Props) {
                 {indexing ? 'Indexing…' : 'Index for search'}
               </button>
               <div className="mt-4">
-                <a className="btn-ghost" href={api.rawUrl(path)} target="_blank" rel="noreferrer">
+                <a className="btn-ghost" href={api.rawUrl(path, callerOpts)} target="_blank" rel="noreferrer">
                   <ExternalLink size={13} />
                   Open original
                 </a>
