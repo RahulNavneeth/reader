@@ -19,6 +19,7 @@ import { preheat } from './services/search.js'
 import { isAvailable as ollamaUp } from './services/embed.js'
 import { loadSettings } from './stores/settings.js'
 import { startVaultWatcher } from './services/watcher.js'
+import { sweepExpiredTrash } from './stores/trash.js'
 
 async function main() {
   // Make sure all data subdirs exist before any store touches them.
@@ -111,6 +112,11 @@ async function main() {
   sweepExpired()
     .then((n) => n > 0 && app.log.info({ removed: n }, 'session sweep'))
     .catch((err) => app.log.warn({ err }, 'session sweep failed'))
+
+  // Purge trash older than the 30-day retention.
+  sweepExpiredTrash()
+    .then((n) => n > 0 && app.log.info({ purged: n }, 'trash sweep'))
+    .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
 
   // Warm the search cache; check Ollama presence (just informational).
   preheat().catch(() => null)

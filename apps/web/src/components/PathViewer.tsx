@@ -88,7 +88,20 @@ export function PathViewer({ path }: Props) {
   const isText = ['.txt', '.yaml', '.yml', '.toml'].includes(ext)
   const isHtml = ['.html', '.htm'].includes(ext)
   const isPdf = ext === '.pdf'
-  const isImage = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg'].includes(ext)
+  const isImage = [
+    '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+    '.avif', '.bmp', '.ico',
+    '.heic', '.heif', '.tiff', '.tif', '.jxl',
+  ].includes(ext)
+  const isVideo = [
+    '.mp4', '.mov', '.m4v', '.mkv', '.webm',
+    '.avi', '.3gp', '.3gpp', '.mts', '.m2ts',
+    '.mpg', '.mpeg', '.wmv', '.flv', '.ogv',
+  ].includes(ext)
+  // Server has to transcode these to JPEG — browsers won't render them
+  // natively. /api/file/preview returns the JPEG for HEIC/TIFF/JXL, the raw
+  // bytes for everything else (so it's safe to use for any image).
+  const needsPreview = ['.heic', '.heif', '.tiff', '.tif', '.jxl'].includes(ext)
   const isOfficeDoc = ['.docx', '.xlsx', '.xls'].includes(ext)
   const wantsExtractedText = isOfficeDoc
 
@@ -259,7 +272,24 @@ export function PathViewer({ path }: Props) {
 
         {!error && isImage && (
           <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
-            <img src={api.rawUrl(path)} alt={filename} className="max-w-full max-h-full rounded shadow-card" />
+            <img
+              src={needsPreview ? api.previewUrl(path) : api.rawUrl(path)}
+              alt={filename}
+              className="max-w-full max-h-full rounded shadow-card"
+            />
+          </div>
+        )}
+
+        {!error && isVideo && (
+          <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
+            <video
+              src={api.rawUrl(path)}
+              poster={api.previewUrl(path)}
+              controls
+              playsInline
+              preload="metadata"
+              className="max-w-full max-h-full rounded shadow-card"
+            />
           </div>
         )}
 

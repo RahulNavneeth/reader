@@ -24,11 +24,16 @@ import {
   deleteDocument,
   listAllDocuments,
   readText as readExtracted,
+  readThumbnail,
+  readPreview,
   saveMeta,
   sha256Of,
   userCanRead,
   userCanEdit,
 } from '../stores/documents.js'
+import { generateThumbnail } from '../services/thumbnail.js'
+import { writeThumbnail, writePreview } from '../stores/documents.js'
+import { moveToTrash } from '../stores/trash.js'
 import { ingestDocument } from '../services/ingest.js'
 import { userCan, canNavigateTo } from '../lib/grants.js'
 import { invalidateSearchCache } from '../services/search.js'
@@ -73,6 +78,12 @@ const SUPPORTED_EXTS = new Set([
   '.xlsx', '.xls',
   // images
   '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+  '.avif', '.bmp', '.ico', '.tiff', '.tif', '.jxl',
+  '.heic', '.heif',
+  // videos
+  '.mp4', '.mov', '.m4v', '.mkv', '.webm',
+  '.avi', '.3gp', '.3gpp', '.mts', '.m2ts',
+  '.mpg', '.mpeg', '.wmv', '.flv', '.ogv',
 ])
 
 function shouldSkipName(name: string): boolean {
@@ -146,6 +157,29 @@ function inferMime(filename: string, fallback?: string): string {
     '.webp': 'image/webp',
     '.gif': 'image/gif',
     '.svg': 'image/svg+xml',
+    '.avif': 'image/avif',
+    '.bmp': 'image/bmp',
+    '.ico': 'image/x-icon',
+    '.tiff': 'image/tiff',
+    '.tif': 'image/tiff',
+    '.jxl': 'image/jxl',
+    '.heic': 'image/heic',
+    '.heif': 'image/heif',
+    '.mp4': 'video/mp4',
+    '.m4v': 'video/x-m4v',
+    '.mov': 'video/quicktime',
+    '.mkv': 'video/x-matroska',
+    '.webm': 'video/webm',
+    '.avi': 'video/x-msvideo',
+    '.3gp': 'video/3gpp',
+    '.3gpp': 'video/3gpp',
+    '.mts': 'video/mp2t',
+    '.m2ts': 'video/mp2t',
+    '.mpg': 'video/mpeg',
+    '.mpeg': 'video/mpeg',
+    '.wmv': 'video/x-ms-wmv',
+    '.flv': 'video/x-flv',
+    '.ogv': 'video/ogg',
   }
   return m[ext] || fallback || 'application/octet-stream'
 }
@@ -383,11 +417,139 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
 
     const mime = inferMime(abs)
+    const disposition = `inline; filename="${path.basename(abs).replace(/"/g, '')}"`
+
+    // Range support — needed for HTML5 <video>, which sends `Range: bytes=...`
+    // to seek. Without 206 responses Safari refuses to play altogether.
+    const range = (req.headers.range || '') as string
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+    if (m) {
+      const total = s.size
+      const start = m[1] ? Number(m[1]) : 0
+      const end = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+        return reply
+          .code(416)
+          .header('Content-Range', `bytes */${total}`)
+          .send({ error: 'range not satisfiable' })
+      }
+      return reply
+        .code(206)
+        .header('Content-Type', mime)
+        .header('Content-Length', String(end - start + 1))
+        .header('Content-Range', `bytes ${start}-${end}/${total}`)
+        .header('Accept-Ranges', 'bytes')
+        .header('Content-Disposition', disposition)
+        .send(createReadStream(abs, { start, end }))
+    }
+
     return reply
       .header('Content-Type', mime)
       .header('Content-Length', String(s.size))
+      .header('Accept-Ranges', 'bytes')
+      .header('Content-Disposition', disposition)
+      .send(createReadStream(abs))
+  })
+
+  // Display-friendly version of a file. For HEIC this returns the JPEG we
+  // generated at ingest so browsers can render it; for everything else it
+  // streams the raw bytes. Use /api/file/raw when you want the original
+  // (e.g., download links).
+  app.get('/api/file/preview', async (req, reply) => {
+    const { path: rel } = req.query as { path?: string }
+    if (!rel) return reply.code(400).send({ error: 'missing path' })
+    const abs = resolveVault(rel)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
+
+    const docs = await listAllDocuments()
+    const meta = docs.find((d) => d.storageKey === rel)
+    if (!meta?.public) {
+      if (!requireAuth(req, reply)) return
+      const u = req.currentUser!
+      if (meta && !userCanRead(meta, u.username, u.role)) {
+        return reply.code(403).send({ error: 'forbidden' })
+      }
+    }
+
+    const { isImageNeedingTranscode, isVideo, transcodeImageToJpeg, videoFrameAt } =
+      await import('../services/media.js')
+    const needsServerPreview = isImageNeedingTranscode(abs) || isVideo(abs)
+
+    if (needsServerPreview) {
+      if (meta) {
+        const cached = await readPreview(meta.id)
+        if (cached) {
+          return reply
+            .header('Content-Type', 'image/jpeg')
+            .header('Cache-Control', 'private, max-age=86400')
+            .send(cached)
+        }
+      }
+      // On-demand for files ingested before preview generation was wired.
+      try {
+        const buffer = await readFile(abs)
+        const jpeg = isVideo(abs)
+          ? await videoFrameAt(buffer, abs)
+          : await transcodeImageToJpeg(buffer, abs)
+        if (!jpeg) return reply.code(415).send({ error: 'preview decode failed' })
+        if (meta) await writePreview(meta.id, jpeg).catch(() => null)
+        return reply
+          .header('Content-Type', 'image/jpeg')
+          .header('Cache-Control', 'private, max-age=86400')
+          .send(jpeg)
+      } catch (e: any) {
+        return reply.code(500).send({ error: e?.message ?? 'preview failed' })
+      }
+    }
+
+    // Browser-renderable: just stream the original bytes inline.
+    return reply
+      .header('Content-Type', inferMime(abs))
+      .header('Content-Length', String(s.size))
       .header('Content-Disposition', `inline; filename="${path.basename(abs).replace(/"/g, '')}"`)
       .send(createReadStream(abs))
+  })
+
+  // Tiny PNG preview for the folder grid. Cached on disk per doc. If the
+  // thumbnail hasn't been generated yet, we render-on-demand and persist.
+  app.get('/api/file/thumbnail', async (req, reply) => {
+    const { path: rel } = req.query as { path?: string }
+    if (!rel) return reply.code(400).send({ error: 'missing path' })
+    const abs = resolveVault(rel)
+
+    const docs = await listAllDocuments()
+    const meta = docs.find((d) => d.storageKey === rel)
+    if (!meta?.public) {
+      if (!requireAuth(req, reply)) return
+      const u = req.currentUser!
+      if (meta && !userCanRead(meta, u.username, u.role)) {
+        return reply.code(403).send({ error: 'forbidden' })
+      }
+    }
+
+    if (meta) {
+      const cached = await readThumbnail(meta.id)
+      if (cached) {
+        return reply
+          .header('Content-Type', 'image/png')
+          .header('Cache-Control', 'private, max-age=86400')
+          .send(cached)
+      }
+    }
+    // Generate on demand (covers files indexed before thumbnails were added).
+    try {
+      const buffer = await readFile(abs)
+      const png = await generateThumbnail(buffer, path.basename(abs))
+      if (!png) return reply.code(404).send({ error: 'no thumbnail for this type' })
+      if (meta) await writeThumbnail(meta.id, png).catch(() => null)
+      return reply
+        .header('Content-Type', 'image/png')
+        .header('Cache-Control', 'private, max-age=86400')
+        .send(png)
+    } catch (e: any) {
+      return reply.code(404).send({ error: e?.message ?? 'thumbnail failed' })
+    }
   })
 
   // ---- write ---------------------------------------------------------------
@@ -504,13 +666,180 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     void userCanRead
 
-    await rm(abs, { force: true }).catch(() => null)
-    if (meta) {
-      await deleteDocument(meta.id)
-      invalidateSearchCache()
+    // Soft-delete: move the vault file + index meta into trash. Sweeper purges
+    // after 30 days; user can restore from Settings → Trash.
+    const s = await stat(abs).catch(() => null)
+    if (s?.isFile()) {
+      await moveToTrash({
+        storageKey: rel,
+        vaultAbs: abs,
+        docId: meta?.id,
+        bytes: s.size,
+        trashedBy: user.username,
+      }).catch((err) => {
+        req.log.warn({ err, rel }, 'trash move failed; hard-deleting')
+        return rm(abs, { force: true }).catch(() => null)
+      })
     }
-    await audit({ actor: user.username, action: 'vault.delete', target: rel })
+    invalidateSearchCache()
+    await audit({ actor: user.username, action: 'vault.trash', target: rel })
     return { ok: true }
+  })
+
+  // ─── trash ─────────────────────────────────────────────────────────────
+
+  app.get('/api/trash', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const { listTrash } = await import('../stores/trash.js')
+    const entries = await listTrash()
+    return { entries }
+  })
+
+  app.post('/api/trash/:id/restore', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const { id } = req.params as { id: string }
+    const { listTrash, purgeTrash } = await import('../stores/trash.js')
+    const all = await listTrash()
+    const entry = all.find((e) => e.id === id)
+    if (!entry) return reply.code(404).send({ error: 'not found in trash' })
+    // Restore vault file.
+    const targetAbs = resolveVault(entry.storageKey)
+    await mkdir(path.dirname(targetAbs), { recursive: true })
+    const blobName = entry.filename.replace(/\.\./g, '_').replace(/[\/\\]/g, '_')
+    const src = path.join(config.paths.trash, entry.id, blobName)
+    try {
+      await rename(src, targetAbs)
+    } catch (e: any) {
+      return reply.code(500).send({ error: `restore failed: ${e?.message ?? e}` })
+    }
+    // Restore doc meta dir if present.
+    if (entry.docId) {
+      const docSrc = path.join(config.paths.trash, entry.id, '_doc')
+      const docDest = path.join(config.paths.documents, entry.docId)
+      const s = await stat(docSrc).catch(() => null)
+      if (s?.isDirectory()) {
+        await rename(docSrc, docDest).catch(() => null)
+      }
+    }
+    await purgeTrash(entry.id)
+    invalidateSearchCache()
+    await audit({ actor: user.username, action: 'trash.restore', target: entry.storageKey })
+    return { ok: true }
+  })
+
+  app.delete('/api/trash/:id', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const { id } = req.params as { id: string }
+    const { purgeTrash } = await import('../stores/trash.js')
+    await purgeTrash(id)
+    await audit({ actor: user.username, action: 'trash.purge', target: id })
+    return { ok: true }
+  })
+
+  // Bulk operations: visibility + delete. Per-file ACL still applies inside.
+  app.post('/api/file/bulk-visibility', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { paths?: string[]; public?: boolean }
+    if (!Array.isArray(body?.paths) || typeof body.public !== 'boolean') {
+      return reply.code(400).send({ error: 'paths[] and public required' })
+    }
+    const docs = await listAllDocuments()
+    let ok = 0
+    let failed = 0
+    for (const rel of body.paths) {
+      try {
+        const abs = resolveVault(rel)
+        const s = await stat(abs).catch(() => null)
+        if (!s?.isFile()) {
+          failed++
+          continue
+        }
+        let meta = docs.find((d) => d.storageKey === rel)
+        if (!meta) {
+          // Create stub meta so the public flag has somewhere to live.
+          const filename = path.basename(abs)
+          meta = {
+            id: nanoid(),
+            title: filename.replace(/\.[^.]+$/, ''),
+            originalFilename: filename,
+            mime: inferMime(filename),
+            bytes: s.size,
+            sha256: '',
+            storageKey: rel,
+            owner: user.username,
+            acl: { readers: [], editors: [] },
+            tags: [],
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            ingest: { status: 'pending', embedded: false },
+          }
+        } else if (!userCanEdit(meta, user.username, user.role)) {
+          failed++
+          continue
+        }
+        const next: DocumentMeta = { ...meta, public: body.public, updatedAt: Date.now() }
+        await saveMeta(next)
+        ok++
+      } catch {
+        failed++
+      }
+    }
+    invalidateSearchCache()
+    await audit({
+      actor: user.username,
+      action: 'vault.bulk-visibility',
+      meta: { count: body.paths.length, public: body.public, ok, failed },
+    })
+    return { ok, failed }
+  })
+
+  app.post('/api/file/bulk-delete', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { paths?: string[] }
+    if (!Array.isArray(body?.paths)) {
+      return reply.code(400).send({ error: 'paths[] required' })
+    }
+    const docs = await listAllDocuments()
+    let ok = 0
+    let failed = 0
+    for (const rel of body.paths) {
+      try {
+        const abs = resolveVault(rel)
+        const meta = docs.find((d) => d.storageKey === rel)
+        if (meta && !userCanEdit(meta, user.username, user.role)) {
+          failed++
+          continue
+        }
+        const s = await stat(abs).catch(() => null)
+        if (s?.isFile()) {
+          await moveToTrash({
+            storageKey: rel,
+            vaultAbs: abs,
+            docId: meta?.id,
+            bytes: s.size,
+            trashedBy: user.username,
+          })
+          ok++
+        }
+      } catch {
+        failed++
+      }
+    }
+    invalidateSearchCache()
+    await audit({
+      actor: user.username,
+      action: 'vault.bulk-trash',
+      meta: { count: body.paths.length, ok, failed },
+    })
+    return { ok, failed }
   })
 
   app.post('/api/folder', async (req, reply) => {

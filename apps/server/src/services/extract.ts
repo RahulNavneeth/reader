@@ -6,6 +6,8 @@
  */
 import path from 'node:path'
 import { extractImageText } from './ocr.js'
+import { isHeic } from './heic.js'
+import { isImageNeedingTranscode, isVideo, transcodeImageToJpeg } from './media.js'
 
 export async function extractText(buffer: Buffer, mime: string, filename: string): Promise<string> {
   const m = (mime || '').toLowerCase()
@@ -30,6 +32,14 @@ export async function extractText(buffer: Buffer, mime: string, filename: string
   if (m.includes('html') || ext === '.html' || ext === '.htm') return extractHtml(buffer)
   if (m.startsWith('text/') || ['.md', '.markdown', '.mdx', '.txt', '.csv', '.json', '.yaml', '.yml', '.toml'].includes(ext)) {
     return buffer.toString('utf8')
+  }
+  // Videos: no text payload to extract. Search will rely on filename/tags.
+  if (isVideo(filename) || m.startsWith('video/')) return ''
+  // HEIC/TIFF/JXL: tesseract can't read these — transcode to JPEG first so
+  // iPhone screenshots and scanned TIFFs still get OCR'd.
+  if (isHeic(filename) || isImageNeedingTranscode(filename) || m === 'image/heic' || m === 'image/heif') {
+    const jpeg = await transcodeImageToJpeg(buffer, filename)
+    return jpeg ? extractImageText(jpeg) : ''
   }
   if (m.startsWith('image/')) return extractImageText(buffer)
   return ''

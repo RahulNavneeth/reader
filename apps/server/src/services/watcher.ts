@@ -21,6 +21,11 @@ const SUPPORTED_EXTS = new Set([
   '.docx',
   '.xlsx', '.xls',
   '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+  '.avif', '.bmp', '.ico', '.tiff', '.tif', '.jxl',
+  '.heic', '.heif',
+  '.mp4', '.mov', '.m4v', '.mkv', '.webm',
+  '.avi', '.3gp', '.3gpp', '.mts', '.m2ts',
+  '.mpg', '.mpeg', '.wmv', '.flv', '.ogv',
 ])
 
 const MIMES: Record<string, string> = {

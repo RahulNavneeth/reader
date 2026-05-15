@@ -213,6 +213,13 @@ export const api = {
   fileMeta: (rel: string) => get<{ meta: DocumentMeta | null }>(`/api/file/meta${q({ path: rel })}`),
   /** Canonical browser-facing URL for a file. Vite/server negotiates: document → SPA, else raw bytes. */
   rawUrl: (rel: string) => '/docs/' + rel.split('/').map(encodeURIComponent).join('/'),
+  thumbnailUrl: (rel: string) => `/api/file/thumbnail${q({ path: rel })}`,
+  /**
+   * Browser-renderable version. For HEIC, returns a JPEG transcoded at
+   * ingest; for other types, just streams the raw bytes. Use rawUrl() when
+   * you specifically need the original (e.g., a download button).
+   */
+  previewUrl: (rel: string) => `/api/file/preview${q({ path: rel })}`,
   upload: async (file: File, opts?: { dir?: string; title?: string; tags?: string }) => {
     const fd = new FormData()
     fd.set('file', file)
@@ -233,6 +240,35 @@ export const api = {
   indexFile: (rel: string) => post<{ document: DocumentMeta }>('/api/file/index', { path: rel }),
   setVisibility: (rel: string, isPublic: boolean) =>
     post<{ document: DocumentMeta }>('/api/file/visibility', { path: rel, public: isPublic }),
+  bulkSetVisibility: (paths: string[], isPublic: boolean) =>
+    post<{ ok: number; failed: number }>('/api/file/bulk-visibility', { paths, public: isPublic }),
+  bulkDelete: (paths: string[]) =>
+    post<{ ok: number; failed: number }>('/api/file/bulk-delete', { paths }),
+
+  // trash
+  trashList: () =>
+    get<{
+      entries: {
+        id: string
+        storageKey: string
+        filename: string
+        docId?: string
+        bytes: number
+        trashedAt: number
+        trashedBy: string
+      }[]
+    }>('/api/trash'),
+  trashRestore: (id: string) => post<{ ok: true }>(`/api/trash/${encodeURIComponent(id)}/restore`),
+  trashPurge: (id: string) =>
+    fetch(`/api/trash/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include' }).then(
+      async (r) => {
+        if (!r.ok) {
+          const data = await r.json().catch(() => ({}))
+          throw new ApiError(r.status, data?.error || `HTTP ${r.status}`)
+        }
+        return r.json() as Promise<{ ok: true }>
+      },
+    ),
   deleteFile: (rel: string) =>
     fetch(`/api/file${q({ path: rel })}`, { method: 'DELETE', credentials: 'include' }).then(
       async (r) => {

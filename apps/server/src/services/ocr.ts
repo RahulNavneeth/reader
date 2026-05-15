@@ -9,7 +9,11 @@ let workerPromise: Promise<Worker> | null = null
 
 async function getWorker(): Promise<Worker> {
   if (workerPromise) return workerPromise
-  workerPromise = createWorker('eng').catch((e) => {
+  // errorHandler swallows worker-side rejects (e.g. "Error attempting to read
+  // image" for an unrecognized format) that would otherwise be re-thrown
+  // synchronously inside tesseract.js's message handler and kill the process.
+  // The in-flight recognize() promise still rejects, which our caller catches.
+  workerPromise = createWorker('eng', undefined, { errorHandler: () => {} }).catch((e) => {
     workerPromise = null
     throw e
   })

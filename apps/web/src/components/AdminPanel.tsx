@@ -18,6 +18,7 @@ import {
   Folder,
   Mail,
   Send,
+  RotateCcw,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate } from 'react-router-dom'
@@ -39,7 +40,7 @@ const ROLE_PRESETS: Record<Role, Grant[]> = {
   viewer: [{ path: '', read: true, write: false, create: false }],
 }
 
-type Section = 'general' | 'users' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens'
+type Section = 'general' | 'users' | 'trash' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens'
 
 type Group = {
   label: string
@@ -52,6 +53,7 @@ const GROUPS: Group[] = [
     items: [
       { id: 'general', label: 'General', icon: Database },
       { id: 'users', label: 'Users', icon: UsersIcon },
+      { id: 'trash', label: 'Trash', icon: Trash2 },
     ],
   },
   {
@@ -145,6 +147,7 @@ export function AdminPanel() {
           <div className="max-w-4xl mx-auto px-6 py-6">
             {section === 'general' && <GeneralPanel />}
             {section === 'users' && <UsersPanel />}
+            {section === 'trash' && <TrashPanel />}
             {section === 'embeddings' && <EmbeddingsPanel />}
             {section === 'storage' && <StoragePanel />}
             {section === 'mail' && <MailPanel />}
@@ -1449,6 +1452,146 @@ function UsersPanel() {
       </div>
     </div>
   )
+}
+
+// ─── Trash ──────────────────────────────────────────────────────────────────
+
+type TrashEntry = {
+  id: string
+  storageKey: string
+  filename: string
+  docId?: string
+  bytes: number
+  trashedAt: number
+  trashedBy: string
+}
+
+function TrashPanel() {
+  const [entries, setEntries] = useState<TrashEntry[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
+
+  const refresh = () =>
+    api
+      .trashList()
+      .then((r) => setEntries(r.entries))
+      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+
+  useEffect(() => {
+    refresh()
+  }, [])
+
+  const restore = async (id: string) => {
+    setBusyId(id)
+    setError(null)
+    try {
+      await api.trashRestore(id)
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const purge = async (id: string, name: string) => {
+    if (!confirm(`Permanently delete "${name}"? This cannot be undone.`)) return
+    setBusyId(id)
+    setError(null)
+    try {
+      await api.trashPurge(id)
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      {error && <ErrText text={error} />}
+
+      <Hint>
+        Items deleted from the vault land here and are automatically purged after 30 days.
+        Restore returns the file to its original path; purge removes it immediately.
+      </Hint>
+
+      <div>
+        <SectionLabel>
+          {entries ? `${entries.length} item${entries.length === 1 ? '' : 's'} in trash` : ''}
+        </SectionLabel>
+        {!entries && <Muted text="Loading…" />}
+        {entries && entries.length === 0 && <Muted text="Trash is empty." />}
+        {entries && entries.length > 0 && (
+          <div className="rounded border border-app overflow-hidden">
+            <table className="w-full text-[13px]">
+              <thead style={{ background: 'var(--panel)' }}>
+                <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
+                  <th className="px-3 py-2 font-semibold">Name</th>
+                  <th className="px-3 py-2 font-semibold">Original path</th>
+                  <th className="px-3 py-2 font-semibold">Size</th>
+                  <th className="px-3 py-2 font-semibold">Deleted</th>
+                  <th className="px-3 py-2 font-semibold">By</th>
+                  <th className="px-3 py-2"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((e) => (
+                  <tr
+                    key={e.id}
+                    className="border-t border-soft"
+                    style={{ borderColor: 'var(--border-soft)' }}
+                  >
+                    <td className="px-3 py-2 font-medium text-fg break-all">{e.filename}</td>
+                    <td className="px-3 py-2 text-muted text-[11.5px] break-all">{e.storageKey}</td>
+                    <td className="px-3 py-2 text-muted" style={{ fontVariantNumeric: 'tabular-nums' }}>
+                      {formatBytes(e.bytes)}
+                    </td>
+                    <td className="px-3 py-2 text-muted">
+                      {new Date(e.trashedAt).toLocaleString()}
+                    </td>
+                    <td className="px-3 py-2 text-muted">{e.trashedBy}</td>
+                    <td className="px-3 py-2 text-right whitespace-nowrap">
+                      <button
+                        className="btn-ghost"
+                        onClick={() => restore(e.id)}
+                        disabled={busyId === e.id}
+                        title="Restore to original location"
+                      >
+                        {busyId === e.id ? (
+                          <Loader2 size={12} className="animate-spin" />
+                        ) : (
+                          <RotateCcw size={12} />
+                        )}
+                        Restore
+                      </button>
+                      <button
+                        className="btn-ghost ml-1"
+                        onClick={() => purge(e.id, e.filename)}
+                        disabled={busyId === e.id}
+                        style={{ color: '#BF2600' }}
+                        title="Permanently delete"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function formatBytes(b: number): string {
+  if (b < 1024) return `${b} B`
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
 // ─── API tokens ─────────────────────────────────────────────────────────────

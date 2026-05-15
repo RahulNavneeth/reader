@@ -1,8 +1,22 @@
 import { config } from '../config.js'
 import { chunkText } from '../lib/chunk.js'
-import { saveMeta, writeText, writeChunks, loadMeta } from '../stores/documents.js'
+import {
+  saveMeta,
+  writeText,
+  writeChunks,
+  writeThumbnail,
+  writePreview,
+  loadMeta,
+} from '../stores/documents.js'
 import { extractText } from './extract.js'
 import { embedBatch, EmbedError } from './embed.js'
+import { generateThumbnail } from './thumbnail.js'
+import {
+  isImageNeedingTranscode,
+  isVideo,
+  transcodeImageToJpeg,
+  videoFrameAt,
+} from './media.js'
 import type { Chunk, DocumentMeta } from '../types.js'
 import { invalidateSearchCache } from './search.js'
 
@@ -17,6 +31,32 @@ import { invalidateSearchCache } from './search.js'
  * Always returns the latest meta. Errors are reflected in meta.ingest, never thrown.
  */
 export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promise<DocumentMeta> {
+  // Fire-and-forget thumbnail (and HEIC preview) generation in parallel with
+  // the extract/embed pipeline. We don't block the response on it.
+  ;(async () => {
+    try {
+      const thumb = await generateThumbnail(buffer, meta.originalFilename)
+      if (thumb) await writeThumbnail(meta.id, thumb)
+    } catch {
+      /* swallow — thumbnail is purely cosmetic */
+    }
+    // Full-size browser-renderable preview for formats browsers can't display
+    // natively (HEIC, HEIF, TIFF, JXL, all video containers). The thumbnail
+    // pipeline above handles the small grid tile; this gives the doc viewer a
+    // JPEG it can drop into an <img>.
+    try {
+      if (isImageNeedingTranscode(meta.originalFilename)) {
+        const jpeg = await transcodeImageToJpeg(buffer, meta.originalFilename)
+        if (jpeg) await writePreview(meta.id, jpeg)
+      } else if (isVideo(meta.originalFilename)) {
+        const frame = await videoFrameAt(buffer, meta.originalFilename)
+        if (frame) await writePreview(meta.id, frame)
+      }
+    } catch {
+      /* swallow — preview is best-effort */
+    }
+  })()
+
   let next: DocumentMeta = { ...meta, ingest: { ...meta.ingest, status: 'extracting' } }
   await saveMeta(next)
 

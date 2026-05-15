@@ -23,6 +23,47 @@ export function chunksFile(id: string): string {
   return path.join(docDir(id), 'chunks.jsonl')
 }
 
+export function thumbnailFile(id: string): string {
+  return path.join(docDir(id), 'thumb.png')
+}
+
+export async function readThumbnail(id: string): Promise<Buffer | null> {
+  try {
+    return await readFile(thumbnailFile(id))
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return null
+    throw e
+  }
+}
+
+export async function writeThumbnail(id: string, buffer: Buffer): Promise<void> {
+  await ensureDir(docDir(id))
+  await writeFile(thumbnailFile(id), buffer)
+}
+
+/**
+ * Full-size derived JPEG, used to display formats browsers can't render
+ * natively (HEIC). Distinct from `thumb.png` so we don't trash the small,
+ * cheap-to-serve thumbnail.
+ */
+export function previewFile(id: string): string {
+  return path.join(docDir(id), 'preview.jpg')
+}
+
+export async function readPreview(id: string): Promise<Buffer | null> {
+  try {
+    return await readFile(previewFile(id))
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return null
+    throw e
+  }
+}
+
+export async function writePreview(id: string, buffer: Buffer): Promise<void> {
+  await ensureDir(docDir(id))
+  await writeFile(previewFile(id), buffer)
+}
+
 export async function saveMeta(meta: DocumentMeta): Promise<void> {
   await writeJson(metaFile(meta.id), meta)
 }
