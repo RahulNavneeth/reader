@@ -7,6 +7,7 @@ import { AuthScreen } from './components/AuthScreen'
 import { UserMenu } from './components/UserMenu'
 import { VaultView } from './components/VaultView'
 import { AdminPanel } from './components/AdminPanel'
+import { ShareFileView } from './components/ShareFileView'
 import { SearchPalette } from './components/SearchPalette'
 import { UploadDialog } from './components/UploadDialog'
 import { PublicFileView } from './components/PublicFileView'
@@ -119,6 +120,15 @@ export default function App() {
       setVaultError(e instanceof ApiError ? e.message : String(e))
     }
   }, [])
+
+  // Share-link redemption is anonymous (gated only by the token + optional
+  // password) — handle it before any other auth branches so /s/:id renders
+  // the same view whether you're signed in or not. We pass the id directly
+  // because we bypass <Routes> here, so useParams() wouldn't see it.
+  if (location.pathname.startsWith('/s/')) {
+    const shareId = decodeURIComponent(location.pathname.slice('/s/'.length).split('/')[0] || '')
+    return <ShareFileView id={shareId} />
+  }
 
   if (auth.status === 'loading') {
     return (

@@ -46,25 +46,45 @@ export function VaultTree({ node, depth, selectedPath, activePath }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAncestorOfActive])
 
-  const loadChildren = async () => {
-    setLoading(true)
+  // `silent` skips the spinner placeholder so refresh-driven refetches don't
+  // briefly blank out an already-populated folder (visible as flicker when
+  // the sidebar refreshes on SSE events like visibility toggles).
+  const loadChildren = async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
       const r = await api.list(node.path)
-      setChildren(r.items)
+      // Only replace state when the data actually changed — keeps the same
+      // array reference for identical payloads and avoids re-rendering every
+      // child row on every event.
+      setChildren((prev) =>
+        prev && JSON.stringify(prev) === JSON.stringify(r.items) ? prev : r.items,
+      )
     } catch (e) {
       console.error(e)
-      setChildren([])
+      setChildren((prev) => (prev ? prev : []))
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
   }
 
+  // Initial expansion: load with spinner.
   useEffect(() => {
     if (node.type !== 'dir' || !expanded) return
-    loadChildren()
-    // refetch whenever the global refreshNonce bumps (after uploads, mkdir, etc.)
+    if (children === null) {
+      loadChildren(false)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshNonce, expanded])
+  }, [expanded])
+
+  // Refresh-driven refetch: silent (no spinner), only when this folder is
+  // already populated. Avoids the "every expanded folder flashes Loading…"
+  // cascade on each SSE event.
+  useEffect(() => {
+    if (node.type !== 'dir' || !expanded) return
+    if (children === null) return
+    loadChildren(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshNonce])
 
   const onClick = async () => {
     if (node.type === 'dir') {

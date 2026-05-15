@@ -1,10 +1,21 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Bookmark, Save } from 'lucide-react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { VaultTree } from './VaultTree'
 import { useVault } from '../lib/vault-context'
+
+// JSON-equality. Fine for our small payloads (tree/tags/views are O(100)
+// entries each); avoids pulling lodash for one comparator.
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    return false
+  }
+}
 
 type FlatHit = {
   path: string
@@ -16,6 +27,8 @@ type FlatHit = {
   score: number
   matchedTags: string[]
 }
+
+type FolderHit = { path: string; name: string; score: number }
 
 /**
  * The left rail used by both VaultView and the workspace-settings page.
@@ -30,7 +43,7 @@ export function VaultSidebar() {
   const location = useLocation()
   const openPath = (params['*'] || '').trim() || null
   const activeTag = location.pathname.startsWith('/tags/') ? params.tag ?? null : null
-  const { uploadFiles, refreshNonce, uploadingName, vaultError, clearError, currentFolder } = useVault()
+  const { uploadFiles, refreshNonce, uploadingName, vaultError, clearError, currentFolder, setCurrentFolder } = useVault()
   const activePath = openPath ?? (currentFolder || null)
 
   const [tree, setTree] = useState<VaultNode[] | null>(null)
@@ -47,6 +60,7 @@ export function VaultSidebar() {
   const [filter, setFilter] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [searchHits, setSearchHits] = useState<FlatHit[] | null>(null)
+  const [searchFolders, setSearchFolders] = useState<FolderHit[]>([])
   const [searching, setSearching] = useState(false)
 
   const refetch = useCallback(async () => {
@@ -56,16 +70,24 @@ export function VaultSidebar() {
         api.tags().catch(() => ({ tags: [] })),
         api.listViews().catch(() => ({ views: [] })),
       ])
-      setTree(list.items)
-      setTags(tagsR.tags)
-      setViews(viewsR.views)
+      // Only replace state when the payload actually differs. A visibility
+      // toggle on one file flips a `public` flag but produces an array that
+      // would otherwise be a new reference on every event — replacing every
+      // time causes a full subtree re-render (flicker).
+      setTree((prev) => (sameJson(prev, list.items) ? prev : list.items))
+      setTags((prev) => (sameJson(prev, tagsR.tags) ? prev : tagsR.tags))
+      setViews((prev) => (sameJson(prev, viewsR.views) ? prev : viewsR.views))
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     }
   }, [])
 
+  // Debounce refresh-driven refetches. A single user action can publish
+  // several SSE events in quick succession (e.g. ingest -> thumbnail ->
+  // preview); we coalesce them into one network round-trip.
   useEffect(() => {
-    refetch()
+    const t = setTimeout(refetch, 80)
+    return () => clearTimeout(t)
   }, [refetch, refreshNonce])
 
   const onDrop = (e: React.DragEvent) => {
@@ -86,6 +108,7 @@ export function VaultSidebar() {
     const q = filter.trim()
     if (!q) {
       setSearchHits(null)
+      setSearchFolders([])
       setSearching(false)
       return
     }
@@ -94,9 +117,15 @@ export function VaultSidebar() {
     const t = setTimeout(async () => {
       try {
         const r = await api.filesSearch(q, 50)
-        if (!cancelled) setSearchHits(r.items)
+        if (!cancelled) {
+          setSearchHits(r.items)
+          setSearchFolders(r.folders ?? [])
+        }
       } catch {
-        if (!cancelled) setSearchHits([])
+        if (!cancelled) {
+          setSearchHits([])
+          setSearchFolders([])
+        }
       } finally {
         if (!cancelled) setSearching(false)
       }
@@ -315,13 +344,42 @@ export function VaultSidebar() {
                 </div>
               )
             }
-            if (matchedTags.length === 0 && (!searchHits || searchHits.length === 0)) {
+            if (
+              matchedTags.length === 0 &&
+              searchFolders.length === 0 &&
+              (!searchHits || searchHits.length === 0)
+            ) {
               return (
                 <div className="px-3 py-2 text-[12.5px] text-subtle">No matches for "{filter}"</div>
               )
             }
             return (
               <div className="space-y-2">
+                {searchFolders.length > 0 && (
+                  <div className="space-y-0.5">
+                    <div className="px-2 pt-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+                      Folders
+                    </div>
+                    {searchFolders.map((f) => (
+                      <button
+                        key={f.path}
+                        onClick={() => {
+                          setCurrentFolder(f.path)
+                          navigate('/')
+                          setFilter('')
+                        }}
+                        className="w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left text-fg hover:bg-hover"
+                        title={f.path}
+                      >
+                        <Folder size={11} className="text-accent shrink-0" />
+                        <span className="truncate flex-1">{f.name}</span>
+                        <span className="text-[10.5px] text-subtle truncate" style={{ maxWidth: 120 }}>
+                          {f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : ''}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 {matchedTags.length > 0 && (
                   <div className="space-y-0.5">
                     <div className="px-2 pt-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">

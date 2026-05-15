@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Share2, Copy, Trash2, Loader2, X, Lock, Globe2 } from 'lucide-react'
+import { Share2, Copy, Check, Loader2, Lock, Globe2 } from 'lucide-react'
 import { ApiError, api, type ShareInfo } from '../lib/api'
 
 type Props = { path: string }
@@ -25,6 +25,7 @@ export function ShareButton({ path }: Props) {
   const [expiry, setExpiry] = useState<number | null>(86400 * 7)
   const [password, setPassword] = useState('')
   const [label, setLabel] = useState('')
+  const [copiedId, setCopiedId] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
 
   const refresh = () =>
@@ -86,6 +87,16 @@ export function ShareButton({ path }: Props) {
   }
 
   const linkOf = (id: string) => `${window.location.origin}/s/${id}`
+
+  const copyLink = async (sid: string) => {
+    try {
+      await navigator.clipboard.writeText(linkOf(sid))
+      setCopiedId(sid)
+      setTimeout(() => setCopiedId((c) => (c === sid ? null : c)), 1500)
+    } catch {
+      /* ignore */
+    }
+  }
 
   return (
     <div ref={rootRef} className="relative inline-flex">
@@ -164,66 +175,80 @@ export function ShareButton({ path }: Props) {
                   className="px-3 py-2"
                   style={{ borderTop: '1px solid var(--border-soft)' }}
                 >
-                  <div className="flex items-center gap-2">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-[12px] font-medium text-fg truncate">
-                        {s.label || s.id}
-                      </div>
-                      <div className="text-[10.5px] text-subtle flex items-center gap-1.5">
-                        {s.hasPassword ? (
-                          <span className="inline-flex items-center gap-0.5">
-                            <Lock size={9} /> password
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-0.5">
-                            <Globe2 size={9} /> open
-                          </span>
-                        )}
-                        <span>·</span>
-                        <span>
-                          {s.expiresAt
-                            ? `expires ${formatRel(s.expiresAt)}`
-                            : 'never expires'}
-                        </span>
-                        <span>·</span>
-                        <span>{s.accessCount} view{s.accessCount === 1 ? '' : 's'}</span>
-                      </div>
-                    </div>
+                  <div className="text-[12px] font-medium text-fg truncate">
+                    {s.label || `Link · ${new Date(s.createdAt).toLocaleDateString()}`}
+                  </div>
+                  <div className="text-[10.5px] text-subtle flex items-center gap-1.5 mt-0.5">
+                    {s.hasPassword ? (
+                      <span className="inline-flex items-center gap-0.5">
+                        <Lock size={9} /> password
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-0.5">
+                        <Globe2 size={9} /> open
+                      </span>
+                    )}
+                    <span>·</span>
+                    <span>
+                      {s.expiresAt ? `expires ${formatRel(s.expiresAt)}` : 'never expires'}
+                    </span>
+                    <span>·</span>
+                    <span>{s.accessCount} view{s.accessCount === 1 ? '' : 's'}</span>
+                  </div>
+
+                  {/* One-piece URL field with an inline labeled Copy button.
+                      Click the URL itself to also copy — friendlier than
+                      hunting for an icon. */}
+                  <div
+                    className="mt-1.5 flex items-stretch rounded overflow-hidden"
+                    style={{ border: '1px solid var(--border-soft)' }}
+                  >
                     <button
-                      className="btn-ghost h-6 w-6 px-0"
-                      onClick={() => navigator.clipboard.writeText(linkOf(s.id))}
-                      title="Copy link"
+                      type="button"
+                      onClick={() => copyLink(s.id)}
+                      className="flex-1 text-left px-2 py-1 text-[11px] truncate"
+                      style={{ background: 'var(--bg)', color: 'var(--fg)', fontFamily: 'ui-monospace, monospace' }}
+                      title="Click to copy"
                     >
-                      <Copy size={11} />
+                      {linkOf(s.id)}
                     </button>
                     <button
-                      className="btn-ghost h-6 w-6 px-0"
-                      onClick={() => revoke(s.id)}
-                      disabled={busy}
-                      title="Revoke"
-                      style={{ color: '#BF2600' }}
+                      type="button"
+                      onClick={() => copyLink(s.id)}
+                      className="px-2 inline-flex items-center gap-1 text-[11px] font-medium"
+                      style={{
+                        background: copiedId === s.id ? 'var(--selected)' : 'var(--panel)',
+                        color: copiedId === s.id ? 'var(--accent)' : 'var(--fg)',
+                        borderLeft: '1px solid var(--border-soft)',
+                      }}
                     >
-                      <X size={11} />
+                      {copiedId === s.id ? (
+                        <>
+                          <Check size={11} /> Copied
+                        </>
+                      ) : (
+                        <>
+                          <Copy size={11} /> Copy
+                        </>
+                      )}
                     </button>
                   </div>
-                  <code
-                    className="block mt-1 px-1.5 py-1 rounded text-[10.5px] break-all"
-                    style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
-                  >
-                    {linkOf(s.id)}
-                  </code>
+
+                  <div className="mt-1 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => revoke(s.id)}
+                      disabled={busy}
+                      className="text-[11px] hover:underline"
+                      style={{ color: '#BF2600' }}
+                    >
+                      Revoke link
+                    </button>
+                  </div>
                 </div>
               ))
             )}
           </div>
-          {shares && shares.length > 0 && (
-            <div
-              className="px-3 py-1.5 text-[10.5px] text-subtle"
-              style={{ borderTop: '1px solid var(--border-soft)' }}
-            >
-              <Trash2 size={9} className="inline mr-0.5" /> = revoke
-            </div>
-          )}
         </div>
       )}
     </div>

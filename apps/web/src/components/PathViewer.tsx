@@ -246,7 +246,10 @@ export function PathViewer({ path }: Props) {
         />
         <ActivityButton path={path} />
         <VersionsButton path={path} />
-        <ShareButton path={path} />
+        {/* Share links are pointless when the file is already public — the
+            raw URL works for anyone with the link. Only show the Share
+            control while the file is private. */}
+        {meta && !meta.public && <ShareButton path={path} />}
         <button
           className="btn-ghost"
           disabled={visibilityBusy || !meta}

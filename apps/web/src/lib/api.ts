@@ -278,7 +278,7 @@ export const api = {
         public: boolean
       }[]
     }>(`/api/files/by-tag${q({ tag })}`),
-  /** Cross-folder filename + tag search. Cheap; safe to call on each keystroke. */
+  /** Cross-folder filename + tag + folder-name search. */
   filesSearch: (qstr: string, limit = 50) =>
     get<{
       q: string
@@ -292,6 +292,7 @@ export const api = {
         score: number
         matchedTags: string[]
       }[]
+      folders: { path: string; name: string; score: number }[]
     }>(`/api/files/search${q({ q: qstr, limit })}`),
   fileVersions: (rel: string) =>
     get<{ versions: { ts: number; sha256: string; bytes: number; title?: string; hasText: boolean }[] }>(
@@ -333,6 +334,32 @@ export const api = {
       if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
       return r.json() as Promise<{ ok: true }>
     }),
+
+  // share redemption (anonymous, token-scoped reads)
+  shareInfo: (id: string, password?: string) =>
+    get<{
+      id: string
+      filename: string
+      ext: string
+      mime: string
+      label?: string
+      hasPassword: boolean
+      expiresAt: number | null
+    }>(`/api/share/${encodeURIComponent(id)}/info${password ? q({ p: password }) : ''}`),
+  shareTextUrl: (id: string, password?: string) =>
+    `/api/share/${encodeURIComponent(id)}/text${password ? q({ p: password }) : ''}`,
+  shareText: (id: string, password?: string) =>
+    get<{ content: string; size: number; mtime: number }>(
+      `/api/share/${encodeURIComponent(id)}/text${password ? q({ p: password }) : ''}`,
+    ),
+  shareRawUrl: (id: string, password?: string) =>
+    `/api/share/${encodeURIComponent(id)}/raw${password ? q({ p: password }) : ''}`,
+  sharePreviewUrl: (id: string, password?: string) =>
+    `/api/share/${encodeURIComponent(id)}/preview${password ? q({ p: password }) : ''}`,
+  shareThumbnailUrl: (id: string, password?: string) =>
+    `/api/share/${encodeURIComponent(id)}/thumbnail${password ? q({ p: password }) : ''}`,
+  shareDownloadUrl: (id: string, password?: string) =>
+    `/s/${encodeURIComponent(id)}?raw=1${password ? `&p=${encodeURIComponent(password)}` : ''}`,
 
   deleteShare: (id: string) =>
     fetch(`/api/file/shares/${encodeURIComponent(id)}`, {

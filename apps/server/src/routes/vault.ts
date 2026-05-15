@@ -1166,7 +1166,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     const { q = '', limit } = req.query as { q?: string; limit?: string }
     const needle = q.trim().toLowerCase()
     const lim = Math.min(Number(limit) || 50, 200)
-    if (!needle) return { q: '', items: [] }
+    if (!needle) return { q: '', items: [], folders: [] }
     const docs = await listAllDocuments()
     type Hit = {
       path: string
@@ -1215,7 +1215,42 @@ export async function vaultRoutes(app: FastifyInstance) {
       })
     }
     hits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
-    return { q: needle, items: hits.slice(0, lim) }
+
+    // Folder matches — walk the vault tree once and score against the basename.
+    // The user typing "investments" should see the investments/ folder
+    // surface as well as files under it.
+    type FolderHit = { path: string; name: string; score: number }
+    const folderHits: FolderHit[] = []
+    async function walkFolders(absDir: string, rel: string): Promise<void> {
+      let entries: import('node:fs').Dirent[]
+      try {
+        entries = await readdir(absDir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const e of entries) {
+        if (shouldSkipName(e.name)) continue
+        if (!e.isDirectory()) continue
+        const childRel = rel ? `${rel}/${e.name}` : e.name
+        if (canNavigateTo(user, childRel)) {
+          const name = e.name.toLowerCase()
+          let score = 0
+          if (name === needle) score += 6
+          else if (name.startsWith(needle)) score += 4
+          else if (name.includes(needle)) score += 2
+          if (score > 0) folderHits.push({ path: childRel, name: e.name, score })
+        }
+        await walkFolders(path.join(absDir, e.name), childRel)
+      }
+    }
+    await walkFolders(config.vault.root, '')
+    folderHits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+
+    return {
+      q: needle,
+      items: hits.slice(0, lim),
+      folders: folderHits.slice(0, Math.min(20, lim)),
+    }
   })
 
   // List every (visible) file carrying a given tag — fuels the "tag click in
