@@ -1,13 +1,16 @@
 import { useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useLocation, useParams } from 'react-router-dom'
 import { PathViewer } from './PathViewer'
 import { FolderGrid } from './FolderGrid'
+import { TaggedFilesView } from './TaggedFilesView'
 import { VaultSidebar } from './VaultSidebar'
 import { useVault } from '../lib/vault-context'
 
 export function VaultView() {
   const params = useParams()
+  const location = useLocation()
   const openPath = (params['*'] || '').trim() || null
+  const tagFilter = location.pathname.startsWith('/tags/') ? params.tag ?? null : null
   const { uploadFiles } = useVault()
   const [dragOver, setDragOver] = useState(false)
 
@@ -36,7 +39,13 @@ export function VaultView() {
         onDrop={onDrop}
         style={dragOver ? { boxShadow: 'inset 0 0 0 2px var(--accent)' } : undefined}
       >
-        {openPath ? <PathViewer key={openPath} path={openPath} /> : <FolderGrid />}
+        {openPath ? (
+          <PathViewer key={openPath} path={openPath} />
+        ) : tagFilter ? (
+          <TaggedFilesView key={tagFilter} />
+        ) : (
+          <FolderGrid />
+        )}
       </main>
     </div>
   )

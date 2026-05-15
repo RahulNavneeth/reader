@@ -19,6 +19,7 @@ import {
 } from './media.js'
 import type { Chunk, DocumentMeta } from '../types.js'
 import { invalidateSearchCache } from './search.js'
+import { publish } from './events.js'
 
 /**
  * Run the full ingestion pipeline for a freshly-uploaded document:
@@ -36,7 +37,10 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
   ;(async () => {
     try {
       const thumb = await generateThumbnail(buffer, meta.originalFilename)
-      if (thumb) await writeThumbnail(meta.id, thumb)
+      if (thumb) {
+        await writeThumbnail(meta.id, thumb)
+        publish({ type: 'thumbnail', path: meta.storageKey, docId: meta.id })
+      }
     } catch {
       /* swallow — thumbnail is purely cosmetic */
     }
@@ -47,10 +51,16 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
     try {
       if (isImageNeedingTranscode(meta.originalFilename)) {
         const jpeg = await transcodeImageToJpeg(buffer, meta.originalFilename)
-        if (jpeg) await writePreview(meta.id, jpeg)
+        if (jpeg) {
+          await writePreview(meta.id, jpeg)
+          publish({ type: 'preview', path: meta.storageKey, docId: meta.id })
+        }
       } else if (isVideo(meta.originalFilename)) {
         const frame = await videoFrameAt(buffer, meta.originalFilename)
-        if (frame) await writePreview(meta.id, frame)
+        if (frame) {
+          await writePreview(meta.id, frame)
+          publish({ type: 'preview', path: meta.storageKey, docId: meta.id })
+        }
       }
     } catch {
       /* swallow — preview is best-effort */
@@ -59,6 +69,7 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
 
   let next: DocumentMeta = { ...meta, ingest: { ...meta.ingest, status: 'extracting' } }
   await saveMeta(next)
+  publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
 
   let text = ''
   try {
@@ -70,6 +81,7 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
       ingest: { ...next.ingest, status: 'failed', error: `extract: ${e?.message ?? String(e)}` },
     }
     await saveMeta(next)
+  publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
     return next
   }
 
@@ -83,6 +95,7 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
       ingest: { ...next.ingest, status: 'no-text', chunkCount: 0, embedded: false },
     }
     await saveMeta(next)
+  publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
     invalidateSearchCache()
     return next
   }
@@ -95,6 +108,7 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
 
   next = { ...next, ingest: { ...next.ingest, status: 'embedding', chunkCount: chunks.length } }
   await saveMeta(next)
+  publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
 
   try {
     const vectors = await embedBatch(segments)
@@ -124,6 +138,7 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
     },
   }
   await saveMeta(next)
+  publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
   invalidateSearchCache()
   return next
 }
@@ -153,6 +168,7 @@ export async function reembedDocument(id: string): Promise<DocumentMeta | null> 
     },
   }
   await saveMeta(next)
+  publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
   invalidateSearchCache()
   return next
 }

@@ -57,6 +57,7 @@ export type VaultNode = {
   ingestStatus?: IngestStatus
   embedded?: boolean
   public?: boolean
+  tags?: string[]
 }
 
 export type SearchHit = {
@@ -240,6 +241,21 @@ export const api = {
   indexFile: (rel: string) => post<{ document: DocumentMeta }>('/api/file/index', { path: rel }),
   setVisibility: (rel: string, isPublic: boolean) =>
     post<{ document: DocumentMeta }>('/api/file/visibility', { path: rel, public: isPublic }),
+  setTags: (rel: string, tags: string[]) =>
+    post<{ document: DocumentMeta }>('/api/file/tags', { path: rel, tags }),
+  tags: () => get<{ tags: { tag: string; count: number }[] }>('/api/tags'),
+  filesByTag: (tag: string) =>
+    get<{
+      tag: string
+      items: {
+        path: string
+        name: string
+        ext: string
+        docId: string
+        tags: string[]
+        public: boolean
+      }[]
+    }>(`/api/files/by-tag${q({ tag })}`),
   bulkSetVisibility: (paths: string[], isPublic: boolean) =>
     post<{ ok: number; failed: number }>('/api/file/bulk-visibility', { paths, public: isPublic }),
   bulkDelete: (paths: string[]) =>

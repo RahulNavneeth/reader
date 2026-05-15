@@ -37,6 +37,7 @@ import { moveToTrash } from '../stores/trash.js'
 import { ingestDocument } from '../services/ingest.js'
 import { userCan, canNavigateTo } from '../lib/grants.js'
 import { invalidateSearchCache } from '../services/search.js'
+import { publish } from '../services/events.js'
 import type { DocumentMeta } from '../types.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
@@ -106,6 +107,7 @@ type TreeNode = {
   ingestStatus?: string
   embedded?: boolean
   public?: boolean
+  tags?: string[]
 }
 
 // ─── filename helpers ───────────────────────────────────────────────────────
@@ -319,6 +321,7 @@ export async function vaultRoutes(app: FastifyInstance) {
           ingestStatus: indexed?.ingest.status,
           embedded: indexed?.ingest.embedded,
           public: indexed?.public ?? false,
+          tags: indexed?.tags ?? [],
         })
       }
     }
@@ -351,12 +354,24 @@ export async function vaultRoutes(app: FastifyInstance) {
       }
     }
 
+    // If the on-disk file is gone (deleted out of band) but a doc record
+    // lingers, drop the stale record so the next list call hides it. Returns
+    // 404 either way.
+    const onDisk = await stat(abs).catch(() => null)
+    if (!onDisk || !onDisk.isFile()) {
+      if (meta) {
+        await deleteDocument(meta.id).catch(() => null)
+        invalidateSearchCache()
+      }
+      return reply.code(404).send({ error: 'file not found' })
+    }
+
     const ext = path.extname(abs).toLowerCase()
     // Native text types — read from disk directly so md/txt edits show without re-ingest.
     if (['.md', '.markdown', '.mdx', '.txt', '.csv', '.json', '.html', '.htm', '.yaml', '.yml', '.toml'].includes(ext)) {
       const buffer = await readFile(abs)
       const text = buffer.toString('utf8')
-      const s = await stat(abs)
+      const s = onDisk
       // First-read auto-ingest: if this vault file has never been embedded, kick
       // off a background ingest so it shows up in semantic search next time.
       if ((!meta || !meta.ingest.embedded) && req.currentUser) {
@@ -395,8 +410,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     // Binary types — return extracted text from the index, if any.
     if (!meta) return reply.code(404).send({ error: 'not indexed; use /api/file/raw' })
     const text = (await readExtracted(meta.id)) ?? ''
-    const s = await stat(abs)
-    return { path: rel, content: text, size: s.size, mtime: s.mtimeMs, docId: meta.id }
+    return { path: rel, content: text, size: onDisk.size, mtime: onDisk.mtimeMs, docId: meta.id }
   })
 
   app.get('/api/file/raw', async (req, reply) => {
@@ -682,6 +696,7 @@ export async function vaultRoutes(app: FastifyInstance) {
       })
     }
     invalidateSearchCache()
+    publish({ type: 'trash', path: rel })
     await audit({ actor: user.username, action: 'vault.trash', target: rel })
     return { ok: true }
   })
@@ -725,6 +740,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     await purgeTrash(entry.id)
     invalidateSearchCache()
+    publish({ type: 'restore', path: entry.storageKey })
     await audit({ actor: user.username, action: 'trash.restore', target: entry.storageKey })
     return { ok: true }
   })
@@ -956,6 +972,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     const next: DocumentMeta = { ...meta, public: body.public, updatedAt: Date.now() }
     await saveMeta(next)
+    publish({ type: 'visibility', path: body.path, public: body.public })
     await audit({
       actor: user.username,
       action: 'vault.visibility',
@@ -963,5 +980,113 @@ export async function vaultRoutes(app: FastifyInstance) {
       meta: { public: body.public },
     })
     return { document: next }
+  })
+
+  // ---- tags ---------------------------------------------------------------
+
+  // Replace a file's tag list. Tags are free-form strings; we lowercase + trim
+  // and de-dupe so "Receipts" and "receipts " collapse. Creates a stub doc
+  // record if the file isn't indexed yet, matching the visibility endpoint.
+  app.post('/api/file/tags', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    const body = req.body as { path?: string; tags?: unknown }
+    if (!body?.path) return reply.code(400).send({ error: 'missing path' })
+    if (!Array.isArray(body.tags)) return reply.code(400).send({ error: 'tags must be an array' })
+    const tags = Array.from(
+      new Set(
+        body.tags
+          .map((t) => (typeof t === 'string' ? t.trim().toLowerCase() : ''))
+          .filter((t) => t.length > 0 && t.length <= 40),
+      ),
+    ).sort()
+    const abs = resolveVault(body.path)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
+    const docs = await listAllDocuments()
+    let meta = docs.find((d) => d.storageKey === body.path)
+    if (!meta) {
+      const filename = path.basename(abs)
+      meta = {
+        id: nanoid(),
+        title: filename.replace(/\.[^.]+$/, ''),
+        originalFilename: filename,
+        mime: inferMime(filename),
+        bytes: s.size,
+        sha256: '',
+        storageKey: body.path,
+        owner: user.username,
+        acl: { readers: [], editors: [] },
+        tags: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ingest: { status: 'pending', embedded: false },
+      }
+    } else if (!userCanEdit(meta, user.username, user.role)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const next: DocumentMeta = { ...meta, tags, updatedAt: Date.now() }
+    await saveMeta(next)
+    invalidateSearchCache()
+    publish({ type: 'tags', path: body.path, tags })
+    await audit({
+      actor: user.username,
+      action: 'vault.tags',
+      target: body.path,
+      meta: { tags },
+    })
+    return { document: next }
+  })
+
+  // The full set of tags in use across the vault, with the doc count for each
+  // — populates the sidebar / picker.
+  app.get('/api/tags', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    const docs = await listAllDocuments()
+    const counts = new Map<string, number>()
+    for (const d of docs) {
+      if (!userCanRead(d, user.username, user.role)) continue
+      for (const t of d.tags || []) {
+        counts.set(t, (counts.get(t) ?? 0) + 1)
+      }
+    }
+    const out = Array.from(counts.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag))
+    return { tags: out }
+  })
+
+  // List every (visible) file carrying a given tag — fuels the "tag click in
+  // sidebar filters the grid" UX.
+  app.get('/api/files/by-tag', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    const { tag } = req.query as { tag?: string }
+    if (!tag) return reply.code(400).send({ error: 'missing tag' })
+    const t = tag.trim().toLowerCase()
+    const docs = await listAllDocuments()
+    const items: Array<{
+      path: string
+      name: string
+      ext: string
+      docId: string
+      tags: string[]
+      public: boolean
+    }> = []
+    for (const d of docs) {
+      if (!d.tags?.includes(t)) continue
+      if (!userCanRead(d, user.username, user.role)) continue
+      items.push({
+        path: d.storageKey,
+        name: path.basename(d.storageKey),
+        ext: path.extname(d.storageKey).toLowerCase(),
+        docId: d.id,
+        tags: d.tags,
+        public: !!d.public,
+      })
+    }
+    items.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+    return { tag: t, items }
   })
 }

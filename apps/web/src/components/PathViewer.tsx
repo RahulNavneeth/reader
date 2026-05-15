@@ -12,6 +12,7 @@ import { useVault } from '../lib/vault-context'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { FileInfoButton } from './FileInfoButton'
+import { TagsButton } from './TagsButton'
 import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
 
@@ -231,6 +232,11 @@ export function PathViewer({ path }: Props) {
             {indexing ? 'Indexing…' : reindexLabel}
           </button>
         )}
+        <TagsButton
+          path={path}
+          tags={meta?.tags ?? []}
+          onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
+        />
         <button
           className="btn-ghost"
           disabled={visibilityBusy}

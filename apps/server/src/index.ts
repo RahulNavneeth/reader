@@ -14,6 +14,7 @@ import { vaultRoutes } from './routes/vault.js'
 import { searchRoutes } from './routes/search.js'
 import { adminRoutes } from './routes/admin.js'
 import { mcpRoutes } from './routes/mcp.js'
+import { eventsRoutes } from './routes/events.js'
 import { sweepExpired } from './stores/sessions.js'
 import { preheat } from './services/search.js'
 import { isAvailable as ollamaUp } from './services/embed.js'
@@ -82,6 +83,7 @@ async function main() {
   await app.register(searchRoutes)
   await app.register(adminRoutes)
   await app.register(mcpRoutes)
+  await app.register(eventsRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
   // SPA fallback rewrites unknown paths to index.html so React Router-style

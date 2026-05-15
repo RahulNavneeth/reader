@@ -11,6 +11,7 @@ import { SearchPalette } from './components/SearchPalette'
 import { UploadDialog } from './components/UploadDialog'
 import { PublicFileView } from './components/PublicFileView'
 import { VaultContext } from './lib/vault-context'
+import { useReaderEvents } from './lib/events'
 
 type AuthState =
   | { status: 'loading' }
@@ -66,6 +67,14 @@ export default function App() {
     setVaultError(null)
     setRefreshNonce((n) => n + 1)
   }, [])
+
+  // Live updates: refresh the vault tree (and any open grid) whenever the
+  // server publishes a corpus mutation. Mounted at the app root so a single
+  // EventSource serves every page; only active when the user is signed in.
+  const onEvent = useCallback(() => {
+    setRefreshNonce((n) => n + 1)
+  }, [])
+  useReaderEvents(onEvent, auth.status === 'authed')
 
   const doUpload = useCallback(async (arr: File[], dir: string) => {
     for (const file of arr) {
@@ -237,6 +246,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<VaultView />} />
           <Route path="/docs/*" element={<VaultView />} />
+          <Route path="/tags/:tag" element={<VaultView />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
           <Route path="*" element={<VaultView />} />
         </Routes>

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2 } from 'lucide-react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight } from 'lucide-react'
 import clsx from 'clsx'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { VaultTree } from './VaultTree'
 import { useVault } from '../lib/vault-context'
@@ -15,19 +15,25 @@ import { useVault } from '../lib/vault-context'
  */
 export function VaultSidebar() {
   const params = useParams()
+  const navigate = useNavigate()
+  const location = useLocation()
   const openPath = (params['*'] || '').trim() || null
+  const activeTag = location.pathname.startsWith('/tags/') ? params.tag ?? null : null
   const { uploadFiles, refreshNonce, uploadingName, vaultError, clearError, currentFolder } = useVault()
   const activePath = openPath ?? (currentFolder || null)
 
   const [tree, setTree] = useState<VaultNode[] | null>(null)
+  const [tags, setTags] = useState<Array<{ tag: string; count: number }> | null>(null)
+  const [tagsOpen, setTagsOpen] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
   const [dragOver, setDragOver] = useState(false)
 
   const refetch = useCallback(async () => {
     try {
-      const list = await api.list('')
+      const [list, tagsR] = await Promise.all([api.list(''), api.tags().catch(() => ({ tags: [] }))])
       setTree(list.items)
+      setTags(tagsR.tags)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     }
@@ -105,6 +111,48 @@ export function VaultSidebar() {
               activePath={activePath}
             />
           ))
+        )}
+
+        {tags && tags.length > 0 && (
+          <div className="mt-3 mx-1">
+            <button
+              className="w-full flex items-center gap-1 px-2 h-6 text-[10.5px] uppercase tracking-wider font-semibold text-subtle hover:bg-hover rounded"
+              onClick={() => setTagsOpen((v) => !v)}
+            >
+              <ChevronRight
+                size={11}
+                className="transition-transform"
+                style={{ transform: tagsOpen ? 'rotate(90deg)' : undefined }}
+              />
+              Tags
+              <span className="text-subtle font-normal normal-case ml-1">({tags.length})</span>
+            </button>
+            {tagsOpen && (
+              <div className="mt-0.5 space-y-0.5">
+                {tags.map((t) => {
+                  const isActive = activeTag === t.tag
+                  return (
+                    <button
+                      key={t.tag}
+                      onClick={() => navigate(`/tags/${encodeURIComponent(t.tag)}`)}
+                      className={clsx(
+                        'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
+                        !isActive && 'hover:bg-hover',
+                      )}
+                      style={{
+                        background: isActive ? 'var(--selected)' : 'transparent',
+                        color: isActive ? 'var(--accent)' : 'var(--fg)',
+                      }}
+                    >
+                      <Tag size={11} className={isActive ? 'text-accent' : 'text-muted'} />
+                      <span className="truncate flex-1">{t.tag}</span>
+                      <span className="text-[10.5px] text-subtle">{t.count}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
         )}
 
         {(uploadingName || vaultError || error) && (
