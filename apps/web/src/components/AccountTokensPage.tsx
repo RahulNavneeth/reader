@@ -11,6 +11,7 @@ import {
   AlertCircle,
 } from 'lucide-react'
 import { ApiError, api, type ApiTokenInfo } from '../lib/api'
+import { useConfirm } from '../lib/confirm'
 
 /**
  * User-scoped API token management at /account/tokens. Mints + lists
@@ -20,6 +21,7 @@ import { ApiError, api, type ApiTokenInfo } from '../lib/api'
  */
 export function AccountTokensPage() {
   const navigate = useNavigate()
+  const confirm = useConfirm()
   const [tokens, setTokens] = useState<ApiTokenInfo[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [name, setName] = useState('')
@@ -55,7 +57,13 @@ export function AccountTokensPage() {
   }
 
   const remove = async (t: ApiTokenInfo) => {
-    if (!window.confirm(`Revoke token "${t.name}"? Anything using it will stop working.`)) return
+    const ok = await confirm({
+      title: 'Revoke token',
+      message: `"${t.name}" will be invalidated immediately. Any MCP client or script using it will stop working.`,
+      confirmLabel: 'Revoke',
+      destructive: true,
+    })
+    if (!ok) return
     try {
       await api.accountDeleteToken(t.id)
       refresh()

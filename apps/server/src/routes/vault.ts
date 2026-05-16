@@ -35,6 +35,7 @@ import { generateThumbnail } from '../services/thumbnail.js'
 import { writeThumbnail, writePreview } from '../stores/documents.js'
 import { moveToTrash } from '../stores/trash.js'
 import { ingestDocument } from '../services/ingest.js'
+import { couldHaveGps, extractGps } from '../services/gps.js'
 import { invalidateSearchCache } from '../services/search.js'
 import { publish } from '../services/events.js'
 import { dispatch as dispatchWebhook } from '../services/webhooks.js'
@@ -95,8 +96,11 @@ async function expandFilesUnder(owner: string, rel: string): Promise<string[]> {
       if (e.isDirectory()) {
         await walk(childAbs, childRel)
       } else if (e.isFile()) {
-        const ext = path.extname(e.name).toLowerCase()
-        if (SUPPORTED_EXTS.has(ext)) out.push(childRel)
+        // Listing intentionally shows every file. Ingest / search
+        // pipelines filter for the formats they can actually process,
+        // but the user should still see (and download/share/delete)
+        // whatever they put on disk — audio, zips, source code, etc.
+        out.push(childRel)
       }
     }
   }
@@ -133,8 +137,9 @@ async function expandTreeUnder(
         folders.push(childRel)
         await walk(childAbs, childRel)
       } else if (e.isFile()) {
-        const ext = path.extname(e.name).toLowerCase()
-        if (SUPPORTED_EXTS.has(ext)) files.push(childRel)
+        // No extension filter — folder cascade should act on every
+        // file the user can see in the grid (which is everything).
+        files.push(childRel)
       }
     }
   }
@@ -414,23 +419,6 @@ function httpErr(status: number, message: string): Error & { statusCode: number 
 
 // ─── tree types ─────────────────────────────────────────────────────────────
 
-const SUPPORTED_EXTS = new Set([
-  // text & docs
-  '.md', '.markdown', '.mdx',
-  '.txt', '.csv', '.json', '.yaml', '.yml', '.toml', '.html', '.htm',
-  '.pdf',
-  '.docx',
-  '.xlsx', '.xls',
-  // images
-  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
-  '.avif', '.bmp', '.ico', '.tiff', '.tif', '.jxl',
-  '.heic', '.heif',
-  // videos
-  '.mp4', '.mov', '.m4v', '.mkv', '.webm',
-  '.avi', '.3gp', '.3gpp', '.mts', '.m2ts',
-  '.mpg', '.mpeg', '.wmv', '.flv', '.ogv',
-])
-
 function shouldSkipName(name: string): boolean {
   if (name.startsWith('.')) return true
   if (name === 'node_modules' || name === 'dist' || name === 'build') return true
@@ -601,8 +589,9 @@ export async function vaultRoutes(app: FastifyInstance) {
           folders.push(childRel)
           await walk(path.join(absDir, e.name), childRel)
         } else if (e.isFile()) {
-          const ext = path.extname(e.name).toLowerCase()
-          if (!SUPPORTED_EXTS.has(ext)) continue
+          // Include every file in the tree dump — same reasoning as
+          // the listing endpoints: storage isn't gated by what we can
+          // index for search.
           files.push(childRel)
         }
       }
@@ -936,7 +925,9 @@ export async function vaultRoutes(app: FastifyInstance) {
         })
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase()
-        if (!SUPPORTED_EXTS.has(ext)) continue
+        // No extension filter — see expandTreeUnder for the rationale.
+        // Ingest still skips formats it can't extract, but the file
+        // remains visible in the grid.
         const indexed = indexedByPath.get(childRel)
         let size: number | undefined, mtime: number | undefined
         try {
@@ -1279,10 +1270,27 @@ export async function vaultRoutes(app: FastifyInstance) {
     const user = req.currentUser!
     if (user.role === 'viewer') return reply.code(403).send({ error: 'viewers cannot upload' })
 
-    const part = await req.file({ limits: { fileSize: config.ingest.maxFileBytes, files: 1 } })
+    const part = await req.file({
+      limits: { fileSize: config.ingest.maxFileBytes, files: 1 },
+    })
     if (!part) return reply.code(400).send({ error: 'no file uploaded' })
 
-    const buffer = await part.toBuffer()
+    let buffer: Buffer
+    try {
+      buffer = await part.toBuffer()
+    } catch (e: any) {
+      // multipart's fileSize limit fires here (mid-read) rather than
+      // on req.file(). Translate to a clean 413 so the client sees
+      // "too large" instead of a generic 500.
+      if (e?.code === 'FST_REQ_FILE_TOO_LARGE' || e?.code === 'FST_FILES_LIMIT') {
+        const mb = Math.round(config.ingest.maxFileBytes / (1024 * 1024))
+        return reply.code(413).send({
+          error: `file too large — max ${mb} MB`,
+          maxBytes: config.ingest.maxFileBytes,
+        })
+      }
+      throw e
+    }
     if (buffer.length === 0) return reply.code(400).send({ error: 'empty file' })
 
     // Quota check. Sums bytes across docs the user owns; rejects if this
@@ -1867,7 +1875,30 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
       return reply.code(403).send({ error: 'forbidden' })
     }
-    const meta = ctx.meta
+    let meta = ctx.meta
+    // Lazy GPS backfill: a legacy image uploaded before EXIF wiring
+    // (or one whose ingest predated `gps`) gets parsed on first
+    // owner-side meta view. Caps work to a single image so this stays
+    // sub-100ms; absence is cached as `null` so we never retry.
+    if (
+      meta &&
+      meta.gps === undefined &&
+      couldHaveGps(meta.originalFilename) &&
+      !!requester &&
+      meta.owner === requester
+    ) {
+      try {
+        const abs = resolveVault(meta.storageKey, meta.owner)
+        const buf = await readFile(abs)
+        const gps = await extractGps(buf, meta.originalFilename)
+        if (gps !== undefined) {
+          meta = { ...meta, gps }
+          await saveMeta(meta)
+        }
+      } catch {
+        /* swallow — best-effort */
+      }
+    }
     if (meta) {
       // Owner sees the full meta (their own data); cross-owner /
       // anonymous viewers get the stricter redaction so we don't leak

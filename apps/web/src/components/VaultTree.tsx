@@ -41,7 +41,7 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
   const [loading, setLoading] = useState(false)
   const [dropTarget, setDropTarget] = useState(false)
   const navigate = useNavigate()
-  const { refreshNonce, refresh } = useVault()
+  const { refreshNonce, refresh, setVaultError } = useVault()
 
   const isSelected = node.type === 'file' && selectedPath === node.path
 
@@ -66,7 +66,7 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
         prev && JSON.stringify(prev) === JSON.stringify(r.items) ? prev : r.items,
       )
     } catch (e) {
-      console.error(e)
+      setVaultError(e instanceof ApiError ? e.message : String(e))
       setChildren((prev) => (prev ? prev : []))
     } finally {
       if (!silent) setLoading(false)
@@ -156,7 +156,7 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
       }
       refresh()
     } catch (err) {
-      console.error(err instanceof ApiError ? err.message : err)
+      setVaultError(err instanceof ApiError ? err.message : String(err))
     }
   }
 

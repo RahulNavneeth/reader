@@ -8,9 +8,11 @@ import { audit } from '../stores/audit.js'
 import {
   deleteDocument,
   listAllDocuments,
+  saveMeta,
 } from '../stores/documents.js'
 import { ingestDocument } from '../services/ingest.js'
 import { invalidateSearchCache } from '../services/search.js'
+import { couldHaveGps, extractGps } from '../services/gps.js'
 import { getUser, saveUser } from '../stores/users.js'
 import { createToken, deleteToken, listTokens } from '../stores/tokens.js'
 import { loadSettings, saveSettings, type WebhookConfig } from '../stores/settings.js'
@@ -139,6 +141,98 @@ export async function accountRoutes(app: FastifyInstance) {
       target: id,
     })
     return { ok: true }
+  })
+
+  // ─── Map (geotagged photos) ─────────────────────────────────────────────
+  //
+  // Returns the caller's image docs that have GPS coords. Lazily
+  // backfills the `gps` field on legacy docs (uploaded before EXIF
+  // extraction was wired into ingest) — capped per request so a vault
+  // full of photos doesn't tie up one HTTP request for minutes.
+  app.get('/api/account/map', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const username = req.currentUser.username
+    const all = await listAllDocuments()
+    const mine = all.filter((d) => d.owner === username)
+
+    const BACKFILL_LIMIT = 25 // per request
+    let backfilled = 0
+    const pinsTried = new Set<string>()
+    for (const d of mine) {
+      if (d.gps !== undefined) continue
+      if (!couldHaveGps(d.originalFilename)) continue
+      if (backfilled >= BACKFILL_LIMIT) break
+      pinsTried.add(d.id)
+      try {
+        const abs = path.join(config.vault.root, d.storageKey)
+        const buf = await readFile(abs)
+        const gps = await extractGps(buf, d.originalFilename)
+        if (gps !== undefined) {
+          d.gps = gps
+          await saveMeta(d)
+          backfilled++
+        }
+      } catch {
+        /* skip — file missing, etc. */
+      }
+    }
+
+    // Dedupe by (sha256, then storageKey) BEFORE filtering. Same
+    // physical bytes = same photo, regardless of path — catches
+    // move/rename/re-ingest cases where one image ends up with
+    // multiple DocumentMeta records under different storageKeys. Falls
+    // back to storageKey for legacy docs missing sha256. Without this
+    // dedup, each duplicate would render as its own pin, inflating
+    // both the photo count and the cluster count.
+    const seen = new Set<string>()
+    const dedup = mine.filter((d) => {
+      const key = d.sha256 ? `sha:${d.sha256}` : `path:${d.storageKey}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+
+    const items = dedup
+      .filter(
+        (d) =>
+          d.gps &&
+          typeof d.gps.lat === 'number' &&
+          typeof d.gps.lng === 'number' &&
+          // Drop already-cached "Null Island" junk. New ingests get
+          // filtered in extractGps; this catches docs ingested before
+          // that filter existed.
+          !(Math.abs(d.gps.lat) < 0.01 && Math.abs(d.gps.lng) < 0.01),
+      )
+      .map((d) => {
+        // Pre-migration docs occasionally carry the owner segment in
+        // their storageKey ("rahulmnavneeth/IMG_8161.heic"). The vault
+        // routes resolve paths relative to the user's namespace, so a
+        // prefixed key 404s. Strip it before handing the URL to the
+        // client so "Open" navigates to a real file.
+        let path = d.storageKey
+        const prefix = username + '/'
+        if (path.startsWith(prefix)) path = path.slice(prefix.length)
+        return {
+          docId: d.id,
+          path,
+          name: d.originalFilename,
+          mime: d.mime,
+          createdAt: d.createdAt,
+          lat: d.gps!.lat,
+          lng: d.gps!.lng,
+        }
+      })
+
+    // True if there are still legacy images we haven't tried yet — the
+    // client can poll /map again to continue the backfill.
+    const moreToBackfill = mine.some(
+      (d) =>
+        d.gps === undefined &&
+        couldHaveGps(d.originalFilename) &&
+        !pinsTried.has(d.id),
+    )
+
+    return { items, backfilled, moreToBackfill }
   })
 
   // ─── Webhooks (user-scoped) ─────────────────────────────────────────────

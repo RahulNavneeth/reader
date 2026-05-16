@@ -11,10 +11,22 @@ export type VaultContextValue = {
   refresh: () => void
   /** Bumped whenever a refresh is requested — drive useEffect deps with this. */
   refreshNonce: number
-  /** Latest known status of an upload-in-progress, or null. */
-  uploadingName: string | null
+  /** Active upload batch progress, or null when nothing is uploading.
+   *  `done` is the number of files fully uploaded so far (not counting
+   *  the one currently in flight); `current` is the file in flight.
+   *  `failed` carries per-file errors so the batch can continue even
+   *  when individual files fail. */
+  uploadProgress: {
+    done: number
+    total: number
+    current: string | null
+    failed: Array<{ name: string; reason: string }>
+  } | null
   /** Latest error from upload/mkdir, cleared by refresh(). */
   vaultError: string | null
+  /** Push an error into the shared banner — used by descendants
+   *  (VaultTree drag-drop, etc.) so they don't dump into console. */
+  setVaultError: (msg: string | null) => void
   /** Clear `vaultError`. */
   clearError: () => void
   /** Vault-relative folder the user is currently viewing (used as upload default). "" = root. */

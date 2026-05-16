@@ -5,6 +5,7 @@ import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { VaultTree } from './VaultTree'
 import { useVault } from '../lib/vault-context'
+import { useConfirm, usePrompt } from '../lib/confirm'
 
 // JSON-equality. Fine for our small payloads (tree/tags/views are O(100)
 // entries each); avoids pulling lodash for one comparator.
@@ -44,7 +45,9 @@ export function VaultSidebar() {
   const location = useLocation()
   const openPath = (params['*'] || '').trim() || null
   const activeTag = location.pathname.startsWith('/tags/') ? params.tag ?? null : null
-  const { uploadFiles, refreshNonce, uploadingName, vaultError, clearError, currentFolder, currentUsername } = useVault()
+  const { uploadFiles, refreshNonce, vaultError, clearError, currentFolder, currentUsername } = useVault()
+  const confirm = useConfirm()
+  const prompt = usePrompt()
   const activePath = openPath ?? (currentFolder || null)
 
   const [tree, setTree] = useState<VaultNode[] | null>(null)
@@ -190,10 +193,15 @@ export function VaultSidebar() {
               <button
                 className="absolute right-7 top-1/2 -translate-y-1/2 btn-ghost h-5 w-5 px-0"
                 onClick={async () => {
-                  const name = window.prompt('Save this filter as a view. Name?')
-                  if (!name?.trim()) return
+                  const name = await prompt({
+                    title: 'Save filter as view',
+                    message: 'Re-apply this filter later with one click.',
+                    placeholder: 'View name',
+                    confirmLabel: 'Save',
+                  })
+                  if (!name) return
                   try {
-                    await api.createView({ name: name.trim(), query: filter.trim() })
+                    await api.createView({ name, query: filter.trim() })
                     refetch()
                   } catch (e) {
                     setError(e instanceof ApiError ? e.message : String(e))
@@ -263,12 +271,18 @@ export function VaultSidebar() {
                     <button
                       className="opacity-0 group-hover:opacity-100 btn-ghost h-5 w-5 px-0"
                       onClick={async () => {
-                        if (!window.confirm(`Delete view "${v.name}"?`)) return
+                        const ok = await confirm({
+                          title: 'Delete view',
+                          message: `Remove "${v.name}" from your saved views? The underlying filter / tag isn't affected.`,
+                          confirmLabel: 'Delete',
+                          destructive: true,
+                        })
+                        if (!ok) return
                         try {
                           await api.deleteView(v.id)
                           refetch()
-                        } catch {
-                          /* ignore */
+                        } catch (e) {
+                          setError(e instanceof ApiError ? e.message : String(e))
                         }
                       }}
                       title="Delete view"
@@ -534,34 +548,64 @@ export function VaultSidebar() {
                 <div className="px-3 py-2 text-[12.5px] text-subtle">No matches for "{filter}"</div>
               )
             }
+            // Split each hit list into own (caller's vault) vs shared
+            // (cross-owner). The own slices keep the existing flat
+            // sections; shared slices are bucketed by owner so the
+            // recipient sees `SHARED · alice` / `SHARED · bob` groups
+            // matching the Shared-with-me sidebar pattern.
+            const ownFolders = searchFolders.filter((f) => f.owner === currentUsername)
+            const ownHits = (searchHits ?? []).filter((h) => h.owner === currentUsername)
+            const sharedFolders = searchFolders.filter((f) => f.owner !== currentUsername)
+            const sharedHits = (searchHits ?? []).filter((h) => h.owner !== currentUsername)
+            const sharedByOwner = new Map<
+              string,
+              { folders: FolderHit[]; files: FlatHit[] }
+            >()
+            for (const f of sharedFolders) {
+              const b = sharedByOwner.get(f.owner) ?? { folders: [], files: [] }
+              b.folders.push(f)
+              sharedByOwner.set(f.owner, b)
+            }
+            for (const h of sharedHits) {
+              const b = sharedByOwner.get(h.owner) ?? { folders: [], files: [] }
+              b.files.push(h)
+              sharedByOwner.set(h.owner, b)
+            }
+            const sharedOwners = Array.from(sharedByOwner.keys()).sort((a, b) =>
+              a.localeCompare(b, undefined, { sensitivity: 'base' }),
+            )
+
+            const openFolderHit = (f: FolderHit) => {
+              const segs = f.path.split('/').filter(Boolean).map(encodeURIComponent).join('/')
+              const suffix =
+                f.owner && f.owner !== currentUsername
+                  ? `?owner=${encodeURIComponent(f.owner)}`
+                  : ''
+              navigate(`${segs ? `/${segs}` : '/'}${suffix}`)
+              setFilter('')
+            }
+            const openFileHit = (h: FlatHit) => {
+              const segs = h.path.split('/').map(encodeURIComponent).join('/')
+              const suffix =
+                h.owner && h.owner !== currentUsername
+                  ? `?owner=${encodeURIComponent(h.owner)}`
+                  : ''
+              navigate(`/${segs}${suffix}`)
+            }
+
             return (
               <div className="space-y-2">
-                {searchFolders.length > 0 && (
+                {ownFolders.length > 0 && (
                   <div className="space-y-0.5">
                     <div className="px-2 pt-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
                       Folders
                     </div>
-                    {searchFolders.map((f) => (
-                      <button
+                    {ownFolders.map((f) => (
+                      <FolderHitRow
                         key={`${f.owner}:${f.path}`}
-                        onClick={() => {
-                          const segs = f.path.split('/').filter(Boolean).map(encodeURIComponent).join('/')
-                          const suffix =
-                            f.owner && f.owner !== currentUsername
-                              ? `?owner=${encodeURIComponent(f.owner)}`
-                              : ''
-                          navigate(`${segs ? `/${segs}` : '/'}${suffix}`)
-                          setFilter('')
-                        }}
-                        className="w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left text-fg hover:bg-hover"
-                        title={f.path}
-                      >
-                        <Folder size={11} className="text-accent shrink-0" />
-                        <span className="truncate flex-1">{f.name}</span>
-                        <span className="text-[10.5px] text-subtle truncate" style={{ maxWidth: 120 }}>
-                          {f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : ''}
-                        </span>
-                      </button>
+                        hit={f}
+                        onOpen={openFolderHit}
+                      />
                     ))}
                   </div>
                 )}
@@ -594,41 +638,51 @@ export function VaultSidebar() {
                     })}
                   </div>
                 )}
-                {searchHits && searchHits.length > 0 && (
+                {ownHits.length > 0 && (
                   <div className="space-y-0.5">
                     <div className="px-2 pt-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
                       Files
                     </div>
-                    {searchHits.map((h) => {
-                      const isActive = openPath === h.path
-                      return (
-                        <button
-                          key={`${h.owner}:${h.path}`}
-                          onClick={() => {
-                            const segs = h.path.split('/').map(encodeURIComponent).join('/')
-                            const suffix =
-                              h.owner && h.owner !== currentUsername
-                                ? `?owner=${encodeURIComponent(h.owner)}`
-                                : ''
-                            navigate(`/${segs}${suffix}`)
-                          }}
-                          className={clsx(
-                            'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
-                            !isActive && 'hover:bg-hover',
-                          )}
-                          style={{
-                            background: isActive ? 'var(--selected)' : 'transparent',
-                            color: isActive ? 'var(--accent)' : 'var(--fg)',
-                          }}
-                          title={h.path}
-                        >
-                          <FileText size={11} className={isActive ? 'text-accent' : 'text-muted'} />
-                          <span className="truncate flex-1">{h.name}</span>
-                        </button>
-                      )
-                    })}
+                    {ownHits.map((h) => (
+                      <FileHitRow
+                        key={`${h.owner}:${h.path}`}
+                        hit={h}
+                        isActive={openPath === h.path}
+                        onOpen={openFileHit}
+                      />
+                    ))}
                   </div>
                 )}
+                {/* One block per sharer for cross-owner matches. Mirrors
+                    the Shared-with-me sidebar grouping so the user
+                    always knows which results came from where. */}
+                {sharedOwners.map((owner) => {
+                  const b = sharedByOwner.get(owner)!
+                  const count = b.folders.length + b.files.length
+                  return (
+                    <div key={owner} className="space-y-0.5">
+                      <div className="flex items-center gap-1.5 px-2 pt-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+                        <span>Shared · {owner}</span>
+                        <span className="ml-auto">{count}</span>
+                      </div>
+                      {b.folders.map((f) => (
+                        <FolderHitRow
+                          key={`${f.owner}:${f.path}`}
+                          hit={f}
+                          onOpen={openFolderHit}
+                        />
+                      ))}
+                      {b.files.map((h) => (
+                        <FileHitRow
+                          key={`${h.owner}:${h.path}`}
+                          hit={h}
+                          isActive={openPath === h.path}
+                          onOpen={openFileHit}
+                        />
+                      ))}
+                    </div>
+                  )
+                })}
               </div>
             )
           })()
@@ -646,19 +700,8 @@ export function VaultSidebar() {
           ))
         )}
 
-        {(uploadingName || vaultError || error) && (
+        {(vaultError || error) && (
           <div className="mt-2 mx-1 space-y-1.5">
-            {uploadingName && (
-              <div
-                className="px-3 py-2 rounded text-[12.5px] flex items-center gap-2"
-                style={{ background: 'var(--accent-bg)', color: 'var(--fg)' }}
-              >
-                <Loader2 size={13} className="animate-spin text-accent" />
-                <span className="truncate">
-                  Uploading <span className="font-medium">{uploadingName}</span>…
-                </span>
-              </div>
-            )}
             {(vaultError || error) && (
               <div
                 className="px-3 py-2 rounded text-[12.5px] flex items-center gap-2"
@@ -968,5 +1011,55 @@ function SharedOwnerSection({
         </div>
       )}
     </div>
+  )
+}
+
+function FolderHitRow({
+  hit,
+  onOpen,
+}: {
+  hit: FolderHit
+  onOpen: (h: FolderHit) => void
+}) {
+  return (
+    <button
+      onClick={() => onOpen(hit)}
+      className="w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left text-fg hover:bg-hover"
+      title={hit.path}
+    >
+      <Folder size={11} className="text-accent shrink-0" />
+      <span className="truncate flex-1">{hit.name}</span>
+      <span className="text-[10.5px] text-subtle truncate" style={{ maxWidth: 120 }}>
+        {hit.path.includes('/') ? hit.path.slice(0, hit.path.lastIndexOf('/')) : ''}
+      </span>
+    </button>
+  )
+}
+
+function FileHitRow({
+  hit,
+  isActive,
+  onOpen,
+}: {
+  hit: FlatHit
+  isActive: boolean
+  onOpen: (h: FlatHit) => void
+}) {
+  return (
+    <button
+      onClick={() => onOpen(hit)}
+      className={clsx(
+        'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
+        !isActive && 'hover:bg-hover',
+      )}
+      style={{
+        background: isActive ? 'var(--selected)' : 'transparent',
+        color: isActive ? 'var(--accent)' : 'var(--fg)',
+      }}
+      title={hit.path}
+    >
+      <FileText size={11} className={isActive ? 'text-accent' : 'text-muted'} />
+      <span className="truncate flex-1">{hit.name}</span>
+    </button>
   )
 }

@@ -30,6 +30,7 @@ import {
   type SystemInfo,
   type WorkspaceSettings,
 } from '../lib/api'
+import { useConfirm } from '../lib/confirm'
 
 type Section = 'general' | 'users' | 'duplicates' | 'embeddings' | 'storage' | 'mounts' | 'mail' | 'advanced'
 
@@ -1050,6 +1051,7 @@ function AdvancedPanel() {
 // ─── Users ──────────────────────────────────────────────────────────────────
 
 function UsersPanel() {
+  const confirm = useConfirm()
   const [users, setUsers] = useState<PublicUser[] | null>(null)
   const [settings, setSettings] = useState<WorkspaceSettings | null>(null)
   const [savingSignup, setSavingSignup] = useState(false)
@@ -1153,7 +1155,13 @@ function UsersPanel() {
   }
 
   const remove = async (u: PublicUser) => {
-    if (!confirm(`Delete "${u.username}"? This cannot be undone.`)) return
+    const ok = await confirm({
+      title: 'Delete user',
+      message: `"${u.username}" and their session tokens will be removed. Files on disk are not deleted; an admin can re-create the user later to regain access.`,
+      confirmLabel: 'Delete user',
+      destructive: true,
+    })
+    if (!ok) return
     try {
       await api.adminDeleteUser(u.username)
       refresh()
@@ -1350,6 +1358,7 @@ function formatBytes(b: number): string {
 // ─── Duplicates ─────────────────────────────────────────────────────────────
 
 function DuplicatesPanel() {
+  const confirm = useConfirm()
   const [groups, setGroups] = useState<Awaited<ReturnType<typeof api.adminDuplicates>>['groups'] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
@@ -1365,7 +1374,13 @@ function DuplicatesPanel() {
   }, [])
 
   const trash = async (storageKey: string) => {
-    if (!confirm(`Move "${storageKey}" to Trash?`)) return
+    const ok = await confirm({
+      title: 'Move to Trash',
+      message: `"${storageKey}" goes to Trash where it can still be restored. Purges automatically after 30 days.`,
+      confirmLabel: 'Move to Trash',
+      destructive: true,
+    })
+    if (!ok) return
     setBusy(storageKey)
     setError(null)
     try {
@@ -1621,6 +1636,7 @@ function Toggle({
  * Strictly read; the server refuses writes under these paths.
  */
 function ExternalMountsPanel() {
+  const confirm = useConfirm()
   const [mounts, setMounts] = useState<
     Array<{ id: string; name: string; absPath: string; createdAt: number }> | null
   >(null)
@@ -1656,7 +1672,13 @@ function ExternalMountsPanel() {
   }
 
   const remove = async (id: string) => {
-    if (!window.confirm('Remove this mount? Users will lose sidebar access; files on disk are untouched.')) return
+    const ok = await confirm({
+      title: 'Remove mount',
+      message: 'Users will lose sidebar access to this library. Files on disk are not affected.',
+      confirmLabel: 'Remove',
+      destructive: true,
+    })
+    if (!ok) return
     try {
       await api.adminDeleteExternalMount(id)
       refresh()

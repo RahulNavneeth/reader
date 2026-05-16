@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { useVault } from '../lib/vault-context'
+import { useConfirm } from '../lib/confirm'
 
 type Entry = {
   id: string
@@ -28,6 +29,7 @@ type Entry = {
 export function TrashPage() {
   const navigate = useNavigate()
   const { refresh } = useVault()
+  const confirm = useConfirm()
   const [entries, setEntries] = useState<Entry[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -57,7 +59,13 @@ export function TrashPage() {
   }
 
   const purge = async (e: Entry) => {
-    if (!window.confirm(`Permanently delete "${e.filename}"? This cannot be undone.`)) return
+    const ok = await confirm({
+      title: 'Permanently delete',
+      message: `"${e.filename}" will be erased from disk. This cannot be undone.`,
+      confirmLabel: 'Delete forever',
+      destructive: true,
+    })
+    if (!ok) return
     setBusyId(e.id)
     setError(null)
     try {

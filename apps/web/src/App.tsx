@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FileText, Sun, Moon, Loader2, Search as SearchIcon } from 'lucide-react'
+import { FileText, Sun, Moon, Loader2, Search as SearchIcon, Upload, FolderPlus } from 'lucide-react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
 import { ApiError, api, type PublicUser } from './lib/api'
 import { useTheme } from './hooks/useTheme'
@@ -11,12 +11,14 @@ import { AccountPage } from './components/AccountPage'
 import { AccountTokensPage } from './components/AccountTokensPage'
 import { AccountWebhooksPage } from './components/AccountWebhooksPage'
 import { MountBrowser } from './components/MountBrowser'
+import { MapPage } from './components/MapPage'
 import { TrashPage } from './components/TrashPage'
 import { SearchPalette } from './components/SearchPalette'
 import { UploadDialog } from './components/UploadDialog'
 import { PublicResolver } from './components/PublicResolver'
 import { VaultContext } from './lib/vault-context'
 import { useReaderEvents } from './lib/events'
+import { usePrompt } from './lib/confirm'
 
 type AuthState =
   | { status: 'loading' }
@@ -26,11 +28,44 @@ type AuthState =
 
 export default function App() {
   const { theme, toggle } = useTheme()
+  const prompt = usePrompt()
   const [auth, setAuth] = useState<AuthState>({ status: 'loading' })
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [refreshNonce, setRefreshNonce] = useState(0)
-  const [uploadingName, setUploadingName] = useState<string | null>(null)
+  const [uploadProgress, setUploadProgress] = useState<{
+    done: number
+    total: number
+    current: string | null
+    failed: Array<{ name: string; reason: string }>
+  } | null>(null)
+  // Live ref to upload state so the SSE handler can check it without
+  // becoming a dep of the listener (which would rebind the
+  // EventSource each upload tick).
+  const uploadingRef = useRef(false)
+  useEffect(() => {
+    uploadingRef.current = uploadProgress != null
+  }, [uploadProgress])
+
+  // Coalesced refresh. Without this, an upload batch of 1000 files
+  // publishes ~4× that many SSE events (upload + thumbnail + preview
+  // + ingest each); each one triggered the sidebar to refetch 6 API
+  // endpoints → continuous flicker AND racing against the upload
+  // itself. Two layers:
+  //   (a) While an upload is active we skip SSE bumps entirely. The
+  //       batch-end explicit refresh is what the user sees.
+  //   (b) Otherwise debounce to once per 750ms — fast enough for
+  //       another tab's mutation to feel live, slow enough to never
+  //       thrash.
+  const bumpTimerRef = useRef<number | null>(null)
+  const bumpRefresh = useCallback(() => {
+    if (uploadingRef.current) return
+    if (bumpTimerRef.current != null) return
+    bumpTimerRef.current = window.setTimeout(() => {
+      bumpTimerRef.current = null
+      setRefreshNonce((n) => n + 1)
+    }, 750)
+  }, [])
   const [vaultError, setVaultError] = useState<string | null>(null)
   const [pendingFiles, setPendingFiles] = useState<File[] | null>(null)
   const [currentFolder, setCurrentFolder] = useState<string>('')
@@ -76,22 +111,35 @@ export default function App() {
   // Live updates: refresh the vault tree (and any open grid) whenever the
   // server publishes a corpus mutation. Mounted at the app root so a single
   // EventSource serves every page; only active when the user is signed in.
-  const onEvent = useCallback(() => {
-    setRefreshNonce((n) => n + 1)
-  }, [])
-  useReaderEvents(onEvent, auth.status === 'authed')
+  // Routes through bumpRefresh so a flood of events compresses to one
+  // refresh per frame instead of one re-render per event.
+  useReaderEvents(bumpRefresh, auth.status === 'authed')
 
   const doUpload = useCallback(async (arr: File[], dir: string) => {
-    for (const file of arr) {
-      setUploadingName(file.name)
+    // Don't abort the whole batch on one bad file — log it and move on.
+    // Common cause is `file too large` (server cap, default 100MB) or
+    // a server-side write error; the user wants the other 999 files
+    // to still go through.
+    const failed: Array<{ name: string; reason: string }> = []
+    setUploadProgress({ done: 0, total: arr.length, current: arr[0]?.name ?? null, failed })
+    for (let i = 0; i < arr.length; i++) {
+      const file = arr[i]
+      setUploadProgress({ done: i, total: arr.length, current: file.name, failed: [...failed] })
       try {
         await api.upload(file, { dir })
       } catch (e) {
-        setVaultError(e instanceof ApiError ? e.message : String(e))
-        break
+        const reason = e instanceof ApiError ? e.message : String(e)
+        failed.push({ name: file.name, reason })
       }
     }
-    setUploadingName(null)
+    if (failed.length > 0) {
+      const summary =
+        failed.length === 1
+          ? `Couldn't upload ${failed[0].name}: ${failed[0].reason}`
+          : `${failed.length} of ${arr.length} files failed to upload. First error: ${failed[0].name} — ${failed[0].reason}`
+      setVaultError(summary)
+    }
+    setUploadProgress(null)
     setRefreshNonce((n) => n + 1)
   }, [])
 
@@ -113,9 +161,14 @@ export default function App() {
   }, [])
 
   const triggerNewFolder = useCallback(async () => {
-    const name = window.prompt('Folder name (use "/" for nesting, e.g. "notes/2026"):')
+    const name = await prompt({
+      title: 'New folder',
+      message: 'Use "/" for nesting, e.g. "notes/2026".',
+      placeholder: 'folder-name',
+      confirmLabel: 'Create',
+    })
     if (!name) return
-    const clean = name.trim().replace(/^\/+|\/+$/g, '')
+    const clean = name.replace(/^\/+|\/+$/g, '')
     if (!clean) return
     try {
       await api.mkdir(clean)
@@ -123,7 +176,7 @@ export default function App() {
     } catch (e) {
       setVaultError(e instanceof ApiError ? e.message : String(e))
     }
-  }, [])
+  }, [prompt])
 
   if (auth.status === 'loading') {
     return (
@@ -137,7 +190,7 @@ export default function App() {
     // Bare-path public URLs: `/` for a public vault root, `/<path>` for
     // any public file or folder. Reserved root segments are app routes
     // that can't be vault items.
-    const RESERVED = new Set(['settings', 'account', 'library', 'trash'])
+    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map'])
     const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
     const firstSeg = rawPath.split('/')[0] ?? ''
     const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
@@ -165,8 +218,9 @@ export default function App() {
         triggerNewFolder,
         refresh,
         refreshNonce,
-        uploadingName,
+        uploadProgress,
         vaultError,
+        setVaultError,
         clearError: () => setVaultError(null),
         currentFolder,
         setCurrentFolder,
@@ -207,22 +261,54 @@ export default function App() {
                 }}
                 onFocus={() => setPaletteOpen(true)}
                 placeholder="Search vault…"
-                className="w-full h-8 pl-8 pr-12 rounded text-[12.5px] text-fg placeholder:text-subtle outline-none transition-colors"
+                className="w-full h-8 pl-8 pr-[96px] rounded text-[12.5px] text-fg placeholder:text-subtle outline-none"
                 style={{
                   background: 'var(--bg)',
                   border: '1px solid var(--border-soft)',
                 }}
               />
-              <kbd
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] px-1 py-0.5 rounded shrink-0 pointer-events-none"
-                style={{
-                  background: 'var(--panel)',
-                  color: 'var(--fg-subtle)',
-                  border: '1px solid var(--border-soft)',
-                }}
-              >
-                ⌘K
-              </kbd>
+              {/* Right-side actions sit inside the input border, before
+                  the ⌘K hint. Quick access to the two most common
+                  vault mutations without having to open the palette
+                  first. Mousedown is on the icon itself so focus
+                  doesn't shift onto the button mid-click. */}
+              <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={triggerNewFolder}
+                  className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-hover text-subtle hover:text-fg transition-colors"
+                  title="New folder"
+                  aria-label="New folder"
+                >
+                  <FolderPlus size={13} />
+                </button>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={triggerUpload}
+                  className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-hover text-subtle hover:text-fg transition-colors"
+                  title="Upload files"
+                  aria-label="Upload files"
+                >
+                  <Upload size={13} />
+                </button>
+                <span
+                  className="mx-1 h-3 w-px"
+                  style={{ background: 'var(--border)' }}
+                  aria-hidden
+                />
+                <kbd
+                  className="text-[10px] px-1 py-0.5 rounded shrink-0 pointer-events-none"
+                  style={{
+                    background: 'var(--panel)',
+                    color: 'var(--fg-subtle)',
+                    border: '1px solid var(--border-soft)',
+                  }}
+                >
+                  ⌘K
+                </kbd>
+              </div>
               <SearchPalette
                 open={paletteOpen}
                 query={searchQuery}
@@ -233,12 +319,6 @@ export default function App() {
           </div>
 
           <div className="w-1/3 flex items-center justify-end gap-2">
-            {uploadingName && (
-              <span className="text-[12px] text-muted inline-flex items-center gap-1.5">
-                <Loader2 size={12} className="animate-spin text-accent" />
-                <span className="truncate max-w-[180px]">{uploadingName}</span>
-              </span>
-            )}
 
             <input
               ref={fileInputRef}
@@ -270,6 +350,7 @@ export default function App() {
           <Route path="/account/tokens" element={<AccountTokensPage />} />
           <Route path="/account/webhooks" element={<AccountWebhooksPage />} />
           <Route path="/trash" element={<TrashPage />} />
+          <Route path="/map" element={<MapPage />} />
           <Route path="/library/:mountId/*" element={<MountBrowser />} />
           <Route path="/library/:mountId" element={<MountBrowser />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
@@ -295,6 +376,74 @@ export default function App() {
               await doUpload(files, dir)
             }}
           />
+        )}
+
+        {/* Centered upload progress card. Floats above content but
+            doesn't block interaction — the user can still click around
+            while a long batch uploads. Lives at the App root so it
+            sits above any route, including /settings and /map. */}
+        {uploadProgress && (
+          <div
+            className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[150] pointer-events-none"
+          >
+            <div
+              className="rounded-xl px-5 py-4 w-[360px] max-w-[90vw] pointer-events-auto"
+              style={{
+                background: 'var(--panel)',
+                border: '1px solid var(--border)',
+                boxShadow: '0 10px 30px -10px rgba(9,30,66,0.35)',
+              }}
+              role="status"
+              aria-live="polite"
+            >
+              <div className="flex items-center gap-2.5 mb-3">
+                <Loader2 size={15} className="animate-spin text-accent shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13.5px] font-semibold text-fg">
+                    {uploadProgress.total === 1
+                      ? 'Uploading…'
+                      : `Uploading ${uploadProgress.total} files`}
+                  </div>
+                  {uploadProgress.total > 1 && (
+                    <div className="text-[11.5px] text-subtle tabular-nums mt-0.5">
+                      {uploadProgress.done} of {uploadProgress.total}
+                      {uploadProgress.failed.length > 0 && (
+                        <span style={{ color: '#BF2600' }}>
+                          {' '}· {uploadProgress.failed.length} failed
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+                {uploadProgress.total > 1 && (
+                  <div className="text-[13.5px] font-semibold text-accent tabular-nums shrink-0">
+                    {Math.round((uploadProgress.done / uploadProgress.total) * 100)}%
+                  </div>
+                )}
+              </div>
+              <div
+                className="h-1.5 rounded-full overflow-hidden"
+                style={{ background: 'var(--border-soft)' }}
+              >
+                <div
+                  className="h-full transition-[width]"
+                  style={{
+                    width: `${
+                      uploadProgress.total === 0
+                        ? 0
+                        : Math.round((uploadProgress.done / uploadProgress.total) * 100)
+                    }%`,
+                    background: 'var(--accent)',
+                  }}
+                />
+              </div>
+              {uploadProgress.current && (
+                <div className="text-[11.5px] text-subtle mt-2 truncate" title={uploadProgress.current}>
+                  {uploadProgress.current}
+                </div>
+              )}
+            </div>
+          </div>
         )}
       </div>
     </VaultContext.Provider>

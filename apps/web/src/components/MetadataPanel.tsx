@@ -12,7 +12,9 @@ import {
   Loader2,
   Share2,
   Tag,
+  MapPin,
 } from 'lucide-react'
+import { Map, Marker } from 'pigeon-maps'
 import { api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 
@@ -236,6 +238,51 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
                     {t}
                   </span>
                 ))}
+              </div>
+            </Section>
+          )}
+
+          {/* Photo GPS — only renders when the image had EXIF GPS coords
+              (cached as `meta.gps`). Tiny embedded OSM tile with a
+              single marker; "Open in map" jumps to the global /map
+              view centered on this pin. */}
+          {meta?.gps && (
+            <Section title="Location">
+              <div
+                className="rounded-md overflow-hidden"
+                style={{
+                  height: 160,
+                  border: '1px solid var(--border-soft)',
+                  position: 'relative',
+                }}
+              >
+                <Map
+                  defaultCenter={[meta.gps.lat, meta.gps.lng]}
+                  defaultZoom={13}
+                  mouseEvents={false}
+                  touchEvents={false}
+                  attribution={false}
+                >
+                  <Marker
+                    width={26}
+                    anchor={[meta.gps.lat, meta.gps.lng]}
+                    color="#845EF7"
+                  />
+                </Map>
+              </div>
+              <div className="flex items-center justify-between mt-2">
+                <span className="text-[10.5px] text-subtle inline-flex items-center gap-1">
+                  <MapPin size={9} className="text-subtle" />
+                  {meta.gps.lat.toFixed(5)}, {meta.gps.lng.toFixed(5)}
+                </span>
+                <button
+                  className="text-[10.5px] text-accent hover:underline"
+                  onClick={() => {
+                    window.open('/map', '_blank')
+                  }}
+                >
+                  Open map →
+                </button>
               </div>
             </Section>
           )}

@@ -11,6 +11,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+import { useConfirm } from '../lib/confirm'
 
 type WebhookEvent = 'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'
 type Webhook = {
@@ -33,6 +34,7 @@ const ALL_EVENTS: WebhookEvent[] = ['upload', 'edit', 'delete', 'share', 'tags',
  */
 export function AccountWebhooksPage() {
   const navigate = useNavigate()
+  const confirm = useConfirm()
   const [hooks, setHooks] = useState<Webhook[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [url, setUrl] = useState('')
@@ -81,7 +83,13 @@ export function AccountWebhooksPage() {
   }
 
   const remove = async (h: Webhook) => {
-    if (!window.confirm(`Delete this webhook? Events will stop being delivered to ${h.url}.`)) return
+    const ok = await confirm({
+      title: 'Delete webhook',
+      message: `Events will stop being delivered to ${h.url}. Existing deliveries already sent aren't affected.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    })
+    if (!ok) return
     try {
       await api.accountDeleteWebhook(h.id)
       refresh()

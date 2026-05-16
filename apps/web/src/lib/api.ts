@@ -55,6 +55,8 @@ export type DocumentMeta = {
     urls?: string[]
     orgs?: string[]
   }
+  /** GPS coords from image EXIF (HEIC/JPEG/TIFF); null = parsed but absent. */
+  gps?: { lat: number; lng: number } | null
 }
 
 export type VaultNode = {
@@ -739,6 +741,22 @@ export const api = {
     post<{ webhook: any }>('/api/account/webhooks', body),
   accountDeleteWebhook: (id: string) =>
     request<{ ok: true }>('DELETE', `/api/account/webhooks/${encodeURIComponent(id)}`),
+
+  // map — geotagged photos
+  accountMap: () =>
+    get<{
+      items: Array<{
+        docId: string
+        path: string
+        name: string
+        mime: string
+        createdAt: number
+        lat: number
+        lng: number
+      }>
+      backfilled: number
+      moreToBackfill: boolean
+    }>('/api/account/map'),
 
   // memories
   memories: () =>

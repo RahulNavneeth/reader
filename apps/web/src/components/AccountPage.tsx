@@ -26,6 +26,7 @@ import {
   Check,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+import { useConfirm } from '../lib/confirm'
 
 type Stats = Awaited<ReturnType<typeof api.accountStats>>
 type Memories = Awaited<ReturnType<typeof api.memories>>
@@ -618,6 +619,7 @@ function timeAgo(ts: number): string {
  * docs (admins still re-embed everyone from /settings if needed).
  */
 function EmailAndReindex({ user }: { user: { username: string; email?: string } }) {
+  const confirm = useConfirm()
   const [email, setEmail] = useState(user.email ?? '')
   const [emailBusy, setEmailBusy] = useState(false)
   const [emailSaved, setEmailSaved] = useState(false)
@@ -648,7 +650,13 @@ function EmailAndReindex({ user }: { user: { username: string; email?: string } 
   }
 
   const runReembed = async () => {
-    if (!window.confirm('Re-index all of your files? This re-runs text extraction + embedding and can take a while for large vaults.')) return
+    const ok = await confirm({
+      title: 'Re-index your files',
+      message:
+        'Re-runs text extraction + embedding on every file you own. Can take a while for large vaults; it runs in the background so feel free to keep using Reader.',
+      confirmLabel: 'Re-index',
+    })
+    if (!ok) return
     setReembedBusy(true)
     setReembedErr(null)
     setReembedResult(null)

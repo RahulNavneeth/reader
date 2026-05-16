@@ -10,6 +10,7 @@ import {
 } from '../stores/documents.js'
 import { extractText } from './extract.js'
 import { extractEntities } from './entities.js'
+import { extractGps } from './gps.js'
 import { embedBatch, EmbedError } from './embed.js'
 import { generateThumbnail } from './thumbnail.js'
 import {
@@ -90,11 +91,16 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
   // Pure-regex entity pass — dates/amounts/emails/urls/orgs — cheap and runs
   // synchronously here so embeddings and entities land in the same save.
   const entities = text.trim() ? extractEntities(text) : {}
+  // EXIF GPS for images (HEIC / JPEG / TIFF / WebP). Cheap parse; we
+  // persist the result (including the null absence-cache) so the /map
+  // view doesn't re-decode every image on each load.
+  const gps = await extractGps(buffer, meta.originalFilename)
   next = {
     ...next,
     updatedAt: Date.now(),
     ingest: { ...next.ingest, extractedAt: Date.now() },
     entities,
+    ...(gps !== undefined ? { gps } : {}),
   }
 
   if (!text.trim()) {

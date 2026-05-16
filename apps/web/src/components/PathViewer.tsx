@@ -20,6 +20,7 @@ import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
 import { MetadataPanel } from './MetadataPanel'
 import { PinButton } from './PinButton'
+import { MediaPlayer } from './MediaPlayer'
 
 type Props = {
   path: string
@@ -114,6 +115,9 @@ export function PathViewer({ path, canEdit = true }: Props) {
     '.mp4', '.mov', '.m4v', '.mkv', '.webm',
     '.avi', '.3gp', '.3gpp', '.mts', '.m2ts',
     '.mpg', '.mpeg', '.wmv', '.flv', '.ogv',
+  ].includes(ext)
+  const isAudio = [
+    '.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus', '.wma',
   ].includes(ext)
   // Server has to transcode these to JPEG — browsers won't render them
   // natively. /api/file/preview returns the JPEG for HEIC/TIFF/JXL, the raw
@@ -354,16 +358,20 @@ export function PathViewer({ path, canEdit = true }: Props) {
         )}
 
         {!error && isVideo && (
-          <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
-            <video
-              src={api.rawUrl(path, callerOpts)}
-              poster={api.previewUrl(path, callerOpts)}
-              controls
-              playsInline
-              preload="metadata"
-              className="max-w-full max-h-full rounded shadow-card"
-            />
-          </div>
+          <MediaPlayer
+            kind="video"
+            src={api.rawUrl(path, callerOpts)}
+            poster={api.previewUrl(path, callerOpts)}
+            filename={filename}
+          />
+        )}
+
+        {!error && isAudio && (
+          <MediaPlayer
+            kind="audio"
+            src={api.rawUrl(path, callerOpts)}
+            filename={filename}
+          />
         )}
 
         {!error && isMarkdown && text != null && (
@@ -434,7 +442,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
           </div>
         )}
 
-        {!error && !isPdf && !isImage && !isMarkdown && !isText && !isCsv && !isJson && !isHtml && !wantsExtractedText && (
+        {!error && !isPdf && !isImage && !isVideo && !isAudio && !isMarkdown && !isText && !isCsv && !isJson && !isHtml && !wantsExtractedText && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center">
               <div className="text-fg font-semibold mb-1">Preview unavailable</div>

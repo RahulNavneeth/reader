@@ -97,6 +97,11 @@ export type DocumentMeta = {
     urls?: string[]
     orgs?: string[]
   }
+  /** GPS coordinates extracted from image EXIF, if any. Set during ingest
+   *  for JPEG / HEIC / TIFF originals. Used by the /map view. `null` (vs
+   *  `undefined`) means we tried to extract and the image had no GPS — we
+   *  cache the negative so we don't re-parse next time. */
+  gps?: { lat: number; lng: number } | null
 }
 
 export type Chunk = {

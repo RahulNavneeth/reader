@@ -80,7 +80,12 @@
   .btn-ghost:hover { background: var(--hover); color: var(--fg); }
 
   .input {
-    @apply w-full h-8 px-2.5 rounded text-[13px] outline-none transition-colors;
+    /* No transition at all on .input. Any color/border transition
+       runs on theme swap too (since the affected values are CSS
+       variables that flip), so the input visibly trails the rest of
+       the chrome. Focus state is snappy without animation — the
+       border + shadow change is instant. */
+    @apply w-full h-8 px-2.5 rounded text-[13px] outline-none;
     background: var(--bg);
     color: var(--fg);
     border: 1px solid var(--border);
