@@ -47,6 +47,24 @@ export async function deleteAllSessionsForUser(username: string): Promise<void> 
   }
 }
 
+/** Return every live session belonging to the user. Used by the
+ *  /account dashboard so users can audit which devices are signed
+ *  in. Expired entries are filtered out. */
+export async function listSessionsForUser(username: string): Promise<Session[]> {
+  const names = await listDirNames(config.paths.sessions)
+  const now = Date.now()
+  const out: Session[] = []
+  for (const n of names) {
+    if (!n.endsWith('.json')) continue
+    const s = await readJson<Session>(path.join(config.paths.sessions, n))
+    if (!s || s.username !== username) continue
+    if (s.expiresAt < now) continue
+    out.push(s)
+  }
+  out.sort((a, b) => b.createdAt - a.createdAt)
+  return out
+}
+
 /** Best-effort sweep on boot; non-blocking thereafter. */
 export async function sweepExpired(): Promise<number> {
   const names = await listDirNames(config.paths.sessions)

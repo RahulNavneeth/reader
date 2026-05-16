@@ -8,12 +8,32 @@
  *   - tools/list
  *   - tools/call
  * Notifications are no-ops; we don't yet hold long-lived streams.
+ *
+ * The token's `createdBy` user is the principal for write operations —
+ * minting a token effectively delegates that user's vault access to
+ * the agent. Read tools continue to use the role-based principal
+ * (admin tokens see everything; lower-role tokens see only public).
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
+import path from 'node:path'
 import { findTokenBySecret } from '../stores/tokens.js'
-import { listAllDocuments, loadMeta, readText, userCanRead } from '../stores/documents.js'
+import {
+  listAllDocuments,
+  loadMeta,
+  readText,
+  saveMeta,
+  sha256Of,
+  userCanRead,
+  userCanEdit,
+} from '../stores/documents.js'
 import { searchKnowledge } from '../services/search.js'
-import type { ApiToken } from '../types.js'
+import { ensureUserVault, resolveUserVault } from '../lib/userVault.js'
+import { writeFile, readdir, stat, mkdir } from 'node:fs/promises'
+import { ingestDocument } from '../services/ingest.js'
+import { nanoid } from 'nanoid'
+import { audit } from '../stores/audit.js'
+import { addPin } from '../stores/pins.js'
+import type { ApiToken, DocumentMeta } from '../types.js'
 
 type RpcRequest = {
   jsonrpc: '2.0'
@@ -28,14 +48,15 @@ type RpcResponse =
 
 const SERVER_INFO = {
   protocolVersion: '2024-11-05',
-  serverInfo: { name: 'reader-knowledge', version: '0.2.0' },
+  serverInfo: { name: 'reader-knowledge', version: '0.3.0' },
   capabilities: { tools: {} },
 }
 
 const TOOLS = [
   {
     name: 'search_knowledge',
-    description: 'Search the user\'s document corpus with hybrid lexical + semantic search. Returns ranked snippets across documents the API token has access to.',
+    description:
+      "Search the user's document corpus with hybrid lexical + semantic search. Returns ranked snippets across documents the API token has access to.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -47,7 +68,8 @@ const TOOLS = [
   },
   {
     name: 'list_documents',
-    description: 'List all documents accessible to the API token, with metadata (title, tags, mime, size, status).',
+    description:
+      'List all documents accessible to the API token, with metadata (title, tags, mime, size, status).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -57,7 +79,7 @@ const TOOLS = [
   },
   {
     name: 'get_document',
-    description: 'Fetch a document\'s full extracted plaintext by id, plus metadata.',
+    description: "Fetch a document's full extracted plaintext by id, plus metadata.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -65,6 +87,60 @@ const TOOLS = [
       },
       required: ['id'],
     },
+  },
+  {
+    name: 'list_folder',
+    description:
+      'List the immediate contents of a folder in the token-owner vault. Use `path: ""` for the root.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Vault-relative folder path. Empty string = root.' },
+      },
+    },
+  },
+  {
+    name: 'upload_text',
+    description:
+      'Create or overwrite a text/markdown file in the token-owner vault. Path is vault-relative (e.g. "notes/agent-output.md"). The file is auto-ingested for search.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Vault-relative target path.' },
+        content: { type: 'string', description: 'UTF-8 file contents.' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  {
+    name: 'set_tags',
+    description: "Replace a document's tags by document id.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['id', 'tags'],
+    },
+  },
+  {
+    name: 'pin',
+    description: 'Pin a file or folder in the token user\'s sidebar.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        owner: { type: 'string', description: 'Optional — defaults to token user.' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'whoami',
+    description: 'Return the token user identity and role.',
+    inputSchema: { type: 'object', properties: {} },
   },
 ] as const
 
@@ -83,9 +159,30 @@ async function authHeaderToken(req: FastifyRequest): Promise<ApiToken | null> {
   return findTokenBySecret(secret)
 }
 
+/** Find an existing doc meta by vault path under the given owner. Used
+ *  by `upload_text` for the create-vs-update branch. */
+async function findDocByPath(owner: string, storageKey: string): Promise<DocumentMeta | null> {
+  const all = await listAllDocuments()
+  return (
+    all.find((d) => d.owner === owner && d.storageKey === storageKey) ?? null
+  )
+}
+
 async function handleCall(token: ApiToken, name: string, args: any) {
-  // The token's role acts as the principal for ACL checks.
+  // For read tools that go through ACL: use a synthetic principal that
+  // matches the legacy behavior (role drives visibility). For write
+  // tools we use the `createdBy` user as the acting principal.
   const principal = { username: `token:${token.id}`, role: token.role }
+  const actingUser = token.createdBy
+
+  if (name === 'whoami') {
+    return {
+      content: [
+        { type: 'text', text: `token=${token.id}, user=${actingUser}, role=${token.role}` },
+      ],
+      structuredContent: { token: token.id, user: actingUser, role: token.role },
+    }
+  }
 
   if (name === 'search_knowledge') {
     const q = String(args?.query ?? '').trim()
@@ -114,9 +211,11 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       .map((d) => ({
         id: d.id,
         title: d.title,
+        path: d.storageKey,
         mime: d.mime,
         bytes: d.bytes,
         tags: d.tags,
+        owner: d.owner,
         createdAt: d.createdAt,
         ingestStatus: d.ingest.status,
         chunkCount: d.ingest.chunkCount ?? 0,
@@ -135,12 +234,137 @@ async function handleCall(token: ApiToken, name: string, args: any) {
     const text = await readText(id)
     return {
       content: [
-        {
-          type: 'text',
-          text: `# ${meta.title}\n\n${text || '(no extracted text)'}`,
-        },
+        { type: 'text', text: `# ${meta.title}\n\n${text || '(no extracted text)'}` },
       ],
       structuredContent: { document: meta, text: text ?? '' },
+    }
+  }
+
+  if (name === 'list_folder') {
+    const rel = String(args?.path ?? '').replace(/^\/+|\/+$/g, '')
+    await ensureUserVault(actingUser)
+    const abs = resolveUserVault(actingUser, rel)
+    const names = await readdir(abs)
+    const items: Array<{ name: string; path: string; type: 'dir' | 'file'; bytes?: number }> = []
+    for (const n of names) {
+      if (n.startsWith('.')) continue
+      const st = await stat(path.join(abs, n)).catch(() => null)
+      if (!st) continue
+      items.push({
+        name: n,
+        path: rel ? `${rel}/${n}` : n,
+        type: st.isDirectory() ? 'dir' : 'file',
+        bytes: st.isFile() ? st.size : undefined,
+      })
+    }
+    items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1))
+    return {
+      content: [{ type: 'text', text: `${items.length} entries in /${rel}` }],
+      structuredContent: { path: rel, items },
+    }
+  }
+
+  if (name === 'upload_text') {
+    const rel = String(args?.path ?? '').replace(/^\/+|\/+$/g, '')
+    if (!rel) throw new Error('path required')
+    const content = String(args?.content ?? '')
+    const tags = Array.isArray(args?.tags)
+      ? args.tags.filter((t: any) => typeof t === 'string').map((t: string) => t.trim()).filter(Boolean)
+      : []
+    await ensureUserVault(actingUser)
+    const abs = resolveUserVault(actingUser, rel)
+    await mkdir(path.dirname(abs), { recursive: true })
+    const buffer = Buffer.from(content, 'utf8')
+    await writeFile(abs, buffer)
+    const filename = path.basename(rel)
+    const mime = filename.endsWith('.md')
+      ? 'text/markdown; charset=utf-8'
+      : 'text/plain; charset=utf-8'
+    const now = Date.now()
+    const existing = await findDocByPath(actingUser, rel)
+    let meta: DocumentMeta
+    if (existing) {
+      meta = {
+        ...existing,
+        bytes: buffer.length,
+        sha256: sha256Of(buffer),
+        tags: tags.length ? tags : existing.tags,
+        updatedAt: now,
+        ingest: { status: 'pending', embedded: false },
+      }
+      await saveMeta(meta)
+    } else {
+      meta = {
+        id: nanoid(),
+        title: filename.replace(/\.[^.]+$/, ''),
+        originalFilename: filename,
+        mime,
+        bytes: buffer.length,
+        sha256: sha256Of(buffer),
+        storageKey: rel,
+        owner: actingUser,
+        acl: { readers: [], editors: [] },
+        publicExpiresAt: null,
+        publicPasswordHash: null,
+        tags,
+        createdAt: now,
+        updatedAt: now,
+        ingest: { status: 'pending', embedded: false },
+      }
+      await saveMeta(meta)
+    }
+    // Re-ingest (text extract, chunk, embed) in the foreground so the
+    // RPC reply reflects the final ingest status the agent can act on.
+    meta = await ingestDocument(meta, buffer)
+    await audit({
+      actor: actingUser,
+      action: 'mcp.upload_text',
+      target: meta.id,
+      meta: { path: rel, bytes: buffer.length },
+    })
+    return {
+      content: [{ type: 'text', text: `Wrote ${rel} (${content.length} chars).` }],
+      structuredContent: { document: meta },
+    }
+  }
+
+  if (name === 'set_tags') {
+    const id = String(args?.id ?? '')
+    const tags: string[] = Array.isArray(args?.tags)
+      ? args.tags.filter((t: any) => typeof t === 'string').map((t: string) => t.trim()).filter(Boolean)
+      : []
+    const meta = await loadMeta(id)
+    if (!meta) throw new Error('document not found')
+    if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    const next: DocumentMeta = { ...meta, tags: Array.from(new Set(tags)), updatedAt: Date.now() }
+    await saveMeta(next)
+    await audit({
+      actor: actingUser,
+      action: 'mcp.set_tags',
+      target: id,
+      meta: { tags: next.tags },
+    })
+    return {
+      content: [{ type: 'text', text: `Tags set: ${next.tags.join(', ') || '(none)'}` }],
+      structuredContent: { document: next },
+    }
+  }
+
+  if (name === 'pin') {
+    const rel = String(args?.path ?? '').replace(/^\/+|\/+$/g, '')
+    const owner = String(args?.owner ?? actingUser)
+    let isFolder = false
+    try {
+      const abs = resolveUserVault(owner, rel)
+      const st = await stat(abs)
+      isFolder = st.isDirectory()
+    } catch {
+      throw new Error('target not found')
+    }
+    const pins = await addPin(actingUser, { owner, storageKey: rel, isFolder })
+    return {
+      content: [{ type: 'text', text: `Pinned ${rel}. ${pins.length} pin(s) total.` }],
+      structuredContent: { pins },
     }
   }
 
@@ -150,7 +374,6 @@ async function handleCall(token: ApiToken, name: string, args: any) {
 async function dispatch(token: ApiToken, msg: RpcRequest): Promise<RpcResponse | null> {
   const id = msg.id ?? null
 
-  // Notifications (no id) get no response.
   const isNotification = msg.id === undefined || msg.id === null
   switch (msg.method) {
     case 'initialize':
@@ -205,8 +428,6 @@ export async function mcpRoutes(app: FastifyInstance) {
     return reply.send(res)
   })
 
-  // GET on /mcp is reserved by the spec for SSE streams; we don't open them yet,
-  // so respond with 405 for clarity.
   app.get('/mcp', async (_req, reply) => {
     return reply.code(405).send({ error: 'streaming not implemented; use POST /mcp' })
   })

@@ -26,7 +26,9 @@ type Props = {
  *
  *   - fetches folder meta with an optional password (?p=),
  *   - shows an in-app prompt on 401 + passwordRequired,
- *   - shows an "expired" card on 410,
+ *
+ * No expiry handling: the server sweeps expired publics back to
+ * private, so this view never has to render that state explicitly.
  *   - renders the folder's children as tiles; clicking a file navigates to
  *     `/<rel>?p=<pwd>` — same bare-path scheme used everywhere else;
  *     the router resolves to the right viewer.
@@ -47,7 +49,6 @@ export function PublicFolderView({ path, onNotPublic }: Props) {
   const [items, setItems] = useState<VaultNode[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [expired, setExpired] = useState(false)
   const [passwordRequired, setPasswordRequired] = useState(false)
   const [passwordWrong, setPasswordWrong] = useState(false)
   const [password, setPassword] = useState('')
@@ -70,7 +71,6 @@ export function PublicFolderView({ path, onNotPublic }: Props) {
     let cancelled = false
     setLoading(true)
     setError(null)
-    setExpired(false)
     setPasswordRequired(false)
     setPasswordWrong(false)
     const pwdOpt = submittedPwd ? { password: submittedPwd } : undefined
@@ -101,10 +101,6 @@ export function PublicFolderView({ path, onNotPublic }: Props) {
           if (e.status === 401) {
             setPasswordRequired(true)
             if (submittedPwd) setPasswordWrong(true)
-            return
-          }
-          if (e.status === 410) {
-            setExpired(true)
             return
           }
           if (e.status === 404 || e.status === 403) {
@@ -159,20 +155,6 @@ export function PublicFolderView({ path, onNotPublic }: Props) {
             </div>
           )}
         </form>
-      </div>
-    )
-  }
-
-  if (expired) {
-    return (
-      <div className="h-full min-h-screen flex items-center justify-center surface">
-        <div className="text-center max-w-md p-6">
-          <AlertCircle size={20} style={{ color: '#BF2600' }} className="mx-auto mb-2" />
-          <div className="text-fg font-semibold">This link has expired</div>
-          <div className="text-[13px] text-muted mt-1">
-            Ask the owner for a fresh public link.
-          </div>
-        </div>
       </div>
     )
   }

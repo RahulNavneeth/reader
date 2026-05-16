@@ -187,8 +187,8 @@ export function UploadDialog({ files, defaultDir, onCancel, onConfirm }: Props) 
           style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
         >
           <div className="flex-1 text-[11.5px] text-subtle">
-            <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel)' }}>↵</kbd> to upload ·{' '}
-            <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel)' }}>esc</kbd> to cancel
+            <kbd className="px-1 py-0.5 rounded" style={{ background: 'var(--panel)' }}>↵</kbd> to upload ·{' '}
+            <kbd className="px-1 py-0.5 rounded" style={{ background: 'var(--panel)' }}>esc</kbd> to cancel
           </div>
           <button className="btn-ghost" onClick={onCancel} disabled={busy}>
             Cancel

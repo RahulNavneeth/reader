@@ -76,6 +76,28 @@ export async function listFolderMetas(owner?: string): Promise<FolderMeta[]> {
   return out
 }
 
+/** Sweep folder metas whose public expiry has passed; flip them to
+ *  private so the listing UI + access gates behave consistently. */
+export async function sweepExpiredPublicFolders(): Promise<number> {
+  const metas = await listFolderMetas()
+  const now = Date.now()
+  let flipped = 0
+  for (const m of metas) {
+    if (!m.public) continue
+    if (m.publicExpiresAt == null) continue
+    if (m.publicExpiresAt > now) continue
+    await saveFolderMeta({
+      ...m,
+      public: false,
+      publicExpiresAt: null,
+      publicPasswordHash: null,
+      updatedAt: now,
+    })
+    flipped++
+  }
+  return flipped
+}
+
 /** Default scaffold used when no meta exists yet. */
 export function freshFolderMeta(owner: string, storageKey: string): FolderMeta {
   const now = Date.now()

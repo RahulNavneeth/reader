@@ -206,6 +206,31 @@ async function isReadableViaShares(
   return false
 }
 
+/** Edit-grant variant of `isReadableViaShares`. Returns true only when
+ *  the recipient holds a share covering the path AND that share has
+ *  `canEdit: true`. */
+async function isEditableViaShare(
+  meta: { owner: string; storageKey: string },
+  user: { username: string; role: string },
+): Promise<boolean> {
+  if (user.role === 'admin') return true
+  if (meta.owner === user.username) return true
+  const { listSharesTo } = await import('../stores/userShares.js')
+  const shares = await listSharesTo(user.username)
+  const target = meta.storageKey.replace(/^\/+|\/+$/g, '')
+  for (const s of shares) {
+    if (s.owner !== meta.owner) continue
+    if (!s.canEdit) continue
+    const sk = s.storageKey.replace(/^\/+|\/+$/g, '')
+    if (s.isFolder) {
+      if (sk === '' || target === sk || target.startsWith(sk + '/')) return true
+    } else if (target === sk) {
+      return true
+    }
+  }
+  return false
+}
+
 async function resolveReadContext(opts: {
   rel: string
   ownerHint?: string
@@ -233,8 +258,31 @@ async function resolveReadContext(opts: {
   const own = owned.find((d) => d.public) ?? owned[0]
   const pub = docs.find((d) => d.storageKey === rel && d.public)
   const meta = own ?? pub ?? null
-  const owner = meta?.owner ?? requester ?? null
-  return { meta, owner, sharedGrant: null }
+  let owner = meta?.owner ?? requester ?? null
+  let sharedGrant: { canEdit: boolean } | null = null
+
+  // Share-grant fallthrough — if the requester hits a bare path (no
+  // ownerHint), they shouldn't 404 on a path that's shared with them
+  // by another user. Scan incoming shares and elevate to the share
+  // owner if any covers the path.
+  if (requester && !ownerHint && !meta) {
+    const { listSharesTo } = await import('../stores/userShares.js')
+    const sharesIn = await listSharesTo(requester)
+    const target = rel.replace(/^\/+|\/+$/g, '')
+    for (const s of sharesIn) {
+      const sk = s.storageKey.replace(/^\/+|\/+$/g, '')
+      const covers = s.isFolder
+        ? sk === '' || target === sk || target.startsWith(sk + '/')
+        : target === sk
+      if (!covers) continue
+      const sharedMeta =
+        docs.find((d) => d.owner === s.owner && d.storageKey === rel) ?? null
+      owner = s.owner
+      sharedGrant = { canEdit: s.canEdit }
+      return { meta: sharedMeta, owner, sharedGrant }
+    }
+  }
+  return { meta, owner, sharedGrant }
 }
 
 /**
@@ -335,17 +383,22 @@ function getReservedUploadBytes(username: string): number {
  * Check whether a public file is currently reachable by an anonymous caller.
  * Returns:
  *   - 'ok'                — public, no password (or correct password supplied)
- *   - 'expired'           — public flag set but the expiry has passed
  *   - 'password-required' — public + password hash + caller didn't include `?p=`
  *   - 'password-wrong'    — `?p=` provided but doesn't match
- *   - 'not-public'        — file isn't marked public at all
+ *   - 'not-public'        — file isn't marked public at all (or expiry has passed)
+ *
+ * Expiry collapses to `not-public` — there's no separate "expired"
+ * state. A periodic sweep flips `public:false` on expired metas so the
+ * data and the gate agree.
  */
 function publicGate(
   meta: { public?: boolean; publicExpiresAt?: number | null; publicPasswordHash?: string | null } | null | undefined,
   providedPassword: string | undefined,
-): 'ok' | 'expired' | 'password-required' | 'password-wrong' | 'not-public' {
+): 'ok' | 'password-required' | 'password-wrong' | 'not-public' {
   if (!meta?.public) return 'not-public'
-  if (meta.publicExpiresAt != null && meta.publicExpiresAt < Date.now()) return 'expired'
+  if (meta.publicExpiresAt != null && meta.publicExpiresAt < Date.now()) {
+    return 'not-public'
+  }
   if (meta.publicPasswordHash) {
     if (!providedPassword) return 'password-required'
     if (!verifySharePassword(meta.publicPasswordHash, providedPassword)) return 'password-wrong'
@@ -615,20 +668,59 @@ export async function vaultRoutes(app: FastifyInstance) {
       }
     }
 
-    // Anonymous fallthrough: scan everything for a public match.
-    if (!requester) {
+    // Share-grant fallthrough — for authed callers, scan incoming
+    // share grants. A recipient who got a bare-path URL (no `owner=`)
+    // for a file/folder shared with them by another user should
+    // resolve to the share owner automatically, not 404.
+    if (requester) {
+      const { listSharesTo } = await import('../stores/userShares.js')
+      const sharesIn = await listSharesTo(requester)
+      const target = rel.replace(/^\/+|\/+$/g, '')
+      for (const share of sharesIn) {
+        const sk = share.storageKey.replace(/^\/+|\/+$/g, '')
+        const covers = share.isFolder
+          ? sk === '' || target === sk || target.startsWith(sk + '/')
+          : target === sk
+        if (!covers) continue
+        const abs = resolveVault(rel, share.owner)
+        const s = await stat(abs).catch(() => null)
+        if (!s) continue
+        const docs = await listAllDocuments()
+        const meta =
+          docs.find((d) => d.storageKey === rel && d.owner === share.owner) ?? null
+        return {
+          kind: s.isFile() ? 'file' : 'folder',
+          owner: share.owner,
+          public: !!meta?.public,
+          access: {
+            ownedByRequester: false,
+            sharedReadOnly: !share.canEdit,
+            sharedEdit: share.canEdit,
+          },
+        }
+      }
+    }
+
+    // Public fallthrough — applies to both anonymous AND authed
+    // callers when the path didn't resolve under the caller's vault
+    // (or the supplied ownerHint). Lets a recipient who got a
+    // public-link URL via clipboard open it without the owner=
+    // query, even while signed in.
+    //
+    // Error responses include `kind` so the client can render the
+    // right viewer (file vs folder) for the password-prompt UI
+    // without guessing.
+    {
       const docs = await listAllDocuments()
       const pubFile = docs.find((d) => d.storageKey === rel && d.public)
       if (pubFile) {
         const gate = publicGate(pubFile, providedPassword)
-        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
         if (gate === 'password-required' || gate === 'password-wrong') {
-          return reply
-            .code(401)
-            .send({
-              error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
-              passwordRequired: true,
-            })
+          return reply.code(401).send({
+            error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+            passwordRequired: true,
+            kind: 'file',
+          })
         }
         if (gate === 'ok')
           return {
@@ -642,14 +734,12 @@ export async function vaultRoutes(app: FastifyInstance) {
       const pubFolder = allFolders.find((m) => m.storageKey === rel && m.public)
       if (pubFolder) {
         const gate = publicGate(pubFolder, providedPassword)
-        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
         if (gate === 'password-required' || gate === 'password-wrong') {
-          return reply
-            .code(401)
-            .send({
-              error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
-              passwordRequired: true,
-            })
+          return reply.code(401).send({
+            error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+            passwordRequired: true,
+            kind: 'folder',
+          })
         }
         if (gate === 'ok')
           return {
@@ -672,6 +762,14 @@ export async function vaultRoutes(app: FastifyInstance) {
     // share-recipient with a grant on this folder (or any ancestor).
     let owner: string
     let anonymous = false
+    // Partial-access mode: the recipient has no grant on `rel` itself
+    // but holds grants on descendants. We return ONLY the immediate
+    // children whose subtree the recipient has a grant for — so the
+    // user lands on a "transit" folder with just their shared items
+    // instead of a hard 403. Filled in below; consumed by the
+    // visibility filter near the bottom of the handler.
+    let partialAccess = false
+    const accessibleSubpaths = new Set<string>()
     if (ownerHint && ownerHint !== requester) {
       const fm = await getFolderMeta(ownerHint, rel)
       const gate = publicGate(fm, providedPassword)
@@ -686,8 +784,38 @@ export async function vaultRoutes(app: FastifyInstance) {
         anonymous = true
       } else if (requester && (await findShareForPath(requester, ownerHint, rel))) {
         owner = ownerHint
+      } else if (requester) {
+        // No direct grant on this path — check descendants. If the
+        // recipient has grants under `rel`, render a transit folder
+        // listing just those children.
+        const { listSharesTo } = await import('../stores/userShares.js')
+        const allShares = await listSharesTo(requester)
+        const prefix = rel ? rel.replace(/\/+$/, '') + '/' : ''
+        for (const s of allShares) {
+          if (s.owner !== ownerHint) continue
+          if (rel === '' || s.storageKey.startsWith(prefix)) {
+            // The visible item is the immediate child segment under `rel`.
+            const tail = rel ? s.storageKey.slice(prefix.length) : s.storageKey
+            const firstSeg = tail.split('/')[0]
+            if (!firstSeg) continue
+            accessibleSubpaths.add(rel ? `${prefix}${firstSeg}` : firstSeg)
+          }
+        }
+        if (accessibleSubpaths.size > 0) {
+          owner = ownerHint
+          partialAccess = true
+        } else {
+          if (gate === 'password-required' || gate === 'password-wrong') {
+            return reply
+              .code(401)
+              .send({
+                error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+                passwordRequired: true,
+              })
+          }
+          return reply.code(403).send({ error: 'forbidden' })
+        }
       } else {
-        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
         if (gate === 'password-required' || gate === 'password-wrong') {
           return reply
             .code(401)
@@ -714,7 +842,6 @@ export async function vaultRoutes(app: FastifyInstance) {
         }
       }
       if (!pick) {
-        if (lastGate === 'expired') return reply.code(410).send({ error: 'link expired' })
         if (lastGate === 'password-required' || lastGate === 'password-wrong') {
           return reply
             .code(401)
@@ -833,16 +960,23 @@ export async function vaultRoutes(app: FastifyInstance) {
         })
       }
     }
-    // For anonymous viewers, redact items that aren't individually
-    // public — a user can publish a folder and then privately revoke a
-    // child, and that child shouldn't be visible (or even discoverable)
-    // through the parent's public link.
-    const visibleItems = anonymous ? items.filter((it) => it.public) : items
+    // Filter rules:
+    //   - anonymous (public-folder browse): show only items with
+    //     public=true (revoked-after-cascade children stay hidden).
+    //   - partial-access (recipient transiting through a parent they
+    //     have no grant on): show only the immediate children whose
+    //     subtree they actually have a grant for.
+    //   - otherwise: show everything.
+    const visibleItems = anonymous
+      ? items.filter((it) => it.public)
+      : partialAccess
+      ? items.filter((it) => accessibleSubpaths.has(it.path))
+      : items
     visibleItems.sort((a, b) => {
       if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
       return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
     })
-    return { path: rel, items: visibleItems }
+    return { path: rel, items: visibleItems, partialAccess: partialAccess || undefined }
   })
 
   // ---- read -----------------------------------------------------------------
@@ -862,7 +996,6 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
-    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
     if (gate === 'password-required' || gate === 'password-wrong') {
       return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
     }
@@ -962,7 +1095,6 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
-    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
     if (gate === 'password-required' || gate === 'password-wrong') {
       if (gate === 'password-wrong') recordGateFailure(req.ip)
       return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
@@ -1034,7 +1166,6 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
-    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
     if (gate === 'password-required' || gate === 'password-wrong') {
       return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
     }
@@ -1105,7 +1236,6 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!owner) return reply.code(401).send({ error: 'auth required' })
 
     const gate = publicGate(meta, publicPassword)
-    if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
     if (gate === 'password-required' || gate === 'password-wrong') {
       return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
     }
@@ -1749,7 +1879,6 @@ export async function vaultRoutes(app: FastifyInstance) {
         : (redactForPublicViewer(meta) as DocumentMeta)
       if (meta.public) {
         const gate = publicGate(meta, publicPassword)
-        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
         if (gate === 'password-required' || gate === 'password-wrong') {
           // Expose just enough so the UI can render a password prompt
           // without giving away anything sensitive.
@@ -1898,7 +2027,7 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.post('/api/file/tags', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
-    const body = req.body as { path?: string; tags?: unknown }
+    const body = req.body as { path?: string; tags?: unknown; owner?: string }
     if (!body?.path) return reply.code(400).send({ error: 'missing path' })
     if (!Array.isArray(body.tags)) return reply.code(400).send({ error: 'tags must be an array' })
     const tags = Array.from(
@@ -1908,11 +2037,23 @@ export async function vaultRoutes(app: FastifyInstance) {
           .filter((t) => t.length > 0 && t.length <= 40),
       ),
     ).sort()
-    const abs = resolveVault(body.path, user.username)
+    // Cross-owner edit: a share-recipient with `canEdit: true` can
+    // mutate tags on the owner's file. Resolve the path under the
+    // effective owner (the share owner when cross-owner) and gate on
+    // the edit grant.
+    const effectiveOwner = body.owner && body.owner !== user.username ? body.owner : user.username
+    const abs = resolveVault(body.path, effectiveOwner)
     const s = await stat(abs).catch(() => null)
     if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
     const docs = await listAllDocuments()
-    let meta = docs.find((d) => d.storageKey === body.path && d.owner === user.username)
+    let meta = docs.find((d) => d.storageKey === body.path && d.owner === effectiveOwner)
+    if (effectiveOwner !== user.username) {
+      const ok = await isEditableViaShare(
+        meta ?? { owner: effectiveOwner, storageKey: body.path },
+        user,
+      )
+      if (!ok) return reply.code(403).send({ error: 'forbidden' })
+    }
     if (!meta) {
       const filename = path.basename(abs)
       meta = {
@@ -1923,14 +2064,14 @@ export async function vaultRoutes(app: FastifyInstance) {
         bytes: s.size,
         sha256: '',
         storageKey: body.path,
-        owner: user.username,
+        owner: effectiveOwner,
         acl: { readers: [], editors: [] },
         tags: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
         ingest: { status: 'pending', embedded: false },
       }
-    } else if (!userCanEdit(meta, user.username, user.role)) {
+    } else if (effectiveOwner === user.username && !userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     const next: DocumentMeta = { ...meta, tags, updatedAt: Date.now() }
@@ -1984,7 +2125,6 @@ export async function vaultRoutes(app: FastifyInstance) {
         }
       }
       if (!owner) {
-        if (lastGate === 'expired') return reply.code(410).send({ error: 'link expired' })
         if (lastGate === 'password-required' || lastGate === 'password-wrong') {
           return reply
             .code(401)
@@ -1999,7 +2139,6 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!owner) return reply.code(401).send({ error: 'auth required' })
     if (owner !== requester) {
       const gate = publicGate(fm, providedPassword)
-      if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
       if (gate === 'password-required' || gate === 'password-wrong') {
         return reply
           .code(401)

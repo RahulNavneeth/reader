@@ -11,45 +11,54 @@ type Props = {
   onNotPublic: () => void
 }
 
+type State =
+  | { status: 'loading' }
+  | { status: 'file' }
+  | { status: 'folder' }
+  | { status: 'gone' }
+
 /**
  * Anonymous entry point for bare-path URLs. Resolves whether `<path>` is a
  * file or a folder via `/api/resolve`, then hands off to the matching
  * viewer. Carries forward `?p=<password>` from the URL so a single
  * password-protected link works for the whole subtree.
+ *
+ * For 401 (password required) the server tells us the kind so we
+ * route to the matching viewer for the password prompt. There is no
+ * "expired" state — the server's expiry sweep flips expired publics
+ * back to private, so expired links just behave like any other
+ * private path.
  */
 export function PublicResolver({ path, onNotPublic }: Props) {
-  const [kind, setKind] = useState<'loading' | 'file' | 'folder' | 'auth'>('loading')
+  const [state, setState] = useState<State>({ status: 'loading' })
 
   useEffect(() => {
     let cancelled = false
     const url = new URL(window.location.href)
     const password = url.searchParams.get('p') ?? undefined
-    setKind('loading')
+    setState({ status: 'loading' })
     api
       .resolve(path, password ? { password } : undefined)
       .then((r) => {
         if (cancelled) return
-        setKind(r.kind)
+        setState({ status: r.kind })
       })
       .catch((e) => {
         if (cancelled) return
-        if (e instanceof ApiError && (e.status === 401 || e.status === 410)) {
-          // Let the underlying viewer handle the prompt / expired UI —
-          // it'll re-issue the same resolve call. Default to folder if
-          // path could plausibly be either; the viewers themselves can
-          // recover with their own error states.
-          setKind('folder')
+        if (e instanceof ApiError && e.status === 401) {
+          const kind = e.body?.kind === 'folder' ? 'folder' : 'file'
+          setState({ status: kind })
           return
         }
         onNotPublic()
-        setKind('auth')
+        setState({ status: 'gone' })
       })
     return () => {
       cancelled = true
     }
   }, [path, onNotPublic])
 
-  if (kind === 'loading') {
+  if (state.status === 'loading') {
     return (
       <div className="h-full flex items-center justify-center surface">
         <div className="text-[13px] text-muted inline-flex items-center gap-2">
@@ -58,10 +67,10 @@ export function PublicResolver({ path, onNotPublic }: Props) {
       </div>
     )
   }
-  if (kind === 'file') {
+  if (state.status === 'file') {
     return <PublicFileView path={path} onNotPublic={onNotPublic} />
   }
-  if (kind === 'folder') {
+  if (state.status === 'folder') {
     return <PublicFolderView path={path} onNotPublic={onNotPublic} />
   }
   return null

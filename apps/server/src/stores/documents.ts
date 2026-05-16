@@ -139,6 +139,35 @@ export async function* streamChunks(id: string): AsyncGenerator<Chunk> {
   }
 }
 
+/**
+ * Sweep public files whose expiry has passed and flip `public:false`.
+ * Treats expired = private from then on, so everything downstream
+ * (file globe, /api/list anonymous filter, /api/file/raw gate)
+ * behaves consistently without special-casing 'expired'.
+ *
+ * Cheap pass over all doc metas; returns how many got flipped so the
+ * boot/cron caller can log it.
+ */
+export async function sweepExpiredPublic(): Promise<number> {
+  const docs = await listAllDocuments()
+  const now = Date.now()
+  let flipped = 0
+  for (const d of docs) {
+    if (!d.public) continue
+    if (d.publicExpiresAt == null) continue
+    if (d.publicExpiresAt > now) continue
+    await saveMeta({
+      ...d,
+      public: false,
+      publicExpiresAt: null,
+      publicPasswordHash: null,
+      updatedAt: now,
+    })
+    flipped++
+  }
+  return flipped
+}
+
 export async function listAllDocuments(): Promise<DocumentMeta[]> {
   const ids = await readdir(config.paths.documents).catch(() => [])
   const out: DocumentMeta[] = []

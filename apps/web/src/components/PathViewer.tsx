@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock, Info } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -11,7 +11,6 @@ import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
-import { FileInfoButton } from './FileInfoButton'
 import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
 import { VersionsButton } from './VersionsButton'
@@ -19,12 +18,18 @@ import { PublicButton } from './PublicButton'
 import { ShareWithUserButton } from './ShareWithUserButton'
 import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
+import { MetadataPanel } from './MetadataPanel'
+import { PinButton } from './PinButton'
 
 type Props = {
   path: string
+  /** True for own-vault files, or shared paths where the recipient has
+   *  canEdit. Drives which toolbar affordances render in shared
+   *  views — read-only recipients see only navigation + Download. */
+  canEdit?: boolean
 }
 
-export function PathViewer({ path }: Props) {
+export function PathViewer({ path, canEdit = true }: Props) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   // When opened from a "Shared with me" entry the URL carries ?owner=<other
@@ -37,6 +42,7 @@ export function PathViewer({ path }: Props) {
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [indexing, setIndexing] = useState(false)
+  const [panelOpen, setPanelOpen] = useState(false)
 
   useEffect(() => {
     const i = path.lastIndexOf('/')
@@ -215,7 +221,16 @@ export function PathViewer({ path }: Props) {
         <PathBreadcrumb
           dir={parentDir}
           currentName={filename}
-          currentAction={<FileInfoButton path={path} meta={meta} />}
+          currentAction={
+            <button
+              className="btn-ghost h-6 w-6 px-0 shrink-0"
+              onClick={() => setPanelOpen(true)}
+              title="Details"
+              aria-label="Open details panel"
+            >
+              <Info size={13} />
+            </button>
+          }
           onNavigate={goToFolder}
           onBack={() => goToFolder(parentDir)}
           ownerLabel={ownerOpt}
@@ -228,9 +243,25 @@ export function PathViewer({ path }: Props) {
         {meta?.ingest.embedded && (
           <Sparkles size={13} className="text-accent shrink-0 mx-1" aria-label="indexed for AI search" />
         )}
-        {/* Owner-only controls. When viewing a shared file (ownerOpt is
-            set), the recipient sees only navigation + Download — they
-            can't mutate the owner's tags, visibility, or shares. */}
+        {/* Access affordances. The owner sees every owner-control
+            (Tags / Activity / Versions / Share / Public). A
+            share-recipient with edit grant additionally sees Tags +
+            Activity (mutating the owner's metadata is what "edit"
+            actually means in this app). Read-only recipients see
+            only navigation + Download. */}
+        {ownerOpt && (
+          <span
+            className="text-[10.5px] font-medium px-1.5 h-5 rounded inline-flex items-center"
+            style={{
+              background: canEdit ? 'var(--selected)' : 'var(--bg)',
+              color: canEdit ? 'var(--accent)' : 'var(--fg-subtle)',
+              border: '1px solid var(--border-soft)',
+            }}
+            title={canEdit ? 'You have edit access via share' : 'You have read-only access via share'}
+          >
+            {canEdit ? 'shared · edit' : 'shared · read-only'}
+          </span>
+        )}
         {!ownerOpt && needsReindex && (
           <button
             className="btn-ghost"
@@ -242,14 +273,19 @@ export function PathViewer({ path }: Props) {
             {indexing ? 'Indexing…' : reindexLabel}
           </button>
         )}
-        {!ownerOpt && (
+        {(!ownerOpt || canEdit) && (
           <>
             <TagsButton
               path={path}
               tags={meta?.tags ?? []}
+              owner={ownerOpt}
               onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
             />
             <ActivityButton path={path} />
+          </>
+        )}
+        {!ownerOpt && (
+          <>
             <VersionsButton path={path} />
             {meta && <ShareWithUserButton paths={[path]} />}
             {meta ? (
@@ -277,6 +313,7 @@ export function PathViewer({ path }: Props) {
             )}
           </>
         )}
+        <PinButton path={path} owner={ownerOpt} isFolder={false} onChanged={refresh} />
         <a className="btn-ghost" href={api.rawUrl(path, callerOpts)} download={filename}>
           <Download size={14} />
           Download
@@ -434,6 +471,13 @@ export function PathViewer({ path }: Props) {
          </aside>
        )}
       </div>
+      <MetadataPanel
+        path={path}
+        meta={meta}
+        owner={ownerOpt}
+        open={panelOpen}
+        onClose={() => setPanelOpen(false)}
+      />
     </div>
   )
 }

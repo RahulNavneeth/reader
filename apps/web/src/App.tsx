@@ -7,6 +7,11 @@ import { AuthScreen } from './components/AuthScreen'
 import { UserMenu } from './components/UserMenu'
 import { VaultView } from './components/VaultView'
 import { AdminPanel } from './components/AdminPanel'
+import { AccountPage } from './components/AccountPage'
+import { AccountTokensPage } from './components/AccountTokensPage'
+import { AccountWebhooksPage } from './components/AccountWebhooksPage'
+import { MountBrowser } from './components/MountBrowser'
+import { TrashPage } from './components/TrashPage'
 import { SearchPalette } from './components/SearchPalette'
 import { UploadDialog } from './components/UploadDialog'
 import { PublicResolver } from './components/PublicResolver'
@@ -132,7 +137,7 @@ export default function App() {
     // Bare-path public URLs: `/` for a public vault root, `/<path>` for
     // any public file or folder. Reserved root segments are app routes
     // that can't be vault items.
-    const RESERVED = new Set(['settings'])
+    const RESERVED = new Set(['settings', 'account', 'library', 'trash'])
     const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
     const firstSeg = rawPath.split('/')[0] ?? ''
     const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
@@ -201,7 +206,7 @@ export default function App() {
                   if (!paletteOpen) setPaletteOpen(true)
                 }}
                 onFocus={() => setPaletteOpen(true)}
-                placeholder="Search vault, or type &quot;new folder&quot; or &quot;upload&quot;…"
+                placeholder="Search vault…"
                 className="w-full h-8 pl-8 pr-12 rounded text-[12.5px] text-fg placeholder:text-subtle outline-none transition-colors"
                 style={{
                   background: 'var(--bg)',
@@ -209,7 +214,7 @@ export default function App() {
                 }}
               />
               <kbd
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] px-1 py-0.5 rounded font-mono shrink-0 pointer-events-none"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] px-1 py-0.5 rounded shrink-0 pointer-events-none"
                 style={{
                   background: 'var(--panel)',
                   color: 'var(--fg-subtle)',
@@ -261,6 +266,12 @@ export default function App() {
         <Routes>
           <Route path="/" element={<VaultView />} />
           <Route path="/tags/:tag" element={<VaultView />} />
+          <Route path="/account" element={<AccountPage />} />
+          <Route path="/account/tokens" element={<AccountTokensPage />} />
+          <Route path="/account/webhooks" element={<AccountWebhooksPage />} />
+          <Route path="/trash" element={<TrashPage />} />
+          <Route path="/library/:mountId/*" element={<MountBrowser />} />
+          <Route path="/library/:mountId" element={<MountBrowser />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
           <Route path="*" element={<VaultView />} />
         </Routes>

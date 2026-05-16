@@ -14,16 +14,19 @@ import {
   Lock,
   Trash2,
   X,
+  Star,
 } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { useVault } from '../lib/vault-context'
+import { useConfirm } from '../lib/confirm'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { MakePublicPopover } from './MakePublicPopover'
 import { ShareWithUserButton } from './ShareWithUserButton'
 import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
 import { RevokePublicPopover } from './RevokePublicPopover'
+import { PinButton } from './PinButton'
 
 type FolderMetaShape = {
   owner: string
@@ -37,8 +40,12 @@ type FolderMetaShape = {
   updatedAt: number
 }
 
-export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
+export function FolderGrid({
+  initialPath,
+  canEdit = true,
+}: { initialPath?: string; canEdit?: boolean } = {}) {
   const navigate = useNavigate()
+  const confirm = useConfirm()
   const [searchParams] = useSearchParams()
   // When viewing a path owned by another user (via a user-to-user share),
   // the URL carries `?owner=<username>`. We thread it through every read
@@ -62,21 +69,40 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPath])
   const [items, setItems] = useState<VaultNode[] | null>(null)
+  // True when /api/list returned a partial-access view (parent has no
+  // grant, we're showing just the shared children). Used to label the
+  // breadcrumb chip — "shared · partial" instead of edit/read-only,
+  // since the per-child grants vary.
+  const [partialAccess, setPartialAccess] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selection, setSelection] = useState<Set<string>>(new Set())
-  const [busy, setBusy] = useState<null | 'delete'>(null)
+  const [busy, setBusy] = useState<null | 'delete' | 'pin' | 'unpin'>(null)
+  // Pinned set scoped to the current owner-namespace — used by the
+  // bulk toolbar to split selection into Pin(N) / Unpin(M) buttons,
+  // mirroring the Public/Private split pattern below it.
+  const [pinnedSet, setPinnedSet] = useState<Set<string>>(new Set())
   const [folderMeta, setFolderMeta] = useState<FolderMetaShape | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
+  // Even in a shared view, an edit-grant recipient gets the bulk
+  // selection toolbar + folder controls. Read-only and partial-access
+  // recipients stay navigation-only.
+  const showEditControls = !isSharedView || (canEdit && !partialAccess)
 
   const load = useCallback(async (rel: string) => {
     setLoading(true)
     setError(null)
+    setPartialAccess(false)
+    // Clear stale items so a failed fetch doesn't render the previous
+    // folder's tiles under the error banner.
+    setItems(null)
     try {
       const r = await api.list(rel, callerOpts)
       setItems(r.items)
+      setPartialAccess(!!r.partialAccess)
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
+      setItems([])
     } finally {
       setLoading(false)
     }
@@ -106,6 +132,29 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
       cancelled = true
     }
   }, [dir, refreshNonce, callerOpts?.owner])
+
+  // Track which selected items are currently pinned so the bulk
+  // toolbar can split Pin/Unpin like Public/Private does.
+  useEffect(() => {
+    let cancelled = false
+    api
+      .listPins()
+      .then((r) => {
+        if (cancelled) return
+        const ownerKey = ownerHint || ''
+        const set = new Set<string>()
+        for (const p of r.pins) {
+          if (ownerKey === '' || p.owner === ownerKey) set.add(p.storageKey)
+        }
+        setPinnedSet(set)
+      })
+      .catch(() => {
+        if (!cancelled) setPinnedSet(new Set())
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [refreshNonce, ownerHint])
 
   // Navigate folders through the URL so the address bar reflects "where am
   // I" — without this, clicking into a sub-folder kept the URL at the
@@ -160,6 +209,16 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
   // Folders: we can't see every descendant's visibility from the parent
   // tree, so we add the folder path to *both* targets — the server walks
   // the subtree and applies the new flag to every file inside.
+  const { pinTargets, unpinTargets } = useMemo(() => {
+    const toPin: string[] = []
+    const toUnpin: string[] = []
+    for (const p of selectedPaths) {
+      if (pinnedSet.has(p)) toUnpin.push(p)
+      else toPin.push(p)
+    }
+    return { pinTargets: toPin, unpinTargets: toUnpin }
+  }, [selectedPaths, pinnedSet])
+
   const { privateTargets, publicTargets } = useMemo(() => {
     const priv: string[] = []
     const pub: string[] = []
@@ -217,9 +276,13 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
 
   const runBulkDelete = async () => {
     if (selectedPaths.length === 0) return
-    if (!confirm(`Move ${selectedPaths.length} item${selectedPaths.length === 1 ? '' : 's'} to Trash?`)) {
-      return
-    }
+    const ok = await confirm({
+      title: 'Move to Trash',
+      message: `${selectedPaths.length} item${selectedPaths.length === 1 ? '' : 's'} will be moved to Trash. You can restore them within the retention window.`,
+      confirmLabel: 'Move to Trash',
+      destructive: true,
+    })
+    if (!ok) return
     setBusy('delete')
     setError(null)
     try {
@@ -246,8 +309,39 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
           onBack={parent !== null ? () => goToFolder(parent) : undefined}
           ownerLabel={ownerHint}
         />
+        {isSharedView && (
+          <span
+            className="text-[10.5px] font-medium px-1.5 h-5 rounded inline-flex items-center"
+            style={{
+              background: partialAccess
+                ? 'var(--bg)'
+                : canEdit
+                ? 'var(--selected)'
+                : 'var(--bg)',
+              color: partialAccess
+                ? 'var(--fg-subtle)'
+                : canEdit
+                ? 'var(--accent)'
+                : 'var(--fg-subtle)',
+              border: '1px solid var(--border-soft)',
+            }}
+            title={
+              partialAccess
+                ? "You don't have a grant on this folder — only the children below are shared with you."
+                : canEdit
+                ? 'You have edit access via share'
+                : 'You have read-only access via share'
+            }
+          >
+            {partialAccess
+              ? 'shared · partial'
+              : canEdit
+              ? 'shared · edit'
+              : 'shared · read-only'}
+          </span>
+        )}
         <div className="flex-1" />
-        {selection.size > 0 && !isSharedView ? (
+        {selection.size > 0 && showEditControls ? (
           <>
             <span className="text-[11.5px] text-fg font-medium">
               {selection.size} selected
@@ -295,6 +389,72 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
                 one recipient/permission combo — no need to pick each
                 target one at a time. */}
             <ShareWithUserButton paths={selectedPaths} />
+            {/* Pin / Unpin split — mirrors the Public/Private split below.
+                Pin(N) targets currently-unpinned items, Unpin(M) targets
+                currently-pinned items. When everything in the selection
+                is already in one state, only the opposite-action button
+                shows. */}
+            {pinTargets.length > 0 && (
+              <button
+                className="btn-ghost"
+                disabled={!!busy}
+                onClick={async () => {
+                  setBusy('pin')
+                  try {
+                    for (const p of pinTargets) {
+                      try {
+                        await api.addPin({ path: p, owner: ownerHint })
+                      } catch {
+                        /* skip */
+                      }
+                    }
+                    refresh()
+                    setSelection(new Set())
+                  } finally {
+                    setBusy(null)
+                  }
+                }}
+                title={`Pin ${pinTargets.length} item${pinTargets.length === 1 ? '' : 's'}`}
+              >
+                {busy === 'pin' ? (
+                  <Loader2 size={13} className="animate-spin" />
+                ) : (
+                  <Star size={13} />
+                )}
+                Pin ({pinTargets.length})
+              </button>
+            )}
+            {unpinTargets.length > 0 && (
+              <button
+                className="btn-ghost"
+                disabled={!!busy}
+                onClick={async () => {
+                  setBusy('unpin')
+                  try {
+                    for (const p of unpinTargets) {
+                      try {
+                        await api.removePin({ path: p, owner: ownerHint })
+                      } catch {
+                        /* skip */
+                      }
+                    }
+                    refresh()
+                    setSelection(new Set())
+                  } finally {
+                    setBusy(null)
+                  }
+                }}
+                title={`Unpin ${unpinTargets.length} item${unpinTargets.length === 1 ? '' : 's'}`}
+                style={{ color: 'var(--accent)', background: 'var(--selected)' }}
+              >
+                {busy === 'unpin' ? (
+                  <Loader2 size={13} className="animate-spin" />
+                ) : (
+                  <Star size={13} fill="currentColor" strokeWidth={1.6} />
+                )}
+                Unpin ({unpinTargets.length})
+              </button>
+            )}
             <button
               className="btn-ghost"
               disabled={!!busy}
@@ -322,7 +482,7 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
                 to public; Private(M) cascades all currently-public items
                 to private. The folder's own visibility follows the
                 cascade. */}
-            {folderMeta && !isSharedView && (
+            {folderMeta && showEditControls && (
               <>
                 <TagsButton
                   path={dir}
@@ -332,6 +492,16 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
                 />
                 <ActivityButton path={dir} kind="folder" />
                 <ShareWithUserButton paths={[dir]} />
+                {/* Pin a folder to the sidebar. Root folder (dir === "")
+                    can't be pinned — that's the whole vault. */}
+                {dir !== '' && (
+                  <PinButton
+                    path={dir}
+                    owner={ownerHint}
+                    isFolder
+                    onChanged={refresh}
+                  />
+                )}
                 {/* Folder Public/Private toggle. Mirrors the file
                     viewer's PublicButton: label + popover both come
                     from the folder's own visibility flag, so the user
@@ -410,7 +580,7 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
           </div>
         )}
 
-        {items && items.length === 0 && !loading && (
+        {items && items.length === 0 && !loading && !error && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center">
               <div
@@ -446,6 +616,7 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
                 key={node.path}
                 node={node}
                 selected={selection.has(node.path)}
+                hasSelection={selection.size > 0}
                 onOpen={() => onOpen(node)}
                 onToggleSelect={() => toggleSelect(node.path)}
               />
@@ -460,11 +631,13 @@ export function FolderGrid({ initialPath }: { initialPath?: string } = {}) {
 function GridTile({
   node,
   selected,
+  hasSelection,
   onOpen,
   onToggleSelect,
 }: {
   node: VaultNode
   selected: boolean
+  hasSelection: boolean
   onOpen: () => void
   onToggleSelect: () => void
 }) {
@@ -492,9 +665,12 @@ function GridTile({
       onMouseLeave={() => setHover(false)}
       onClick={(e) => {
         // Cmd/Ctrl-click toggles selection (works on files AND folders so
-        // bulk Public/Private/Delete can act on whole subtrees); plain click
-        // opens.
-        if (e.metaKey || e.ctrlKey) {
+        // bulk Public/Private/Delete can act on whole subtrees).
+        // Once anything is selected, the grid enters "selection mode" —
+        // plain clicks add/remove from selection (Finder-style) instead
+        // of navigating. To navigate, the user must first clear the
+        // selection (× on the toolbar, or click empty space).
+        if (e.metaKey || e.ctrlKey || hasSelection) {
           e.preventDefault()
           onToggleSelect()
           return
@@ -531,7 +707,9 @@ function GridTile({
           className="absolute top-1.5 right-1.5 text-[9.5px] font-medium px-1 py-px rounded leading-none"
           style={{
             background: 'var(--panel)',
-            color: '#00875A',
+            // Expired badge reads red — the link is dead, not a healthy
+            // signal. Active links stay green.
+            color: node.publicExpiresAt <= Date.now() ? '#BF2600' : '#00875A',
             border: '1px solid var(--border-soft)',
           }}
           title={`Public link expires ${describeExpiry(node.publicExpiresAt)}`}
@@ -558,9 +736,17 @@ function GridTile({
         {node.type === 'file' && node.embedded && (
           <Sparkles size={9} className="text-accent inline-block ml-1 align-middle" />
         )}
-        {node.public && (
-          <Globe size={9} className="inline-block ml-1 align-middle" style={{ color: '#00875A' }} />
-        )}
+        {node.public && (() => {
+          const isExpired =
+            !!node.publicExpiresAt && node.publicExpiresAt <= Date.now()
+          return (
+            <Globe
+              size={9}
+              className="inline-block ml-1 align-middle"
+              style={{ color: isExpired ? 'var(--fg-subtle)' : '#00875A' }}
+            />
+          )
+        })()}
       </div>
     </div>
   )

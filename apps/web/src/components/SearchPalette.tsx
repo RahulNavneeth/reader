@@ -267,10 +267,10 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
           <div className="px-4 py-3 text-[11.5px] text-subtle flex items-center gap-2 border-t" style={{ borderColor: 'var(--border-soft)' }}>
             <CornerDownLeft size={11} />
             <span>
-              <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↑</kbd>{' '}
-              <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↓</kbd>{' '}
+              <kbd className="px-1 py-0.5 rounded" style={{ background: 'var(--panel-2)' }}>↑</kbd>{' '}
+              <kbd className="px-1 py-0.5 rounded" style={{ background: 'var(--panel-2)' }}>↓</kbd>{' '}
               navigate ·{' '}
-              <kbd className="px-1 py-0.5 rounded font-mono" style={{ background: 'var(--panel-2)' }}>↵</kbd>{' '}
+              <kbd className="px-1 py-0.5 rounded" style={{ background: 'var(--panel-2)' }}>↵</kbd>{' '}
               run · {searching ? <Loader2 size={11} className="inline animate-spin" /> : 'type to search'}
             </span>
           </div>

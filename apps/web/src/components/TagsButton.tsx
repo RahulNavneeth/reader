@@ -7,6 +7,8 @@ type Props = {
   tags: string[]
   /** Which API to hit. Folders use /api/folder/tags; files use /api/file/tags. */
   kind?: 'file' | 'folder'
+  /** Owner of the path when caller is editing via a share grant. */
+  owner?: string
   /** Called after a successful save so the parent can refresh its meta. */
   onSaved?: (next: string[]) => void
 }
@@ -24,7 +26,7 @@ type Props = {
  * All mutations hit /api/file/tags immediately so there's no separate
  * "Save" step.
  */
-export function TagsButton({ path, tags, kind = 'file', onSaved }: Props) {
+export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props) {
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
@@ -87,7 +89,7 @@ export function TagsButton({ path, tags, kind = 'file', onSaved }: Props) {
       const saved =
         kind === 'folder'
           ? (await api.setFolderTags(path, next)).folder.tags
-          : (await api.setTags(path, next)).document.tags
+          : (await api.setTags(path, next, owner ? { owner } : undefined)).document.tags
       setLocal(saved)
       onSaved?.(saved)
     } catch (e) {

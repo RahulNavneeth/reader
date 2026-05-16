@@ -25,8 +25,8 @@ export function VaultView() {
   const [resolved, setResolved] = useState<
     | { status: 'idle' }
     | { status: 'loading' }
-    | { status: 'file'; path: string }
-    | { status: 'folder'; path: string }
+    | { status: 'file'; path: string; canEdit: boolean }
+    | { status: 'folder'; path: string; canEdit: boolean }
   >({ status: 'idle' })
 
   useEffect(() => {
@@ -35,7 +35,7 @@ export function VaultView() {
       return
     }
     if (!barePath) {
-      setResolved({ status: 'folder', path: '' })
+      setResolved({ status: 'folder', path: '', canEdit: true })
       return
     }
     let cancelled = false
@@ -44,21 +44,31 @@ export function VaultView() {
       .resolve(barePath, ownerHint ? { owner: ownerHint } : undefined)
       .then((r) => {
         if (cancelled) return
+        // canEdit is true for own vault, sharedEdit grants, or admin
+        // (resolve returns `access.ownedByRequester` for the owner
+        // case; the recipient case is gated on `sharedEdit`).
+        const canEdit = r.access.ownedByRequester || r.access.sharedEdit
         setResolved(
           r.kind === 'file'
-            ? { status: 'file', path: barePath }
-            : { status: 'folder', path: barePath },
+            ? { status: 'file', path: barePath, canEdit }
+            : { status: 'folder', path: barePath, canEdit },
         )
       })
       .catch((e) => {
         if (cancelled) return
-        // 404 → fall back to folder view so the user lands on an empty
-        // grid instead of a hard error if the path was, say, just
-        // created on disk and not yet indexed.
         if (e instanceof ApiError && e.status === 404) {
-          setResolved({ status: 'folder', path: barePath })
+          // 404 → fall back to folder view at the bare path; treat as
+          // own-vault (canEdit=true) so the user can recover by
+          // uploading etc.
+          setResolved({ status: 'folder', path: barePath, canEdit: !ownerHint })
+        } else if (e instanceof ApiError && (e.status === 403 || e.status === 401)) {
+          // Forbidden / auth-required: keep the path so the error
+          // surfaces in the folder view, but canEdit=false so we
+          // don't render owner-only controls (and the chip reads
+          // "read-only" instead of "edit").
+          setResolved({ status: 'folder', path: barePath, canEdit: false })
         } else {
-          setResolved({ status: 'folder', path: '' })
+          setResolved({ status: 'folder', path: '', canEdit: true })
         }
       })
     return () => {
@@ -98,9 +108,12 @@ export function VaultView() {
             <Loader2 size={14} className="animate-spin mr-2" /> Loading…
           </div>
         ) : resolved.status === 'file' ? (
-          <PathViewer key={resolved.path} path={resolved.path} />
+          <PathViewer key={resolved.path} path={resolved.path} canEdit={resolved.canEdit} />
         ) : (
-          <FolderGrid initialPath={resolved.status === 'folder' ? resolved.path : ''} />
+          <FolderGrid
+            initialPath={resolved.status === 'folder' ? resolved.path : ''}
+            canEdit={resolved.status === 'folder' ? resolved.canEdit : true}
+          />
         )}
       </main>
     </div>

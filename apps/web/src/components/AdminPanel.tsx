@@ -5,7 +5,6 @@ import {
   Plus,
   Trash2,
   X,
-  KeyRound,
   Users as UsersIcon,
   Settings,
   ChevronLeft,
@@ -19,21 +18,20 @@ import {
   Folder,
   Mail,
   Send,
-  RotateCcw,
+  HardDrive,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate } from 'react-router-dom'
 import {
   ApiError,
   api,
-  type ApiTokenInfo,
   type PublicUser,
   type Role,
   type SystemInfo,
   type WorkspaceSettings,
 } from '../lib/api'
 
-type Section = 'general' | 'users' | 'trash' | 'stats' | 'duplicates' | 'embeddings' | 'storage' | 'mail' | 'advanced' | 'tokens' | 'webhooks'
+type Section = 'general' | 'users' | 'duplicates' | 'embeddings' | 'storage' | 'mounts' | 'mail' | 'advanced'
 
 type Group = {
   label: string
@@ -46,16 +44,15 @@ const GROUPS: Group[] = [
     items: [
       { id: 'general', label: 'General', icon: Database },
       { id: 'users', label: 'Users', icon: UsersIcon },
-      { id: 'trash', label: 'Trash', icon: Trash2 },
     ],
   },
   {
     label: 'Data',
     items: [
-      { id: 'stats', label: 'Stats', icon: Database },
       { id: 'duplicates', label: 'Duplicates', icon: Copy },
       { id: 'embeddings', label: 'Search & embeddings', icon: Sparkles },
       { id: 'storage', label: 'Storage', icon: Database },
+      { id: 'mounts', label: 'External libraries', icon: HardDrive },
     ],
   },
   {
@@ -65,8 +62,6 @@ const GROUPS: Group[] = [
   {
     label: 'Access',
     items: [
-      { id: 'tokens', label: 'API tokens', icon: KeyRound },
-      { id: 'webhooks', label: 'Webhooks', icon: Send },
       { id: 'advanced', label: 'Server & sessions', icon: Settings },
     ],
   },
@@ -143,15 +138,12 @@ export function AdminPanel() {
           <div className="max-w-4xl mx-auto px-6 py-6">
             {section === 'general' && <GeneralPanel />}
             {section === 'users' && <UsersPanel />}
-            {section === 'trash' && <TrashPanel />}
-            {section === 'stats' && <StatsPanel />}
             {section === 'duplicates' && <DuplicatesPanel />}
             {section === 'embeddings' && <EmbeddingsPanel />}
             {section === 'storage' && <StoragePanel />}
+            {section === 'mounts' && <ExternalMountsPanel />}
             {section === 'mail' && <MailPanel />}
             {section === 'advanced' && <AdvancedPanel />}
-            {section === 'tokens' && <TokensPanel />}
-            {section === 'webhooks' && <WebhooksPanel />}
           </div>
         </div>
       </main>
@@ -604,84 +596,11 @@ function EmbeddingsPanel() {
         </FieldRow>
       </Card>
 
-      <ReembedCard />
-
       <SaveBar onSave={save} saving={saving} msg={msg} />
     </div>
   )
 }
 
-function ReembedCard() {
-  const [busy, setBusy] = useState(false)
-  const [result, setResult] = useState<{
-    total: number
-    ok: number
-    removed: number
-    failed: number
-    errors: { id: string; error: string }[]
-  } | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const run = async () => {
-    if (!confirm('Re-index every document? Reads each file from disk, re-extracts, re-embeds.')) return
-    setBusy(true)
-    setError(null)
-    setResult(null)
-    try {
-      const r = await api.adminReembedAll()
-      setResult({ total: r.total, ok: r.ok, removed: r.removed, failed: r.failed, errors: r.errors })
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-  return (
-    <Card title="Re-index corpus">
-      <div className="flex items-center gap-3">
-        <button className="btn-primary" onClick={run} disabled={busy}>
-          {busy ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-          {busy ? 'Re-indexing…' : 'Re-index all'}
-        </button>
-        {result && (
-          <span className="text-[12px]" style={{ color: result.failed === 0 ? '#00875A' : '#974F0C' }}>
-            {result.ok} OK
-            {result.removed > 0 ? `, ${result.removed} orphans cleaned` : ''}
-            {result.failed > 0 ? `, ${result.failed} failed` : ''}
-          </span>
-        )}
-        {error && (
-          <span className="text-[12px]" style={{ color: '#BF2600' }}>
-            {error}
-          </span>
-        )}
-      </div>
-      {result && result.errors.length > 0 && (
-        <div
-          className="rounded border text-[11.5px] mt-1"
-          style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
-        >
-          <div className="px-2.5 py-1.5 font-semibold text-subtle uppercase tracking-wider text-[10.5px] border-b" style={{ borderColor: 'var(--border-soft)' }}>
-            Failures
-          </div>
-          <ul className="px-2.5 py-1.5 space-y-1">
-            {result.errors.map((e, i) => (
-              <li key={i} className="text-fg break-all">
-                <code className="text-subtle">{e.id}</code> — <span style={{ color: '#BF2600' }}>{e.error}</span>
-              </li>
-            ))}
-            {result.failed > result.errors.length && (
-              <li className="text-subtle">…and {result.failed - result.errors.length} more</li>
-            )}
-          </ul>
-        </div>
-      )}
-      <Hint>
-        Re-reads each file from disk and runs extraction + embedding. Use after expanding
-        the extractor (e.g. OCR added) or switching the embed model.
-      </Hint>
-    </Card>
-  )
-}
 
 // ─── Storage ────────────────────────────────────────────────────────────────
 
@@ -1420,303 +1339,12 @@ function UsersPanel() {
   )
 }
 
-// ─── Trash ──────────────────────────────────────────────────────────────────
-
-type TrashEntry = {
-  id: string
-  storageKey: string
-  filename: string
-  docId?: string
-  bytes: number
-  trashedAt: number
-  trashedBy: string
-}
-
-function TrashPanel() {
-  const [entries, setEntries] = useState<TrashEntry[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [busyId, setBusyId] = useState<string | null>(null)
-
-  const refresh = () =>
-    api
-      .trashList()
-      .then((r) => setEntries(r.entries))
-      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
-
-  useEffect(() => {
-    refresh()
-  }, [])
-
-  const restore = async (id: string) => {
-    setBusyId(id)
-    setError(null)
-    try {
-      await api.trashRestore(id)
-      refresh()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusyId(null)
-    }
-  }
-
-  const purge = async (id: string, name: string) => {
-    if (!confirm(`Permanently delete "${name}"? This cannot be undone.`)) return
-    setBusyId(id)
-    setError(null)
-    try {
-      await api.trashPurge(id)
-      refresh()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusyId(null)
-    }
-  }
-
-  return (
-    <div className="space-y-5">
-      {error && <ErrText text={error} />}
-
-      <Hint>
-        Items deleted from the vault land here and are automatically purged after 30 days.
-        Restore returns the file to its original path; purge removes it immediately.
-      </Hint>
-
-      <div>
-        <SectionLabel>
-          {entries ? `${entries.length} item${entries.length === 1 ? '' : 's'} in trash` : ''}
-        </SectionLabel>
-        {!entries && <Muted text="Loading…" />}
-        {entries && entries.length === 0 && <Muted text="Trash is empty." />}
-        {entries && entries.length > 0 && (
-          <div className="rounded border border-app overflow-hidden">
-            <table className="w-full text-[13px]">
-              <thead style={{ background: 'var(--panel)' }}>
-                <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
-                  <th className="px-3 py-2 font-semibold">Name</th>
-                  <th className="px-3 py-2 font-semibold">Original path</th>
-                  <th className="px-3 py-2 font-semibold">Size</th>
-                  <th className="px-3 py-2 font-semibold">Deleted</th>
-                  <th className="px-3 py-2 font-semibold">By</th>
-                  <th className="px-3 py-2"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {entries.map((e) => (
-                  <tr
-                    key={e.id}
-                    className="border-t border-soft"
-                    style={{ borderColor: 'var(--border-soft)' }}
-                  >
-                    <td className="px-3 py-2 font-medium text-fg break-all">{e.filename}</td>
-                    <td className="px-3 py-2 text-muted text-[11.5px] break-all">{e.storageKey}</td>
-                    <td className="px-3 py-2 text-muted" style={{ fontVariantNumeric: 'tabular-nums' }}>
-                      {formatBytes(e.bytes)}
-                    </td>
-                    <td className="px-3 py-2 text-muted">
-                      {new Date(e.trashedAt).toLocaleString()}
-                    </td>
-                    <td className="px-3 py-2 text-muted">{e.trashedBy}</td>
-                    <td className="px-3 py-2 text-right whitespace-nowrap">
-                      <button
-                        className="btn-ghost"
-                        onClick={() => restore(e.id)}
-                        disabled={busyId === e.id}
-                        title="Restore to original location"
-                      >
-                        {busyId === e.id ? (
-                          <Loader2 size={12} className="animate-spin" />
-                        ) : (
-                          <RotateCcw size={12} />
-                        )}
-                        Restore
-                      </button>
-                      <button
-                        className="btn-ghost ml-1"
-                        onClick={() => purge(e.id, e.filename)}
-                        disabled={busyId === e.id}
-                        style={{ color: '#BF2600' }}
-                        title="Permanently delete"
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
 
 function formatBytes(b: number): string {
   if (b < 1024) return `${b} B`
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
   if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`
   return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`
-}
-
-// ─── Stats ──────────────────────────────────────────────────────────────────
-
-function StatsPanel() {
-  const [data, setData] = useState<Awaited<ReturnType<typeof api.adminStats>> | null>(null)
-  const [jobs, setJobs] = useState<Awaited<ReturnType<typeof api.adminJobs>> | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  useEffect(() => {
-    api
-      .adminStats()
-      .then(setData)
-      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
-    api.adminJobs().then(setJobs).catch(() => null)
-    // Live refresh job counts so the admin can watch ingest move through.
-    const t = setInterval(() => {
-      api.adminJobs().then(setJobs).catch(() => null)
-    }, 4000)
-    return () => clearInterval(t)
-  }, [])
-  if (error) return <ErrText text={error} />
-  if (!data) return <Muted text="Loading…" />
-  return (
-    <div className="space-y-5">
-      <Card title="Totals">
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-          <Metric label="Documents" value={data.totals.documents.toLocaleString()} />
-          <Metric label="Users" value={data.totals.users.toLocaleString()} />
-          <Metric label="Public" value={data.totals.publicDocs.toLocaleString()} />
-          <Metric label="Embedded" value={data.totals.embeddedDocs.toLocaleString()} />
-          <Metric label="Total size" value={formatBytes(data.totals.bytes)} />
-        </div>
-      </Card>
-      <Card title="Ingest status">
-        <StatTable
-          rows={Object.entries(data.byStatus).map(([k, v]) => [k, v.toLocaleString()])}
-          labelCol="Status"
-        />
-      </Card>
-      <Card title="By extension">
-        <StatTable rows={data.byExt.slice(0, 15).map((r) => [r.ext, r.count.toLocaleString()])} labelCol="Ext" />
-      </Card>
-      <Card title="By owner">
-        <StatTable rows={data.byOwner.map((r) => [r.owner, r.count.toLocaleString()])} labelCol="User" />
-      </Card>
-      <Card title="Recent uploads">
-        <StatTable
-          rows={data.recent
-            .slice(0, 10)
-            .map((r) => [r.title || r.storageKey, new Date(r.createdAt).toLocaleString()])}
-          labelCol="Document"
-        />
-      </Card>
-      {jobs && (
-        <Card title="Background jobs">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
-            <Metric label="Running" value={jobs.counts.running.toLocaleString()} />
-            <Metric label="Failed" value={jobs.counts.failed.toLocaleString()} />
-            <Metric label="Completed" value={jobs.counts.completed.toLocaleString()} />
-            <Metric label="Pending" value={jobs.counts.pending.toLocaleString()} />
-          </div>
-          {jobs.jobs.length === 0 ? (
-            <Muted text="No recent jobs." />
-          ) : (
-            <div className="rounded border border-app overflow-hidden">
-              <table className="w-full text-[12.5px]">
-                <thead style={{ background: 'var(--panel)' }}>
-                  <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
-                    <th className="px-3 py-1.5 font-semibold">Type</th>
-                    <th className="px-3 py-1.5 font-semibold">Target</th>
-                    <th className="px-3 py-1.5 font-semibold">Status</th>
-                    <th className="px-3 py-1.5 font-semibold">Duration</th>
-                    <th className="px-3 py-1.5 font-semibold">Started</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {jobs.jobs.slice(0, 20).map((j) => (
-                    <tr
-                      key={j.id}
-                      className="border-t"
-                      style={{ borderColor: 'var(--border-soft)' }}
-                    >
-                      <td className="px-3 py-1.5 text-fg">{j.type}</td>
-                      <td className="px-3 py-1.5 text-muted break-all">{j.target ?? '—'}</td>
-                      <td
-                        className="px-3 py-1.5"
-                        style={{
-                          color:
-                            j.status === 'failed'
-                              ? '#BF2600'
-                              : j.status === 'running'
-                              ? '#974F0C'
-                              : j.status === 'completed'
-                              ? '#00875A'
-                              : 'var(--muted)',
-                        }}
-                      >
-                        {j.status}
-                        {j.error ? ` · ${j.error}` : ''}
-                      </td>
-                      <td
-                        className="px-3 py-1.5 text-muted"
-                        style={{ fontVariantNumeric: 'tabular-nums' }}
-                      >
-                        {j.durationMs != null ? `${(j.durationMs / 1000).toFixed(1)}s` : '—'}
-                      </td>
-                      <td className="px-3 py-1.5 text-muted">
-                        {j.startedAt ? new Date(j.startedAt).toLocaleTimeString() : '—'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
-      )}
-    </div>
-  )
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div
-      className="rounded border px-3 py-2"
-      style={{ borderColor: 'var(--border-soft)', background: 'var(--panel)' }}
-    >
-      <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">{label}</div>
-      <div className="text-[16px] font-semibold text-fg mt-0.5" style={{ fontVariantNumeric: 'tabular-nums' }}>
-        {value}
-      </div>
-    </div>
-  )
-}
-
-function StatTable({ rows, labelCol }: { rows: [string, string][]; labelCol: string }) {
-  if (rows.length === 0) return <Muted text="No data." />
-  return (
-    <div className="rounded border border-app overflow-hidden">
-      <table className="w-full text-[12.5px]">
-        <thead style={{ background: 'var(--panel)' }}>
-          <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
-            <th className="px-3 py-1.5 font-semibold">{labelCol}</th>
-            <th className="px-3 py-1.5 font-semibold text-right">Count</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(([k, v]) => (
-            <tr key={k} className="border-t" style={{ borderColor: 'var(--border-soft)' }}>
-              <td className="px-3 py-1.5 text-fg break-all">{k}</td>
-              <td className="px-3 py-1.5 text-right text-muted" style={{ fontVariantNumeric: 'tabular-nums' }}>
-                {v}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
 }
 
 // ─── Duplicates ─────────────────────────────────────────────────────────────
@@ -1812,346 +1440,6 @@ function DuplicatesPanel() {
   )
 }
 
-// ─── Webhooks ───────────────────────────────────────────────────────────────
-
-type Hook = {
-  id: string
-  url: string
-  events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
-  secret?: string
-  enabled?: boolean
-  createdAt: number
-  lastDelivery?: { ts: number; status: number | null; error?: string }
-}
-
-const HOOK_EVENTS: Hook['events'] = ['upload', 'edit', 'delete', 'share', 'tags', 'visibility']
-
-function WebhooksPanel() {
-  const [hooks, setHooks] = useState<Hook[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [newUrl, setNewUrl] = useState('')
-  const [newSecret, setNewSecret] = useState('')
-  const [newEvents, setNewEvents] = useState<Set<Hook['events'][number]>>(new Set(['upload', 'delete']))
-  const [creating, setCreating] = useState(false)
-
-  const refresh = () =>
-    api
-      .adminWebhooks()
-      .then((r) => setHooks(r.webhooks))
-      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
-
-  useEffect(() => {
-    refresh()
-  }, [])
-
-  const create = async () => {
-    if (!newUrl.trim() || newEvents.size === 0) return
-    setCreating(true)
-    setError(null)
-    try {
-      await api.adminCreateWebhook({
-        url: newUrl.trim(),
-        events: Array.from(newEvents),
-        secret: newSecret.trim() || undefined,
-        enabled: true,
-      })
-      setNewUrl('')
-      setNewSecret('')
-      setNewEvents(new Set(['upload', 'delete']))
-      refresh()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setCreating(false)
-    }
-  }
-
-  const remove = async (id: string) => {
-    if (!confirm('Delete this webhook? Future events will not be delivered.')) return
-    try {
-      await api.adminDeleteWebhook(id)
-      refresh()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    }
-  }
-
-  return (
-    <div className="space-y-5">
-      <Card title="New webhook">
-        <FieldRow label="URL">
-          <input
-            className="input"
-            placeholder="https://example.com/hook"
-            value={newUrl}
-            onChange={(e) => setNewUrl(e.target.value)}
-          />
-        </FieldRow>
-        <FieldRow label="HMAC secret">
-          <input
-            className="input"
-            placeholder="optional — signs payload as X-Reader-Signature"
-            value={newSecret}
-            onChange={(e) => setNewSecret(e.target.value)}
-          />
-        </FieldRow>
-        <div>
-          <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
-            Events
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {HOOK_EVENTS.map((ev) => {
-              const on = newEvents.has(ev)
-              return (
-                <button
-                  key={ev}
-                  className="px-2 h-6 rounded text-[11.5px]"
-                  style={{
-                    background: on ? 'var(--selected)' : 'var(--panel)',
-                    color: on ? 'var(--accent)' : 'var(--fg)',
-                    border: `1px solid ${on ? 'var(--accent)' : 'var(--border)'}`,
-                  }}
-                  onClick={() => {
-                    const next = new Set(newEvents)
-                    if (on) next.delete(ev)
-                    else next.add(ev)
-                    setNewEvents(next)
-                  }}
-                >
-                  {ev}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-        <div className="flex items-center gap-3 pt-1">
-          <button
-            className="btn-primary"
-            onClick={create}
-            disabled={creating || !newUrl.trim() || newEvents.size === 0}
-          >
-            {creating ? <Loader2 size={13} className="animate-spin" /> : <Plus size={14} />}
-            Create
-          </button>
-          {error && (
-            <span className="text-[12px]" style={{ color: '#BF2600' }}>
-              {error}
-            </span>
-          )}
-        </div>
-        <Hint>
-          Payload is JSON: <code className="text-subtle">{`{ type, path, actor, ts, ... }`}</code>. If
-          a secret is set, requests include <code className="text-subtle">X-Reader-Signature</code>
-          (HMAC-SHA256 hex over the body).
-        </Hint>
-      </Card>
-
-      <div>
-        <SectionLabel>
-          {hooks ? `${hooks.length} webhook${hooks.length === 1 ? '' : 's'}` : ''}
-        </SectionLabel>
-        {!hooks && <Muted text="Loading…" />}
-        {hooks && hooks.length === 0 && <Muted text="No webhooks configured." />}
-        {hooks && hooks.length > 0 && (
-          <div className="rounded border border-app overflow-hidden">
-            <table className="w-full text-[13px]">
-              <thead style={{ background: 'var(--panel)' }}>
-                <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
-                  <th className="px-3 py-2 font-semibold">URL</th>
-                  <th className="px-3 py-2 font-semibold">Events</th>
-                  <th className="px-3 py-2 font-semibold">Last delivery</th>
-                  <th className="px-3 py-2"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {hooks.map((h) => (
-                  <tr key={h.id} className="border-t" style={{ borderColor: 'var(--border-soft)' }}>
-                    <td className="px-3 py-2 text-fg break-all" style={{ maxWidth: 280 }}>
-                      {h.url}
-                    </td>
-                    <td className="px-3 py-2 text-muted text-[11.5px]">
-                      {h.events.join(', ')}
-                    </td>
-                    <td className="px-3 py-2 text-[11.5px]">
-                      {h.lastDelivery ? (
-                        h.lastDelivery.error ? (
-                          <span style={{ color: '#BF2600' }}>
-                            {new Date(h.lastDelivery.ts).toLocaleString()} · {h.lastDelivery.error}
-                          </span>
-                        ) : (
-                          <span style={{ color: '#00875A' }}>
-                            {new Date(h.lastDelivery.ts).toLocaleString()} ·{' '}
-                            {h.lastDelivery.status ?? 'ok'}
-                          </span>
-                        )
-                      ) : (
-                        <span className="text-subtle">—</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      <button
-                        className="btn-ghost"
-                        onClick={() => remove(h.id)}
-                        title="Delete"
-                        style={{ color: '#BF2600' }}
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ─── API tokens ─────────────────────────────────────────────────────────────
-
-function TokensPanel() {
-  const [tokens, setTokens] = useState<ApiTokenInfo[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [creating, setCreating] = useState(false)
-  const [newName, setNewName] = useState('')
-  const [newRole, setNewRole] = useState<Role>('viewer')
-  const [justCreated, setJustCreated] = useState<{ secret: string; name: string } | null>(null)
-
-  const refresh = () =>
-    api
-      .adminTokens()
-      .then((r) => setTokens(r.tokens))
-      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
-
-  useEffect(() => {
-    refresh()
-  }, [])
-
-  const create = async () => {
-    if (!newName.trim()) return
-    setCreating(true)
-    setError(null)
-    try {
-      const r = await api.adminCreateToken(newName.trim(), newRole)
-      setJustCreated({ secret: r.secret, name: r.token.name })
-      setNewName('')
-      setNewRole('viewer')
-      refresh()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setCreating(false)
-    }
-  }
-
-  const revoke = async (id: string) => {
-    if (!confirm('Revoke this token? Agents using it will be disconnected immediately.')) return
-    try {
-      await api.adminDeleteToken(id)
-      refresh()
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    }
-  }
-
-  return (
-    <div className="space-y-5">
-      <Card title="New token">
-        <div className="grid grid-cols-[1fr_140px_auto] gap-2">
-          <input
-            className="input"
-            placeholder="Name (e.g., laptop-claude)"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && create()}
-          />
-          <select className="input" value={newRole} onChange={(e) => setNewRole(e.target.value as Role)}>
-            <option value="viewer">viewer</option>
-            <option value="editor">editor</option>
-            <option value="admin">admin</option>
-          </select>
-          <button className="btn-primary" onClick={create} disabled={creating || !newName.trim()}>
-            <Plus size={14} />
-            Create
-          </button>
-        </div>
-        <Hint>The secret is shown <strong>once</strong> — copy it immediately.</Hint>
-      </Card>
-
-      {justCreated && (
-        <div
-          className="rounded border p-3"
-          style={{ background: '#E3FCEF', borderColor: '#ABF5D1' }}
-        >
-          <div className="text-[12px] font-semibold mb-1" style={{ color: '#006644' }}>
-            Secret for "{justCreated.name}" — copy now
-          </div>
-          <div className="flex items-center gap-2">
-            <code
-              className="flex-1 px-2 py-1.5 rounded text-[12px] truncate"
-              style={{ background: '#FFFFFF', border: '1px solid #ABF5D1' }}
-            >
-              {justCreated.secret}
-            </code>
-            <button className="btn" onClick={() => navigator.clipboard.writeText(justCreated.secret)}>
-              <Copy size={13} />
-              Copy
-            </button>
-            <button className="btn-ghost" onClick={() => setJustCreated(null)}>
-              <X size={13} />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {error && <ErrText text={error} />}
-
-      <div>
-        <SectionLabel>{tokens ? `${tokens.length} token${tokens.length === 1 ? '' : 's'}` : ''}</SectionLabel>
-        {!tokens && <Muted text="Loading…" />}
-        {tokens && tokens.length === 0 && <Muted text="No tokens yet." />}
-        {tokens && tokens.length > 0 && (
-          <div className="rounded border border-app overflow-hidden">
-            <table className="w-full text-[13px]">
-              <thead style={{ background: 'var(--panel)' }}>
-                <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
-                  <th className="px-3 py-2 font-semibold">Name</th>
-                  <th className="px-3 py-2 font-semibold">ID</th>
-                  <th className="px-3 py-2 font-semibold">Role</th>
-                  <th className="px-3 py-2 font-semibold">Created</th>
-                  <th className="px-3 py-2 font-semibold">Last used</th>
-                  <th className="px-3 py-2"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {tokens.map((t) => (
-                  <tr key={t.id} className="border-t border-soft" style={{ borderColor: 'var(--border-soft)' }}>
-                    <td className="px-3 py-2 font-medium text-fg">{t.name}</td>
-                    <td className="px-3 py-2 text-muted text-[11.5px]" style={{ fontVariantNumeric: 'tabular-nums' }}>
-                      {t.id}…
-                    </td>
-                    <td className="px-3 py-2 capitalize text-muted">{t.role}</td>
-                    <td className="px-3 py-2 text-muted">{new Date(t.createdAt).toLocaleDateString()}</td>
-                    <td className="px-3 py-2 text-muted">
-                      {t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString() : '—'}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      <button className="btn-ghost" onClick={() => revoke(t.id)} title="Revoke">
-                        <Trash2 size={12} />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
 
 // ─── Shared atoms ───────────────────────────────────────────────────────────
 
@@ -2326,3 +1614,140 @@ function Toggle({
   )
 }
 
+
+/**
+ * Read-only external library mounts — admin-only config that exposes
+ * on-disk folders as virtual sidebar entries for every signed-in user.
+ * Strictly read; the server refuses writes under these paths.
+ */
+function ExternalMountsPanel() {
+  const [mounts, setMounts] = useState<
+    Array<{ id: string; name: string; absPath: string; createdAt: number }> | null
+  >(null)
+  const [name, setName] = useState('')
+  const [absPath, setAbsPath] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const refresh = () =>
+    api
+      .adminListExternalMounts()
+      .then((r) => setMounts(r.mounts))
+      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+
+  useEffect(() => {
+    refresh()
+  }, [])
+
+  const add = async () => {
+    if (!name.trim() || !absPath.trim()) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.adminCreateExternalMount({ name: name.trim(), absPath: absPath.trim() })
+      setName('')
+      setAbsPath('')
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async (id: string) => {
+    if (!window.confirm('Remove this mount? Users will lose sidebar access; files on disk are untouched.')) return
+    try {
+      await api.adminDeleteExternalMount(id)
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <header>
+        <div className="text-[18px] font-semibold text-fg">External libraries</div>
+        <div className="text-[12.5px] text-muted mt-1">
+          Mount an existing on-disk folder as a read-only library. Every signed-in user can
+          browse it from the sidebar. Files are never written; the vault watcher does not
+          ingest them.
+        </div>
+      </header>
+
+      {error && (
+        <div
+          className="px-3 py-2 rounded text-[12.5px]"
+          style={{ background: '#FFEBE6', color: '#BF2600' }}
+        >
+          {error}
+        </div>
+      )}
+
+      <section
+        className="rounded-lg p-4"
+        style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+      >
+        <div className="text-[13px] font-semibold text-fg mb-2.5">Add a mount</div>
+        <div className="flex flex-col sm:flex-row gap-2">
+          <input
+            className="input flex-1 h-8 text-[12.5px]"
+            placeholder="Display name (e.g., Family Photos)"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={busy}
+          />
+          <input
+            className="input flex-[2] h-8 text-[12.5px]"
+            placeholder="Absolute path (e.g., /Users/me/Photos)"
+            value={absPath}
+            onChange={(e) => setAbsPath(e.target.value)}
+            disabled={busy}
+          />
+          <button className="btn-ghost" onClick={add} disabled={busy || !name || !absPath}>
+            {busy ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
+            Add
+          </button>
+        </div>
+      </section>
+
+      <section>
+        <div className="text-[13px] font-semibold text-fg mb-2">Current mounts</div>
+        {!mounts ? (
+          <div className="text-[12.5px] text-muted inline-flex items-center gap-1.5">
+            <Loader2 size={12} className="animate-spin" /> Loading…
+          </div>
+        ) : mounts.length === 0 ? (
+          <div className="text-[12.5px] text-subtle">No mounts configured.</div>
+        ) : (
+          <div className="space-y-1.5">
+            {mounts.map((m) => (
+              <div
+                key={m.id}
+                className="flex items-center gap-3 px-3 py-2 rounded"
+                style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+              >
+                <HardDrive size={14} className="text-muted shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] font-medium text-fg truncate">{m.name}</div>
+                  <div className="text-[11px] text-subtle truncate" title={m.absPath}>
+                    {m.absPath}
+                  </div>
+                </div>
+                <button
+                  className="btn-ghost"
+                  onClick={() => remove(m.id)}
+                  title="Remove mount"
+                  style={{ color: '#BF2600' }}
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}

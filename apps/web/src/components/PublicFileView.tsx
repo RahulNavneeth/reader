@@ -21,14 +21,16 @@ type Props = {
  *
  *   - rendering an in-app password prompt when /api/file/meta says 401 +
  *     passwordRequired,
- *   - rendering an "expired" card on 410.
+ *
+ * No "expired" handling — the server's expiry sweep flips expired
+ * publics back to private, so this view never has to render that
+ * state explicitly. Expired links become normal not-public links.
  */
 export function PublicFileView({ path, onNotPublic }: Props) {
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
   const [text, setText] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [expired, setExpired] = useState(false)
   const [passwordRequired, setPasswordRequired] = useState(false)
   const [passwordWrong, setPasswordWrong] = useState(false)
   const [password, setPassword] = useState('')
@@ -71,7 +73,6 @@ export function PublicFileView({ path, onNotPublic }: Props) {
     let cancelled = false
     setLoading(true)
     setError(null)
-    setExpired(false)
     setPasswordRequired(false)
     setPasswordWrong(false)
     const pwdOpt = submittedPwd ? { password: submittedPwd } : undefined
@@ -99,10 +100,6 @@ export function PublicFileView({ path, onNotPublic }: Props) {
           if (e.status === 401) {
             setPasswordRequired(true)
             if (submittedPwd) setPasswordWrong(true)
-            return
-          }
-          if (e.status === 410) {
-            setExpired(true)
             return
           }
           if (e.status === 404) {
@@ -163,19 +160,6 @@ export function PublicFileView({ path, onNotPublic }: Props) {
     )
   }
 
-  if (expired) {
-    return (
-      <div className="h-full min-h-screen flex items-center justify-center surface">
-        <div className="text-center max-w-md p-6">
-          <AlertCircle size={20} style={{ color: '#BF2600' }} className="mx-auto mb-2" />
-          <div className="text-fg font-semibold">This link has expired</div>
-          <div className="text-[13px] text-muted mt-1">
-            Ask the owner for a fresh public link.
-          </div>
-        </div>
-      </div>
-    )
-  }
 
   if (loading) {
     return (

@@ -10,6 +10,7 @@ import {
   FileSpreadsheet,
   FileCode,
   Sparkles,
+  ArrowRight,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate } from 'react-router-dom'
@@ -162,7 +163,7 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
   return (
     <div>
       <div
-        className={clsx('tree-item', isSelected && 'selected')}
+        className={clsx('tree-item group', isSelected && 'selected')}
         style={{ paddingLeft: 8 + depth * 14 }}
         onClick={onClick}
         draggable={node.type === 'file' && !owner}
@@ -193,6 +194,25 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
         <span className="truncate flex-1">{node.name}</span>
         {node.type === 'file' && node.embedded && (
           <Sparkles size={11} className="text-accent shrink-0" aria-label="indexed for AI search" />
+        )}
+        {/* Folder rows get a hover-only arrow that navigates INTO the
+            folder (folder name click stays bound to expand/collapse).
+            Without this, opening a folder's page from the sidebar
+            required clicking a file inside it first. */}
+        {node.type === 'dir' && (
+          <button
+            className="opacity-0 group-hover:opacity-100 inline-flex items-center justify-center w-5 h-5 rounded shrink-0 hover:bg-hover transition-opacity"
+            onClick={(e) => {
+              e.stopPropagation()
+              const segs = node.path.split('/').map(encodeURIComponent).join('/')
+              const suffix = owner ? `?owner=${encodeURIComponent(owner)}` : ''
+              navigate(`/${segs}${suffix}`)
+            }}
+            title="Open folder"
+            aria-label={`Open ${node.name}`}
+          >
+            <ArrowRight size={11} className="text-accent" />
+          </button>
         )}
       </div>
       {dropTarget && (

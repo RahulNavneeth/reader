@@ -17,7 +17,14 @@ import { mcpRoutes } from './routes/mcp.js'
 import { eventsRoutes } from './routes/events.js'
 import { viewsRoutes } from './routes/views.js'
 import { userSharesRoutes } from './routes/userShares.js'
+import { pinsRoutes } from './routes/pins.js'
+import { exportRoutes } from './routes/export.js'
+import { memoriesRoutes } from './routes/memories.js'
+import { accountRoutes } from './routes/account.js'
+import { externalMountsRoutes } from './routes/externalMounts.js'
 import { sweepExpired } from './stores/sessions.js'
+import { sweepExpiredPublic } from './stores/documents.js'
+import { sweepExpiredPublicFolders } from './stores/folderMetas.js'
 import { preheat } from './services/search.js'
 import { isAvailable as ollamaUp } from './services/embed.js'
 import { loadSettings } from './stores/settings.js'
@@ -130,6 +137,11 @@ async function main() {
   await app.register(eventsRoutes)
   await app.register(viewsRoutes)
   await app.register(userSharesRoutes)
+  await app.register(pinsRoutes)
+  await app.register(exportRoutes)
+  await app.register(memoriesRoutes)
+  await app.register(externalMountsRoutes)
+  await app.register(accountRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
   // SPA fallback rewrites unknown paths to index.html so React Router-style
@@ -174,6 +186,24 @@ async function main() {
       .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
   runTrashSweep()
   setInterval(runTrashSweep, 60 * 60 * 1000).unref()
+
+  // Auto-flip expired public links to private — file metas + folder
+  // metas both. Runs at boot and every minute so an owner who looks
+  // at a file just past its expiry sees it as private within a
+  // minute, not hours.
+  const runPublicExpirySweep = async () => {
+    try {
+      const files = await sweepExpiredPublic()
+      const folders = await sweepExpiredPublicFolders()
+      if (files + folders > 0) {
+        app.log.info({ files, folders }, 'public-expiry sweep flipped to private')
+      }
+    } catch (err) {
+      app.log.warn({ err }, 'public-expiry sweep failed')
+    }
+  }
+  runPublicExpirySweep()
+  setInterval(runPublicExpirySweep, 60 * 1000).unref()
 
   // Warm the search cache; check Ollama presence (just informational).
   preheat().catch(() => null)

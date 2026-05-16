@@ -52,6 +52,23 @@ export type WorkspaceSettings = {
     secure?: boolean
   }
   webhooks?: WebhookConfig[]
+  /**
+   * Read-only external library mounts — absolute on-disk folders that
+   * appear as virtual roots in every user's vault tree. Admin-only to
+   * configure; visible to all signed-in users. Useful for browsing an
+   * existing media library or imported corpus without copying it into
+   * the per-user vault.
+   */
+  externalMounts?: ExternalMount[]
+}
+
+export type ExternalMount = {
+  id: string
+  /** Display name shown in the sidebar (e.g., "Family Photos"). */
+  name: string
+  /** Absolute path. The server only reads — never writes — under here. */
+  absPath: string
+  createdAt: number
 }
 
 export type WebhookConfig = {
@@ -64,6 +81,10 @@ export type WebhookConfig = {
   enabled?: boolean
   createdAt: number
   lastDelivery?: { ts: number; status: number | null; error?: string }
+  /** Username that owns this hook. When set, the dispatcher only fires
+   *  the hook for events on that user's files (event.actor === owner).
+   *  Legacy hooks without an owner fire for every event. */
+  owner?: string
 }
 
 const FILE = config.paths.settings

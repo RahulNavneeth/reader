@@ -14,6 +14,8 @@ export type PublicUser = {
   disabled?: boolean
   /** Per-user upload cap in bytes. Unset/0 = unlimited. */
   quotaBytes?: number
+  /** Optional contact address for notifications. */
+  email?: string
 }
 
 
@@ -176,9 +178,13 @@ export type ApiTokenInfo = {
 
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  /** Full error response body — lets callers read fields like
+   *  `kind` or `passwordRequired` to render the right UI on 401/410. */
+  body: Record<string, unknown>
+  constructor(status: number, message: string, body: Record<string, unknown> = {}) {
     super(message)
     this.status = status
+    this.body = body
   }
 }
 
@@ -197,7 +203,7 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
-    throw new ApiError(res.status, data?.error || `HTTP ${res.status}`)
+    throw new ApiError(res.status, data?.error || `HTTP ${res.status}`, data || {})
   }
   return res.json()
 }
@@ -218,6 +224,34 @@ export const api = {
   // bootstrap / auth
   bootstrap: () => get<{ hasAdmin: boolean; allowOpenSignup: boolean }>('/api/bootstrap'),
   me: () => get<{ user: PublicUser }>('/api/auth/me'),
+  accountStats: () =>
+    get<{
+      user: PublicUser
+      storage: {
+        bytesUsed: number
+        quotaBytes: number | null
+        fileCount: number
+        publicCount: number
+        embeddedCount: number
+      }
+      recent: Array<{
+        path: string
+        name: string
+        bytes: number
+        createdAt: number
+        embedded: boolean
+        public: boolean
+      }>
+      fileTypes: Array<{ ext: string; count: number }>
+      activity: Array<{ ts: number; action: string; target: string | null }>
+      shares: { outgoing: number; incoming: number }
+      sessions: Array<{
+        token: string
+        createdAt: number
+        expiresAt: number
+        current: boolean
+      }>
+    }>('/api/account/stats'),
   signup: (username: string, password: string) =>
     post<{ user: PublicUser }>('/api/auth/signup', { username, password }),
   login: (username: string, password: string) =>
@@ -238,7 +272,7 @@ export const api = {
       }
     }>(`/api/resolve${q({ path: rel, owner: opts?.owner, p: opts?.password })}`),
   list: (rel: string, opts?: { owner?: string; password?: string }) =>
-    get<{ path: string; items: VaultNode[] }>(
+    get<{ path: string; items: VaultNode[]; partialAccess?: boolean }>(
       `/api/list${q({ path: rel, owner: opts?.owner, p: opts?.password })}`,
     ),
   folders: () => get<{ folders: string[] }>('/api/folders'),
@@ -287,8 +321,12 @@ export const api = {
       expiresInSeconds: opts?.expiresInSeconds ?? null,
       password: opts?.password ?? null,
     }),
-  setTags: (rel: string, tags: string[]) =>
-    post<{ document: DocumentMeta }>('/api/file/tags', { path: rel, tags }),
+  setTags: (rel: string, tags: string[], opts?: { owner?: string }) =>
+    post<{ document: DocumentMeta }>('/api/file/tags', {
+      path: rel,
+      tags,
+      ...(opts?.owner ? { owner: opts.owner } : {}),
+    }),
   tags: () => get<{ tags: { tag: string; count: number }[] }>('/api/tags'),
   filesByTag: (tag: string) =>
     get<{
@@ -627,6 +665,135 @@ export const api = {
     }>('/api/admin/duplicates'),
   adminOllamaModels: () =>
     get<{ models: string[]; error?: string }>('/api/admin/ollama/models'),
+
+  // pins
+  listPins: () =>
+    get<{
+      pins: Array<{
+        owner: string
+        storageKey: string
+        isFolder: boolean
+        pinnedAt: number
+        label?: string
+      }>
+    }>('/api/pins'),
+  addPin: (body: { path: string; owner?: string; isFolder?: boolean; label?: string }) =>
+    post<{
+      pins: Array<{
+        owner: string
+        storageKey: string
+        isFolder: boolean
+        pinnedAt: number
+        label?: string
+      }>
+    }>('/api/pins', body),
+  removePin: (body: { path: string; owner?: string }) =>
+    request<{
+      pins: Array<{
+        owner: string
+        storageKey: string
+        isFolder: boolean
+        pinnedAt: number
+        label?: string
+      }>
+    }>('DELETE', '/api/pins', body),
+
+  // user account — email, reembed, tokens, webhooks (all scoped to caller)
+  patchAccountEmail: (email: string) =>
+    request<{ user: PublicUser }>('PATCH', '/api/account/email', { email }),
+  accountReembed: () =>
+    post<{
+      total: number
+      ok: number
+      removed: number
+      failed: number
+      errors: { id: string; error: string }[]
+    }>('/api/account/reembed'),
+  accountTokens: () => get<{ tokens: ApiTokenInfo[] }>('/api/account/tokens'),
+  accountCreateToken: (name: string, expiresInDays?: number | null) =>
+    post<{ secret: string; token: ApiTokenInfo }>('/api/account/tokens', {
+      name,
+      ...(expiresInDays !== undefined ? { expiresInDays } : {}),
+    }),
+  accountDeleteToken: (id: string) =>
+    request<{ ok: true }>('DELETE', `/api/account/tokens/${encodeURIComponent(id)}`),
+  accountWebhooks: () =>
+    get<{
+      webhooks: Array<{
+        id: string
+        url: string
+        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+        secret?: string
+        enabled?: boolean
+        createdAt: number
+        owner?: string
+        lastDelivery?: { ts: number; status: number | null; error?: string }
+      }>
+    }>('/api/account/webhooks'),
+  accountCreateWebhook: (body: {
+    url: string
+    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+    secret?: string
+    enabled?: boolean
+  }) =>
+    post<{ webhook: any }>('/api/account/webhooks', body),
+  accountDeleteWebhook: (id: string) =>
+    request<{ ok: true }>('DELETE', `/api/account/webhooks/${encodeURIComponent(id)}`),
+
+  // memories
+  memories: () =>
+    get<{
+      date: string
+      groups: Array<{
+        yearsAgo: number
+        label: string
+        items: Array<{
+          path: string
+          name: string
+          bytes: number
+          mime: string
+          createdAt: number
+          embedded: boolean
+          public: boolean
+        }>
+      }>
+    }>('/api/account/memories'),
+
+  // bulk export — direct URL the user navigates to so the browser streams the download
+  exportUrl: () => '/api/account/export.zip',
+
+  // external library mounts
+  listExternalMounts: () =>
+    get<{ mounts: Array<{ id: string; name: string; hint: string }> }>('/api/external-mounts'),
+  listExternalMountEntries: (id: string, rel = '') =>
+    get<{
+      mountId: string
+      mountName: string
+      path: string
+      items: Array<{
+        name: string
+        path: string
+        type: 'dir' | 'file'
+        ext?: string
+        size?: number
+        mtime?: number
+        hasChildren?: boolean
+      }>
+    }>(`/api/external-mounts/${encodeURIComponent(id)}/list${q({ path: rel })}`),
+  externalMountFileUrl: (id: string, rel: string) =>
+    `/api/external-mounts/${encodeURIComponent(id)}/file${q({ path: rel })}`,
+
+  // admin — external library mounts
+  adminListExternalMounts: () =>
+    get<{
+      mounts: Array<{ id: string; name: string; absPath: string; createdAt: number }>
+    }>('/api/admin/external-mounts'),
+  adminCreateExternalMount: (body: { name: string; absPath: string }) =>
+    post<{
+      mount: { id: string; name: string; absPath: string; createdAt: number }
+    }>('/api/admin/external-mounts', body),
+  adminDeleteExternalMount: (id: string) =>
+    request<{ ok: true }>('DELETE', `/api/admin/external-mounts/${encodeURIComponent(id)}`),
 
   // admin — tokens
   adminTokens: () => get<{ tokens: ApiTokenInfo[] }>('/api/admin/tokens'),

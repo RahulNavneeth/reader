@@ -20,6 +20,9 @@ export type User = {
   disabled?: boolean
   /** Per-user upload cap in bytes. Undefined / 0 / negative = unlimited. */
   quotaBytes?: number
+  /** Optional contact address — used for outbound notifications
+   *  (share invites, quota warnings) when SMTP is configured. */
+  email?: string
 }
 
 export type Session = {

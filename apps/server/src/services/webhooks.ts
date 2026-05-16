@@ -9,6 +9,7 @@
  * fire-and-forget audit notifications, not a delivery queue.
  */
 import crypto from 'node:crypto'
+import { config } from '../config.js'
 import { loadSettings, saveSettings, type WebhookConfig } from '../stores/settings.js'
 
 const TIMEOUT_MS = 5_000
@@ -25,10 +26,21 @@ export async function dispatch(event: WebhookEvent): Promise<void> {
   const settings = await loadSettings().catch(() => null)
   const hooks = settings?.webhooks ?? []
   if (hooks.length === 0) return
-  const eligible = hooks.filter((h) => h.enabled !== false && h.events.includes(event.type))
+  // User-scoped hooks only fire when the event's actor matches the
+  // hook's owner. Legacy global hooks (no owner) fire for every event.
+  const eligible = hooks.filter(
+    (h) =>
+      h.enabled !== false &&
+      h.events.includes(event.type) &&
+      (h.owner == null || h.owner === event.actor),
+  )
   if (eligible.length === 0) return
 
-  const payload = JSON.stringify({ ...event, ts: Date.now() })
+  // Include a back-pointer URL so the webhook receiver can deep-link
+  // straight into Reader without needing to know our public host.
+  const segs = event.path.split('/').filter(Boolean).map(encodeURIComponent).join('/')
+  const itemUrl = segs ? `${config.appUrl}/${segs}` : `${config.appUrl}/`
+  const payload = JSON.stringify({ ...event, ts: Date.now(), appUrl: config.appUrl, itemUrl })
   await Promise.all(eligible.map((hook) => deliver(hook, payload)))
 }
 

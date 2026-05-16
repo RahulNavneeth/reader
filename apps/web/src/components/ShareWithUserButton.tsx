@@ -41,6 +41,11 @@ export function ShareWithUserButton({ paths }: Props) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [shares, setShares] = useState<ShareRow[] | null>(null)
+  // Separate busy flag for row actions (permission toggle, revoke) so
+  // they don't disable the unrelated "Share" submit button at the top
+  // of the popover — that was causing a visible flicker on every chip
+  // click.
+  const [rowBusy, setRowBusy] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -134,8 +139,8 @@ export function ShareWithUserButton({ paths }: Props) {
     }
   }
 
-  const revoke = async (ids: string[]) => {
-    setBusy(true)
+  const revoke = async (ids: string[], rowKey: string) => {
+    setRowBusy(rowKey)
     setError(null)
     try {
       for (const id of ids) {
@@ -145,7 +150,32 @@ export function ShareWithUserButton({ paths }: Props) {
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
-      setBusy(false)
+      setRowBusy(null)
+    }
+  }
+
+  /** Flip a recipient's permission across every selected path that
+   *  has a grant for them. Server dedupes `(owner, recipient,
+   *  storageKey)` so re-creating with the new canEdit updates the
+   *  existing record in place. */
+  const togglePermission = async (recipient: string, nextCanEdit: boolean, rowKey: string) => {
+    if (!shares) return
+    const targets = shares.filter((s) => s.recipient === recipient)
+    setRowBusy(rowKey)
+    setError(null)
+    try {
+      for (const t of targets) {
+        await api.createUserShare({
+          path: t.storageKey,
+          recipient,
+          canEdit: nextCanEdit,
+        })
+      }
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setRowBusy(null)
     }
   }
 
@@ -220,13 +250,35 @@ export function ShareWithUserButton({ paths }: Props) {
                       {row.recipient}
                       <span className="text-subtle">{coverage}</span>
                     </span>
-                    <span className="text-[10.5px] text-subtle">
+                    {/* Permission chip — click to flip. Server dedupes
+                        on (owner, recipient, storageKey) so updating
+                        an existing grant in place is just a
+                        createUserShare with the new canEdit. */}
+                    <button
+                      className="text-[10.5px] font-medium px-1.5 h-5 rounded"
+                      onClick={() =>
+                        togglePermission(
+                          row.recipient,
+                          !row.canEdit,
+                          `${row.recipient}-${row.canEdit ? 'e' : 'r'}`,
+                        )
+                      }
+                      disabled={rowBusy === `${row.recipient}-${row.canEdit ? 'e' : 'r'}`}
+                      title={`Click to switch to ${row.canEdit ? 'read-only' : 'edit'}`}
+                      style={{
+                        background: row.canEdit ? 'var(--selected)' : 'var(--bg)',
+                        color: row.canEdit ? 'var(--accent)' : 'var(--fg)',
+                        border: '1px solid var(--border-soft)',
+                      }}
+                    >
                       {row.canEdit ? 'edit' : 'read-only'}
-                    </span>
+                    </button>
                     <button
                       className="btn-ghost h-6 w-6 px-0"
-                      onClick={() => revoke(row.ids)}
-                      disabled={busy}
+                      onClick={() =>
+                        revoke(row.ids, `${row.recipient}-${row.canEdit ? 'e' : 'r'}`)
+                      }
+                      disabled={rowBusy === `${row.recipient}-${row.canEdit ? 'e' : 'r'}`}
                       title={
                         row.ids.length > 1
                           ? `Revoke all ${row.ids.length} grants`

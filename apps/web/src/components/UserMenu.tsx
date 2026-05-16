@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { LogOut, Shield, User as UserIcon, Settings } from 'lucide-react'
+import { LogOut, Shield, User as UserIcon, Settings, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import type { PublicUser } from '../lib/api'
 
@@ -45,6 +45,26 @@ export function UserMenu({ user, onLogout }: Props) {
               {user.role}
             </div>
           </div>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+            onClick={() => {
+              setOpen(false)
+              navigate('/account')
+            }}
+          >
+            <UserIcon size={13} className="text-muted" />
+            Account
+          </button>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+            onClick={() => {
+              setOpen(false)
+              navigate('/trash')
+            }}
+          >
+            <Trash2 size={13} className="text-muted" />
+            Trash
+          </button>
           {isAdmin && (
             <button
               className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"

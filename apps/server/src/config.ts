@@ -53,8 +53,7 @@ function envBool(key: string, fallback: boolean): boolean {
 const dataDir = anchor.dataDir
   ? expand(anchor.dataDir)
   : expand(envStr('DATA_DIR', './data'))
-const nodeEnv = process.env.NODE_ENV ?? 'development'
-const isProd = nodeEnv === 'production'
+const isProd = process.env.NODE_ENV === 'production'
 const sessionSecret = envStr('SESSION_SECRET', '')
 if (!sessionSecret || sessionSecret.length < 32) {
   if (isProd) {
@@ -114,12 +113,28 @@ export const config = {
     host: envStr('SERVER_HOST', '127.0.0.1'),
     port: envInt('SERVER_PORT', 3001),
   },
+  /**
+   * Canonical public URL the app is served at — used to build links
+   * the server emits (webhook payloads, future email templates,
+   * MCP responses). Strip the trailing slash so callers can safely
+   * `${appUrl}/<path>`. In dev (no APP_URL set) we fall back to the
+   * bind host/port; in prod the env var is required and the server
+   * refuses to boot without it.
+   */
+  appUrl: (() => {
+    const raw = envStr('APP_URL', '')
+    if (raw) return raw.replace(/\/+$/, '')
+    if (isProd) {
+      throw new Error('[config] APP_URL is required in production. Refusing to boot.')
+    }
+    const host = envStr('SERVER_HOST', '127.0.0.1')
+    const port = envInt('SERVER_PORT', 3001)
+    return `http://${host}:${port}`
+  })(),
   session: {
     secret: sessionSecret || randomDevSecret(),
     cookieName: 'reader_sid',
-    // Default `secure: true` in production so session cookies are never
-    // sent over plain HTTP; opt-out is `COOKIE_SECURE=false` only.
-    secure: envBool('COOKIE_SECURE', isProd),
+    secure: envBool('COOKIE_SECURE', false),
     sameSite: (envStr('COOKIE_SAMESITE', 'lax') as 'lax' | 'strict' | 'none'),
     ttlMs: envInt('SESSION_TTL_DAYS', 30) * 24 * 60 * 60 * 1000,
   },

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save } from 'lucide-react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save, HardDrive, User as UserIcon } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
@@ -71,6 +71,20 @@ export function VaultSidebar() {
     }>
   >([])
   const [sharedOpen, setSharedOpen] = useState(true)
+  const [pins, setPins] = useState<
+    Array<{
+      owner: string
+      storageKey: string
+      isFolder: boolean
+      pinnedAt: number
+      label?: string
+    }>
+  >([])
+  const [pinsOpen, setPinsOpen] = useState(true)
+  const [externalMounts, setExternalMounts] = useState<
+    Array<{ id: string; name: string; hint: string }>
+  >([])
+  const [mountsOpen, setMountsOpen] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
   const [dragOver, setDragOver] = useState(false)
@@ -80,17 +94,23 @@ export function VaultSidebar() {
 
   const refetch = useCallback(async () => {
     try {
-      const [list, tagsR, viewsR, sharesR] = await Promise.all([
+      const [list, tagsR, viewsR, sharesR, pinsR, mountsR] = await Promise.all([
         api.list(''),
         api.tags().catch(() => ({ tags: [] })),
         api.listViews().catch(() => ({ views: [] })),
         api.listUserSharesTo().catch(() => ({ shares: [] })),
+        api.listPins().catch(() => ({ pins: [] })),
+        api.listExternalMounts().catch(() => ({ mounts: [] })),
       ])
       setTree((prev) => (sameJson(prev, list.items) ? prev : list.items))
       setTags((prev) => (sameJson(prev, tagsR.tags) ? prev : tagsR.tags))
       setViews((prev) => (sameJson(prev, viewsR.views) ? prev : viewsR.views))
       setSharedWithMe((prev) =>
         sameJson(prev, sharesR.shares) ? prev : (sharesR.shares as typeof prev),
+      )
+      setPins((prev) => (sameJson(prev, pinsR.pins) ? prev : pinsR.pins))
+      setExternalMounts((prev) =>
+        sameJson(prev, mountsR.mounts) ? prev : mountsR.mounts,
       )
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -161,7 +181,7 @@ export function VaultSidebar() {
           <Filter size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-subtle pointer-events-none" />
           <input
             className="input pl-8 pr-7 h-7 text-[12.5px]"
-            placeholder="Filter files (⌘K for search)…"
+            placeholder="Filter files…"
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
           />
@@ -220,7 +240,7 @@ export function VaultSidebar() {
                 style={{ transform: viewsOpen ? 'rotate(90deg)' : undefined }}
               />
               Views
-              <span className="text-subtle font-normal normal-case ml-1">({views.length})</span>
+              <span className="text-subtle font-semibold ml-auto">{views.length}</span>
             </button>
             {viewsOpen && (
               <div className="space-y-0.5 mt-0.5">
@@ -262,6 +282,118 @@ export function VaultSidebar() {
           </div>
         )}
 
+        {/* Pinned items. Click opens the file/folder viewer. Threads
+            ?owner=<owner> when the pinned path lives in another user's
+            namespace (shared item). */}
+        {!filter.trim() && pins.length > 0 && (
+          <div className="mb-2 mx-1">
+            <button
+              className="w-full flex items-center gap-1 px-2 h-6 text-[10.5px] uppercase tracking-wider font-semibold text-subtle hover:bg-hover rounded"
+              onClick={() => setPinsOpen((v) => !v)}
+            >
+              <ChevronRight
+                size={11}
+                className="transition-transform"
+                style={{ transform: pinsOpen ? 'rotate(90deg)' : undefined }}
+              />
+              Pinned
+              <span className="text-subtle font-semibold ml-auto">{pins.length}</span>
+            </button>
+            {pinsOpen && (
+              <div className="mt-0.5 space-y-0.5">
+                {pins.map((p) => {
+                  const segs = p.storageKey.split('/').map(encodeURIComponent).join('/')
+                  const suffix =
+                    p.owner !== currentUsername
+                      ? `?owner=${encodeURIComponent(p.owner)}`
+                      : ''
+                  const target = `/${segs}${suffix}`
+                  const isActive = openPath === p.storageKey
+                  const name = p.label || p.storageKey.split('/').pop() || p.storageKey
+                  return (
+                    <button
+                      key={`${p.owner}:${p.storageKey}`}
+                      onClick={() => navigate(target)}
+                      className={clsx(
+                        'w-full flex items-center gap-2 pl-7 pr-2 h-7 rounded text-[12.5px] text-left',
+                        !isActive && 'hover:bg-hover',
+                      )}
+                      style={{
+                        background: isActive ? 'var(--selected)' : 'transparent',
+                        color: isActive ? 'var(--accent)' : 'var(--fg)',
+                      }}
+                      title={`${p.owner}:${p.storageKey}`}
+                    >
+                      {p.isFolder ? (
+                        <Folder
+                          size={12}
+                          className={isActive ? 'text-accent' : 'text-accent'}
+                        />
+                      ) : (
+                        <FileText
+                          size={12}
+                          className={isActive ? 'text-accent' : 'text-muted'}
+                        />
+                      )}
+                      <span className="truncate flex-1">{name}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* External mounts — admin-configured read-only library roots. */}
+        {!filter.trim() && externalMounts.length > 0 && (
+          <div className="mb-2 mx-1">
+            <button
+              className="w-full flex items-center gap-1 px-2 h-6 text-[10.5px] uppercase tracking-wider font-semibold text-subtle hover:bg-hover rounded"
+              onClick={() => setMountsOpen((v) => !v)}
+            >
+              <ChevronRight
+                size={11}
+                className="transition-transform"
+                style={{ transform: mountsOpen ? 'rotate(90deg)' : undefined }}
+              />
+              Libraries
+              <span className="text-subtle font-semibold ml-auto">
+                {externalMounts.length}
+              </span>
+            </button>
+            {mountsOpen && (
+              <div className="mt-0.5 space-y-0.5">
+                {externalMounts.map((m) => {
+                  const target = `/library/${encodeURIComponent(m.id)}`
+                  const isActive = location.pathname.startsWith(target)
+                  return (
+                    <button
+                      key={m.id}
+                      onClick={() => navigate(target)}
+                      className={clsx(
+                        'w-full flex items-center gap-2 pl-7 pr-2 h-7 rounded text-[12.5px] text-left',
+                        !isActive && 'hover:bg-hover',
+                      )}
+                      style={{
+                        background: isActive ? 'var(--selected)' : 'transparent',
+                        color: isActive ? 'var(--accent)' : 'var(--fg)',
+                      }}
+                      title={`Read-only: ${m.hint}`}
+                    >
+                      <HardDrive
+                        size={11}
+                        className={isActive ? 'text-accent' : 'text-subtle'}
+                      />
+                      <span className="truncate flex-1">{m.name}</span>
+                      <span className="text-[10px] text-subtle">read-only</span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Files / folders other users have shared with the caller. Each
             click opens the doc viewer with ?owner=<their username> so the
             read endpoints resolve to the owner's namespace. */}
@@ -277,17 +409,16 @@ export function VaultSidebar() {
                 style={{ transform: sharedOpen ? 'rotate(90deg)' : undefined }}
               />
               Shared with me
-              <span className="text-subtle font-normal normal-case ml-1">
-                ({sharedWithMe.length})
+              <span className="text-subtle font-semibold ml-auto">
+                {sharedWithMe.length}
               </span>
             </button>
             {sharedOpen && (
-              <div className="mt-0.5 space-y-0.5">
-                {buildSharedTree(sharedWithMe).map((n) => (
-                  <SharedNode
-                    key={`${n.owner}:${n.path}`}
-                    node={n}
-                    depth={0}
+              <div className="mt-0.5 space-y-1">
+                {buildSharedTree(sharedWithMe).map((g) => (
+                  <SharedOwnerSection
+                    key={g.owner}
+                    group={g}
                     selectedPath={openPath}
                     activePath={activePath}
                   />
@@ -311,7 +442,7 @@ export function VaultSidebar() {
                 style={{ transform: tagsOpen ? 'rotate(90deg)' : undefined }}
               />
               Tags
-              <span className="text-subtle font-normal normal-case ml-1">({tags.length})</span>
+              <span className="text-subtle font-semibold ml-auto">{tags.length}</span>
             </button>
             {tagsOpen && (
               <>
@@ -581,21 +712,32 @@ type SharedTreeNode =
       children: SharedTreeNode[]
     }
 
+export type SharedOwnerGroup = {
+  owner: string
+  /** Total leaf shares from this owner (files + folder roots), used in
+   *  the header chip — gives the user a fast "X items from alice" cue. */
+  shareCount: number
+  /** Trees under this owner, identical shape to the legacy flat output. */
+  trees: SharedTreeNode[]
+}
+
 /**
- * Group `shared with me` items so they read like a real tree:
+ * Group `shared with me` items by the user who shared them, then by
+ * the in-vault path hierarchy under each:
  *
- *   investments/                   ← group (no grant — visual only)
- *     cdsl/                        ← share (folder)
- *     exchanges/                   ← share (folder)
- *     portfolio-target.md          ← share (file)
- *   2005100123 DEARL TECH…         ← share (file at root)
+ *   alice  (2)
+ *     investments/                   ← path-group (no grant — visual only)
+ *       cdsl/                        ← share (folder)
+ *       portfolio-target.md          ← share (file)
+ *   bob    (1)
+ *     2005100123 DEARL TECH…         ← share (file at root)
  *
- * Group nodes are purely client-side; they expand/collapse but don't
- * navigate (the recipient has no grant on the bare `investments` path).
- * Share nodes hand off to VaultTree, which fetches descendants under
- * the share grant.
+ * Two-level grouping: outer = owner (so a recipient with many sharers
+ * can tell who shared what at a glance); inner = path hierarchy
+ * (same as before — folder ancestors group their children visually).
+ * Group nodes are client-only and don't navigate.
  */
-function buildSharedTree(shares: SharedShare[]): SharedTreeNode[] {
+function buildSharedTree(shares: SharedShare[]): SharedOwnerGroup[] {
   type Bucket = {
     nodesByPath: Map<string, SharedTreeNode>
     roots: SharedTreeNode[]
@@ -665,7 +807,6 @@ function buildSharedTree(shares: SharedShare[]): SharedTreeNode[] {
     }
   }
 
-  const out: SharedTreeNode[] = []
   // Sort folders first within each level, then alphabetical.
   const sort = (nodes: SharedTreeNode[]): SharedTreeNode[] => {
     nodes.forEach((n) => sort(n.children))
@@ -677,8 +818,26 @@ function buildSharedTree(shares: SharedShare[]): SharedTreeNode[] {
     })
     return nodes
   }
-  for (const bucket of byOwner.values()) out.push(...sort(bucket.roots))
-  return out
+  // Outer order: alphabetical by owner so the list is stable across
+  // re-renders. Inner order: folder-first inside each owner.
+  const owners = Array.from(byOwner.keys()).sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: 'base' }),
+  )
+  return owners.map((owner) => {
+    const bucket = byOwner.get(owner)!
+    const trees = sort(bucket.roots)
+    // shareCount = number of original share grants this owner gave us
+    // (count the leaf share nodes, not transient path-groups).
+    const countLeaves = (nodes: SharedTreeNode[]): number =>
+      nodes.reduce(
+        (acc, n) =>
+          acc +
+          (n.kind === 'share-file' || n.kind === 'share-folder' ? 1 : 0) +
+          countLeaves(n.children),
+        0,
+      )
+    return { owner, shareCount: countLeaves(trees), trees }
+  })
 }
 
 /** Render one node in the shared-with-me virtual tree. Group nodes are
@@ -761,6 +920,53 @@ function SharedNode({
             activePath={activePath}
           />
         ))}
+    </div>
+  )
+}
+
+/** Header row for a single sharer, with their items nested underneath.
+ *  Always renders the owner row (even when there's only one sharer) so
+ *  the recipient always knows who shared what — that was the whole
+ *  motivation for this restructure. */
+function SharedOwnerSection({
+  group,
+  selectedPath,
+  activePath,
+}: {
+  group: SharedOwnerGroup
+  selectedPath: string | null
+  activePath: string | null
+}) {
+  const [open, setOpen] = useState(true)
+  return (
+    <div>
+      <div
+        className="flex items-center gap-1.5 pl-7 pr-2 h-6 rounded text-[10.5px] uppercase tracking-wider font-semibold text-subtle hover:bg-hover cursor-pointer"
+        onClick={() => setOpen((v) => !v)}
+        title={`Shared by ${group.owner}`}
+      >
+        <ChevronRight
+          size={10}
+          className="text-subtle transition-transform"
+          style={{ transform: open ? 'rotate(90deg)' : undefined }}
+        />
+        <UserIcon size={10} className="text-subtle" />
+        <span className="truncate flex-1">{group.owner}</span>
+        <span className="text-subtle font-semibold ml-auto">{group.shareCount}</span>
+      </div>
+      {open && (
+        <div className="mt-0.5 space-y-0.5">
+          {group.trees.map((n) => (
+            <SharedNode
+              key={`${n.owner}:${n.path}`}
+              node={n}
+              depth={2}
+              selectedPath={selectedPath}
+              activePath={activePath}
+            />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
