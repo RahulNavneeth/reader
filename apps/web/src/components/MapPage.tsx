@@ -239,11 +239,7 @@ export function MapPage() {
           </div>
         )}
 
-        {pins == null ? (
-          <div className="absolute inset-0 flex items-center justify-center text-[13px] text-muted">
-            <Loader2 size={14} className="animate-spin mr-2" /> Loading map…
-          </div>
-        ) : pins.length === 0 && !backfilling ? (
+        {pins == null ? null : pins.length === 0 && !backfilling ? (
           <div className="absolute inset-0 flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
@@ -544,7 +540,7 @@ function ClusterSidebar({
         onClick={onClose}
       />
       <aside
-        className="fixed top-0 right-0 h-full w-[400px] z-[60] flex flex-col overflow-hidden"
+        className="fixed top-0 right-0 h-full w-full sm:w-[400px] z-[60] flex flex-col overflow-hidden"
         style={{ background: 'var(--panel)', borderLeft: '1px solid var(--border)' }}
       >
         {/* Header: location pill + chevron-style chip showing N/M.

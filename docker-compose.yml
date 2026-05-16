@@ -1,80 +1,84 @@
-# Reader — self-hosted knowledge platform.
-# All state on disk; no DB. Three services: app + S3-compatible blob store + local embeddings.
+# Reader — self-hosted document vault.
 #
 # Quick start:
-#   1. cp .env.example .env  (and set SESSION_SECRET to a long random string)
+#   1. Set SESSION_SECRET to a long random string:
+#        printf "SESSION_SECRET=%s\n" "$(openssl rand -hex 32)" > .env
 #   2. docker compose up -d
-#   3. open http://localhost:3001 — first signup becomes admin
-#   4. (one-time) docker compose exec ollama ollama pull nomic-embed-text
+#   3. open http://localhost:3001 — the first signup becomes admin
+#   4. (one-time, optional) pull the embedding model so search works:
+#        docker compose exec ollama ollama pull nomic-embed-text
 #
-# Volumes are bind-mounted to ./_state/* so you can rsync them to a NAS.
+# Volumes:
+#   ./_state/data    → /data    (users, sessions, document meta, audit log)
+#   ./_state/vault   → /vault   (the user's files — *back this up*)
+#   ./_state/ollama  → /root/.ollama (downloaded embedding models)
+#
+# Bind-mounted so you can rsync `./_state/` to a NAS for backup.
+# Comment out the `ollama` service if you don't want semantic search;
+# the app falls back to lexical-only.
 
 services:
-  app:
+  reader:
+    image: ghcr.io/rahulnavneeth/reader:latest
+    # Use the local build instead of the published image during dev:
+    #   docker compose build
     build: .
-    image: reader:local
-    container_name: reader-app
+    container_name: reader
     restart: unless-stopped
     ports:
-      - "${SERVER_PORT:-3001}:3001"
+      - "${READER_PORT:-3001}:3001"
     environment:
-      DATA_DIR: /data
-      SERVER_HOST: 0.0.0.0
-      SERVER_PORT: 3001
+      # Required — at least 32 chars. Cookies are signed with this.
       SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env (>= 32 chars)}
+      # Public URL the app is served at. Required when COOKIE_SECURE=true.
+      APP_URL: ${APP_URL:-http://localhost:3001}
+      # Cookie config. Set COOKIE_SECURE=true behind HTTPS reverse proxy.
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
       SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-30}
+      # Allowed CORS origins (comma-separated). Required in production
+      # when the web UI is served from a different origin.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      # Open signup off by default — the first user becomes admin and
+      # invites everyone else through Settings → Users.
       ALLOW_OPEN_SIGNUP: ${ALLOW_OPEN_SIGNUP:-false}
-      READER_ROOT: /data/legacy-root
+      # Upload size cap (bytes). 100 MB default. Bump if you're storing
+      # video or large archives.
       MAX_FILE_BYTES: ${MAX_FILE_BYTES:-104857600}
-      # Storage — point at MinIO sibling.
-      STORAGE: s3
-      S3_ENDPOINT: http://minio:9000
-      S3_BUCKET: ${S3_BUCKET:-reader}
-      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-readeradmin}
-      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
-      S3_FORCE_PATH_STYLE: "true"
-      # Embeddings — point at Ollama sibling.
-      OLLAMA_BASE_URL: http://ollama:11434
+      # Embeddings — points at the Ollama sibling container.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
       OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
-      OLLAMA_ENABLED: "true"
+      OLLAMA_ENABLED: ${OLLAMA_ENABLED:-true}
+      # Optional SMTP for outbound notifications (share invites, etc.).
+      # Leave SMTP_ENABLED=false to skip — emails are logged to stdout.
+      SMTP_ENABLED: ${SMTP_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-Reader <noreply@reader.local>}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
     volumes:
       - ./_state/data:/data
+      - ./_state/vault:/vault
     depends_on:
-      minio:
-        condition: service_healthy
       ollama:
         condition: service_started
-
-  minio:
-    image: minio/minio:latest
-    container_name: reader-minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-readeradmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
-    ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
-    volumes:
-      - ./_state/minio:/data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
 
   ollama:
     image: ollama/ollama:latest
     container_name: reader-ollama
     restart: unless-stopped
-    ports:
-      - "${OLLAMA_PORT:-11434}:11434"
     volumes:
       - ./_state/ollama:/root/.ollama
-    # On Apple Silicon and CUDA-equipped hosts, pass-through GPU resources here.
+    # Optional: expose Ollama on the host if you want to use it
+    # outside Reader. Leave commented to keep it private to the
+    # compose network.
+    # ports:
+    #   - "11434:11434"
+    #
+    # On CUDA hosts, pass through the GPU. Apple Silicon hosts can
+    # leave this out — Ollama uses Metal automatically.
     # deploy:
     #   resources:
     #     reservations:

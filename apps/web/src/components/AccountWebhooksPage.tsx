@@ -184,11 +184,7 @@ export function AccountWebhooksPage() {
 
         <section>
           <div className="text-[13px] font-semibold text-fg mb-2">Your webhooks</div>
-          {!hooks ? (
-            <div className="text-[12.5px] text-muted inline-flex items-center gap-1.5">
-              <Loader2 size={12} className="animate-spin" /> Loading…
-            </div>
-          ) : hooks.length === 0 ? (
+          {!hooks ? null : hooks.length === 0 ? (
             <div
               className="rounded-xl p-6 text-center"
               style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}

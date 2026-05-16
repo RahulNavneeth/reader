@@ -7,7 +7,9 @@
     "dev": "DATA_DIR=${DATA_DIR:-../../data} tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.1",
@@ -36,6 +38,7 @@
     "@types/node": "^22.9.0",
     "@types/nodemailer": "^8.0.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.5"
   }
 }

@@ -105,7 +105,7 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
         onClick={onClose}
       />
       <aside
-        className="fixed top-0 right-0 h-full w-[380px] z-[60] flex flex-col overflow-y-auto"
+        className="fixed top-0 right-0 h-full w-full sm:w-[380px] z-[60] flex flex-col overflow-y-auto"
         style={{ background: 'var(--panel)', borderLeft: '1px solid var(--border)' }}
       >
         <div

@@ -23,11 +23,17 @@ export type Pin = {
   label?: string
 }
 
-const DIR = path.join(config.dataDir, 'pins')
+// Resolve the dir per-call rather than at module load. Tests swap
+// `config.dataDir` in beforeEach so they get isolated scratch dirs;
+// the same dynamic resolution also lets the admin "move data dir at
+// runtime" feature work without a server restart.
+function pinsDir(): string {
+  return path.join(config.dataDir, 'pins')
+}
 
 function fileFor(user: string): string {
   const safe = user.replace(/[^a-zA-Z0-9._-]/g, '_')
-  return path.join(DIR, `${safe}.json`)
+  return path.join(pinsDir(), `${safe}.json`)
 }
 
 export async function listPins(user: string): Promise<Pin[]> {
@@ -42,7 +48,7 @@ export async function listPins(user: string): Promise<Pin[]> {
 }
 
 async function writePins(user: string, pins: Pin[]): Promise<void> {
-  await ensureDir(DIR)
+  await ensureDir(pinsDir())
   await writeFile(fileFor(user), JSON.stringify(pins, null, 2), 'utf8')
 }
 

@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useParams, useSearchParams } from 'react-router-dom'
-import { Loader2 } from 'lucide-react'
 import { PathViewer } from './PathViewer'
 import { FolderGrid } from './FolderGrid'
 import { TaggedFilesView } from './TaggedFilesView'
@@ -104,9 +103,9 @@ export function VaultView() {
         {tagFilter ? (
           <TaggedFilesView key={tagFilter} />
         ) : resolved.status === 'loading' ? (
-          <div className="flex-1 flex items-center justify-center text-muted text-[12.5px]">
-            <Loader2 size={14} className="animate-spin mr-2" /> Loading…
-          </div>
+          // Empty during resolve — avoids a spinner flash for what's
+          // usually a <100ms /api/resolve round-trip.
+          <div className="flex-1" />
         ) : resolved.status === 'file' ? (
           <PathViewer key={resolved.path} path={resolved.path} canEdit={resolved.canEdit} />
         ) : (

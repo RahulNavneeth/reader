@@ -34,9 +34,13 @@ coverage
 # Reader filesystem state — never commit user data, sessions, documents.
 /data/*
 !/data/.gitkeep
+/apps/server/data/
 
 # docker compose state volumes (bind-mounted to ./_state)
 /_state/
 
 # Tesseract language models, downloaded at first OCR.
 *.traineddata
+
+# We use npm workspaces; package-lock.json is canonical.
+pnpm-lock.yaml

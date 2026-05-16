@@ -36,6 +36,10 @@ export type VaultContextValue = {
   /** Logged-in user's username — used to decide when to thread
    *  `?owner=` through navigation (cross-owner shared content). */
   currentUsername: string
+  /** Mobile-only sidebar drawer state. Sidebar is always visible on
+   *  desktop (md+); on small screens it slides in over the content. */
+  mobileSidebarOpen: boolean
+  setMobileSidebarOpen: (open: boolean) => void
 }
 
 export const VaultContext = createContext<VaultContextValue | null>(null)

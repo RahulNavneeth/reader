@@ -1,99 +1,268 @@
 # Reader
 
+[![CI](https://github.com/RahulNavneeth/reader/actions/workflows/ci.yml/badge.svg)](https://github.com/RahulNavneeth/reader/actions/workflows/ci.yml)
+
 A self-hosted document vault. Files live on disk as a normal folder tree
-(Obsidian-style); the app indexes them for AI agents and humans.
+(Obsidian-style); the app gives every file a viewer, search index, shareable
+links, and an MCP endpoint for AI agents.
+
+Single-node, single Docker image, runs on a Mac mini or Raspberry Pi.
+
+---
 
 ## Features
 
-- **Filesystem-backed vault** — every file is just a real file on disk, so it
-  stays editable in Finder, Obsidian, vim, etc.
-- **Hybrid search** — lexical scoring fused with vector cosine search over
-  Ollama embeddings. RRF-merged, snippet-highlighted.
-- **⌘K command palette** — global search across the corpus *and* quick actions
-  (new folder, upload, move/rename).
-- **Folder grid** — Finder-style empty state with breadcrumbs, type-aware
-  icons, and click-to-navigate.
-- **Upload destination picker** — every upload prompts for a destination,
-  pre-filled with your current folder.
-- **Public/private toggle** — flip a file public from the header and the same
-  `/docs/<path>` URL is readable without auth. Private files require login.
-- **Anonymous viewer** — hitting a public file's URL in incognito renders the
-  file with minimal chrome, no login wall.
-- **Content negotiation on `/docs/<path>`** — browsers get the SPA viewer,
-  CLIs (wget, curl, fetch) get the raw bytes. No redirects, no leaked
-  internal endpoints.
-- **MD outline** — markdown files get a TOC panel on the right with
-  click-to-scroll.
-- **Dynamic tab title + favicon** — both update to match the file you're
-  viewing; favicon icons match the sidebar/grid glyphs.
-- **MCP integration** — the server exposes an MCP endpoint so AI agents can
-  query the vault.
-- **Auth + roles** — admin/editor/viewer, sessions cookies, audit log,
-  long-lived API tokens.
-- **Re-index button** — if Ollama was down at upload time, one click
-  re-extracts and re-embeds.
+**File browser**
+- Folder grid with thumbnails (images, PDFs, video frames)
+- Inline viewers for PDF, markdown, CSV, JSON, images, audio, video
+- Custom-chrome audio/video player (play/pause/seek/mute/fullscreen)
+- Pin files or folders to the sidebar
+- Drag-and-drop upload, bulk select + bulk public/private/pin/share/delete
+- Trash with 30-day retention and per-file deletion countdown
+- Versions per file, recent-activity audit per file/folder
+
+**Multi-user**
+- Per-user vaults (`<VAULT_ROOT>/<username>/…`)
+- First signup becomes admin; admin invites the rest via Settings → Users
+- Role-based: `admin` / `editor` / `viewer`
+- Per-user upload quotas, per-user re-index, per-user API tokens + webhooks
+- User-to-user shares (folder or file, read-only or read+write)
+- Public links with optional password + expiry; folder shares cascade
+
+**Search**
+- Hybrid lexical + semantic (Ollama embeddings, RRF-merged)
+- Filename + tag search in the sidebar
+- ⌘K command palette with file matches + quick actions
+
+**AI agents**
+- MCP endpoint at `/mcp` (Bearer token from Settings → API tokens)
+- 11 tools: search, list, get, list_folder, upload_text, set_tags,
+  pin, whoami, etc. Acts as the token's user.
+
+**Photo map**
+- `/map` plots geotagged photos on OpenStreetMap (pigeon-maps)
+- EXIF GPS extracted on ingest via `exifr`; lazy-backfilled for legacy images
+- Proximity clustering, zoom-to-fit, date-grouped cluster sidebar
+
+**Other**
+- Streaming ZIP export of an account's vault + manifest (constant memory)
+- Memories ("On this day" carousel from past years)
+- Light / dark theme
+- All themed dialogs (no native `window.confirm`)
+
+---
+
+## Quick start (Docker)
+
+```bash
+# 1. Pick a directory for your stack, e.g. ~/reader
+git clone https://github.com/RahulNavneeth/reader.git ~/reader
+cd ~/reader
+
+# 2. Generate a session secret (>= 32 chars, do this once)
+printf "SESSION_SECRET=%s\n" "$(openssl rand -hex 32)" > .env
+
+# 3. Bring it up
+docker compose up -d
+
+# 4. Open http://localhost:3001 — the first signup becomes admin
+```
+
+That's it. Files land under `./_state/vault/<username>/…` on the host; you
+can `rsync` that to a NAS for backup.
+
+To pull the embedding model so semantic search works (one-time, ~270 MB):
+
+```bash
+docker compose exec ollama ollama pull nomic-embed-text
+```
+
+If you don't want semantic search at all, comment out the `ollama` service
+in `docker-compose.yml` and set `OLLAMA_ENABLED=false`. The app falls back
+to lexical-only search.
+
+---
+
+## Configuration
+
+All config is environment variables. Defaults are fine for a LAN install.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SESSION_SECRET` | — | **Required.** ≥ 32 chars. Generate with `openssl rand -hex 32`. |
+| `APP_URL` | `http://localhost:3001` | Public URL the app is served at. Required if `COOKIE_SECURE=true`. |
+| `COOKIE_SECURE` | `false` | Set to `true` behind an HTTPS reverse proxy. |
+| `COOKIE_SAMESITE` | `lax` | `lax` / `strict` / `none`. |
+| `SESSION_TTL_DAYS` | `30` | How long a session cookie lives. |
+| `ALLOWED_ORIGINS` | _empty_ | Comma-separated CORS allowlist for production. Localhost is auto-allowed in dev. |
+| `ALLOW_OPEN_SIGNUP` | `false` | If true, anyone can sign up. Otherwise only the first user (auto-admin) + admin-issued accounts. |
+| `MAX_FILE_BYTES` | `104857600` (100 MB) | Upload size cap. Bump if storing video / large archives. |
+| `DATA_DIR` | `/data` | App state (users, sessions, meta, audit). Mount a volume. |
+| `VAULT_ROOT` | `/vault` | User files. **This is the directory to back up.** Mount a volume. |
+| `WEB_DIR` | `/app/apps/web/dist` | Where the SPA bundle is. Don't change in Docker. |
+| `SERVER_HOST` / `SERVER_PORT` | `0.0.0.0` / `3001` | Bind address. |
+| `OLLAMA_BASE_URL` | `http://ollama:11434` | Where to reach Ollama. |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Any Ollama embed model works. |
+| `OLLAMA_ENABLED` | `true` | Set false to skip semantic search entirely. |
+| `SMTP_*` | _disabled_ | If `SMTP_ENABLED=true`, sends real email; otherwise logs to stdout. |
+
+Most of these are also editable live in **Settings → General** once you're
+signed in as admin.
+
+---
+
+## Storage layout
+
+Two persistent directories you mount as volumes:
+
+```
+data/                    ← app state ($DATA_DIR)
+├── users/               registered accounts (argon2 password hashes)
+├── sessions/            active cookies
+├── tokens/              API tokens (sha256-hashed)
+├── documents/           per-doc meta, extracted text, embeddings, thumb/preview
+├── folder-metas/        per-folder meta (tags, public flag)
+├── user-shares/         user-to-user share grants
+├── views/               saved sidebar filters
+├── pins/                per-user pin lists
+├── audit/               append-only audit log
+├── trash/               trashed files (auto-purged at 30d)
+└── settings.json        workspace settings
+
+vault/                   ← user files ($VAULT_ROOT)
+├── alice/
+│   ├── investments/
+│   │   └── notes.md
+│   └── IMG_1234.heic
+└── bob/
+    └── …
+```
+
+Files in `vault/` are normal files — you can edit them in Finder / Obsidian /
+vim and Reader picks up the changes via a filesystem watcher.
+
+---
+
+## Backup
+
+Reader has no database. Two directories carry all state.
+
+**Option A — one-shot tar.gz snapshot:**
+
+```bash
+docker compose exec reader node apps/server/dist/cli/backup.js --out /data
+# writes /data/reader-backup-2026-05-16-231005.tar.gz inside the volume
+```
+
+The CLI accepts `--out`, `--data`, and `--vault` overrides; defaults match
+the container's mount points.
+
+**Option B — rsync:**
+
+```bash
+rsync -av --delete ./_state/data/  /path/to/backup/data/
+rsync -av --delete ./_state/vault/ /path/to/backup/vault/
+```
+
+The vault is the irreplaceable part. `data/` can be regenerated (the app
+will re-index on first run) but you'll lose tags, shares, pins, and the
+audit log if you only restore the vault.
+
+**Full account export** is also built in: each user can download a ZIP of
+their files + a `manifest.json` of tags/shares/pins from **Account → Export
+everything**.
+
+---
+
+## Upgrade
+
+Published images live at `ghcr.io/rahulnavneeth/reader`. Pin to a major
+version (`:1`) for safe upgrades, or `:latest` for the bleeding edge:
+
+```bash
+cd ~/reader
+docker compose pull
+docker compose up -d
+```
+
+Available tags: `latest`, `1`, `1.2`, `1.2.3` (semver — pick the precision
+that matches your risk tolerance). Multi-arch (`linux/amd64`, `linux/arm64`).
+
+If you're building from source instead:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+Data format is stable across versions; the app tolerates older `meta.json`
+shapes and lazily upgrades them on first read. There is no manual migration
+step.
+
+---
+
+## Reverse proxy
+
+The app expects an HTTPS reverse proxy in front of it for any deployment
+outside `localhost`. Minimal Caddy config:
+
+```caddy
+reader.example.com {
+  reverse_proxy reader:3001
+}
+```
+
+Then in `.env`:
+
+```
+APP_URL=https://reader.example.com
+COOKIE_SECURE=true
+ALLOWED_ORIGINS=https://reader.example.com
+```
+
+---
+
+## Development
+
+```bash
+npm install
+cp .env.example .env
+# set SESSION_SECRET, VAULT_ROOT, DATA_DIR
+npm run dev   # server :3001, web :5174 with HMR
+```
+
+Build:
+
+```bash
+npm run build
+```
+
+Typecheck:
+
+```bash
+npm run typecheck
+```
+
+Tests (vitest smoke suite — path traversal guards, ZIP encoder, GPS extraction):
+
+```bash
+npm test
+```
+
+---
 
 ## Stack
 
 | Layer | Tech |
 |---|---|
-| Frontend | React 18 + Vite, TailwindCSS, react-markdown, lucide icons |
-| Backend | Fastify (Node 22), multipart uploads, JSON file stores |
-| Search | Ollama (`nomic-embed-text` by default) + in-memory chunk index |
-| Storage | Local disk (vault under `~/Documents/Reader-Vault` by default) |
-| Optional | S3-compatible object storage (MinIO/R2/AWS) for blobs |
+| Frontend | React 18 + Vite, TailwindCSS, react-markdown, pigeon-maps, lucide |
+| Backend | Fastify (Node 22), `@fastify/multipart`, `chokidar`, `sharp`, `@napi-rs/canvas`, `pdfjs-dist`, `exifr` |
+| Search | Ollama (`nomic-embed-text` by default) + in-process lexical index |
+| Storage | Filesystem |
+| Container | Debian-slim, non-root, ~400 MB |
 
-## Repo layout
-
-```
-apps/
-  server/   Fastify API + ingest pipeline + search service
-  web/      React SPA (Vite dev on :5174, /api proxied to :3001)
-packages/
-  shared/   Cross-cutting types (in progress)
-data/       Runtime state: users, sessions, document meta, audit log
-            (gitignored — only .gitkeep is tracked)
-```
-
-## Getting started
-
-Prerequisites: Node 22, Ollama running with `nomic-embed-text` pulled, an
-existing vault directory.
-
-```bash
-# 1. Install
-npm install
-
-# 2. Copy env template and edit
-cp .env.example .env
-#   set SESSION_SECRET (openssl rand -hex 32)
-#   set READER_ROOT to your vault path (defaults to ~/Documents/Reader-Vault)
-
-# 3. Run dev (server :3001, web :5174 with HMR + /api proxy)
-npm run dev
-```
-
-Open <http://localhost:5174>, sign up the first admin user, drop a file into
-the dropzone, and try ⌘K.
-
-## URL conventions
-
-| URL | What you get |
-|---|---|
-| `/docs/<path>` in a browser | SPA viewer (auth-gated unless file is public) |
-| `/docs/<path>` via `wget`/`curl` | Raw file bytes (auth-gated unless public) |
-| `/api/file/raw?path=<path>` | Internal — same as above, used by the server |
-| `/api/search/knowledge?q=…` | Hybrid search hits |
-| `/mcp` | MCP server endpoint for AI agents |
-
-## Public sharing
-
-In the file header, click **Private** to flip to **Public**. The URL
-`/docs/<path>` stays the same and becomes anonymously readable. Click
-**Public** again to lock it back down.
-
-Folder-level sharing is not implemented yet — coming.
+---
 
 ## License
 
-ISC.
+MIT — see [LICENSE](./LICENSE).

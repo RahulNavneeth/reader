@@ -45,7 +45,7 @@ export function VaultSidebar() {
   const location = useLocation()
   const openPath = (params['*'] || '').trim() || null
   const activeTag = location.pathname.startsWith('/tags/') ? params.tag ?? null : null
-  const { uploadFiles, refreshNonce, vaultError, clearError, currentFolder, currentUsername } = useVault()
+  const { uploadFiles, refreshNonce, vaultError, clearError, currentFolder, currentUsername, mobileSidebarOpen, setMobileSidebarOpen } = useVault()
   const confirm = useConfirm()
   const prompt = usePrompt()
   const activePath = openPath ?? (currentFolder || null)
@@ -175,7 +175,27 @@ export function VaultSidebar() {
   }, [filter])
 
   return (
-    <aside className="panel border-r border-app overflow-y-auto shrink-0 w-[320px] flex flex-col">
+    <>
+      {/* Mobile backdrop — only renders on small screens when the
+          drawer is open. Click to dismiss. */}
+      {mobileSidebarOpen && (
+        <div
+          className="md:hidden fixed inset-0 z-30"
+          style={{ background: 'rgba(9,30,66,0.42)' }}
+          onClick={() => setMobileSidebarOpen(false)}
+          aria-hidden
+        />
+      )}
+      <aside
+        className={clsx(
+          'panel border-r border-app overflow-y-auto flex flex-col',
+          // Mobile: fixed-position drawer that slides in from the left.
+          // Desktop: in-flow column at 320px.
+          'md:static md:translate-x-0 md:w-[320px] md:shrink-0',
+          'fixed inset-y-0 left-0 z-40 w-[85vw] max-w-[320px] transition-transform',
+          mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0',
+        )}
+      >
       <div
         className="h-11 px-2 flex items-center border-b sticky top-0 z-10"
         style={{ background: 'var(--panel)', borderColor: 'var(--border-soft)' }}
@@ -723,6 +743,7 @@ export function VaultSidebar() {
         )}
       </div>
     </aside>
+    </>
   )
 }
 

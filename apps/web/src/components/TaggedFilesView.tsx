@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import {
   Tag,
   ChevronLeft,
-  Loader2,
   FileText,
   FileType,
   FileImage,
@@ -69,12 +68,6 @@ export function TaggedFilesView() {
       </header>
 
       <div className="flex-1 overflow-y-auto p-6">
-        {items == null && !error && (
-          <div className="flex items-center justify-center h-full text-muted text-[12.5px]">
-            <Loader2 size={14} className="animate-spin mr-2" /> Loading…
-          </div>
-        )}
-
         {error && (
           <div className="text-[12.5px]" style={{ color: '#BF2600' }}>
             {error}

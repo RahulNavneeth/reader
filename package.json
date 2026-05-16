@@ -12,7 +12,8 @@
     "dev:server": "npm -w @reader/server run dev",
     "dev:web": "npm -w @reader/web run dev",
     "build": "npm -w @reader/server run build && npm -w @reader/web run build",
-    "typecheck": "npm -w @reader/server run typecheck && npm -w @reader/web run typecheck"
+    "typecheck": "npm -w @reader/server run typecheck && npm -w @reader/web run typecheck",
+    "test": "npm -w @reader/server run test"
   },
   "devDependencies": {
     "concurrently": "^9.0.1"

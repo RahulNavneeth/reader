@@ -66,13 +66,9 @@ export function AccountPage() {
     )
   }
   if (!stats) {
-    return (
-      <div className="flex-1 flex items-center justify-center surface">
-        <div className="text-[13px] text-muted inline-flex items-center gap-2">
-          <Loader2 size={14} className="animate-spin" /> Loading…
-        </div>
-      </div>
-    )
+    // Blank surface while account stats load — avoids a centered
+    // spinner flash for what's typically a single sub-100ms fetch.
+    return <div className="flex-1 surface" />
   }
 
   const u = stats.user

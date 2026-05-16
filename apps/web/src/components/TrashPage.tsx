@@ -105,11 +105,7 @@ export function TrashPage() {
           </div>
         )}
 
-        {!entries ? (
-          <div className="text-[13px] text-muted inline-flex items-center gap-2">
-            <Loader2 size={13} className="animate-spin" /> Loading…
-          </div>
-        ) : entries.length === 0 ? (
+        {!entries ? null : entries.length === 0 ? (
           <div
             className="rounded-xl p-8 text-center"
             style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}

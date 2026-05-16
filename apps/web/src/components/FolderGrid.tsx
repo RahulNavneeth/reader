@@ -15,6 +15,8 @@ import {
   Trash2,
   X,
   Star,
+  CheckSquare,
+  Square,
 } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
@@ -300,7 +302,7 @@ export function FolderGrid({
     <div ref={rootRef} className="h-full flex flex-col" style={{ background: 'var(--bg)' }}>
       <div
         data-grid-toolbar=""
-        className="flex items-center gap-2 px-3 h-11 border-b shrink-0"
+        className="flex items-center gap-2 px-3 min-h-11 py-1.5 border-b shrink-0 flex-wrap"
         style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
       >
         <PathBreadcrumb
@@ -341,11 +343,33 @@ export function FolderGrid({
           </span>
         )}
         <div className="flex-1" />
+        {/* Select-all toggle. Visible whenever there are items in the
+            current view, regardless of selection state. Filled square
+            when everything is already selected (click to clear),
+            empty square when partial / nothing (click to select all). */}
+        {items && items.length > 0 && showEditControls && (
+          <button
+            className="btn-ghost"
+            onClick={() => {
+              if (selection.size === items.length) setSelection(new Set())
+              else setSelection(new Set(items.map((n) => n.path)))
+            }}
+            title={
+              selection.size === items.length
+                ? 'Clear selection'
+                : `Select all ${items.length} item${items.length === 1 ? '' : 's'}`
+            }
+          >
+            {selection.size === items.length ? (
+              <CheckSquare size={13} className="text-accent" />
+            ) : (
+              <Square size={13} />
+            )}
+            {selection.size === items.length ? 'Selected' : 'Select all'}
+          </button>
+        )}
         {selection.size > 0 && showEditControls ? (
           <>
-            <span className="text-[11.5px] text-fg font-medium">
-              {selection.size} selected
-            </span>
             {/* Selection toolbar uses the same form + semantics as the
                 folder toolbar: label = current state count, Public
                 opens the revoke popover, Private opens the publish
@@ -565,12 +589,6 @@ export function FolderGrid({
       </div>
 
       <div className="flex-1 overflow-y-auto p-6">
-        {loading && !items && (
-          <div className="flex items-center justify-center h-full text-muted text-[12.5px]">
-            <Loader2 size={14} className="animate-spin mr-2" /> Loading…
-          </div>
-        )}
-
         {error && (
           <div className="px-2 py-4">
             <div className="flex items-center gap-2 text-fg font-semibold mb-1">

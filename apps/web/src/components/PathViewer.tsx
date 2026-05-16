@@ -221,7 +221,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
 
   return (
     <div className="h-full flex flex-col">
-      <header className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0" style={{ background: 'var(--panel-2)' }}>
+      <header className="min-h-11 px-3 py-1.5 flex items-center gap-2 border-b border-app shrink-0 flex-wrap overflow-x-auto" style={{ background: 'var(--panel-2)' }}>
         <PathBreadcrumb
           dir={parentDir}
           currentName={filename}

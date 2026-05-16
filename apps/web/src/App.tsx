@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FileText, Sun, Moon, Loader2, Search as SearchIcon, Upload, FolderPlus } from 'lucide-react'
+import { FileText, Sun, Moon, Loader2, Search as SearchIcon, Upload, FolderPlus, Menu } from 'lucide-react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
 import { ApiError, api, type PublicUser } from './lib/api'
 import { useTheme } from './hooks/useTheme'
@@ -69,9 +69,15 @@ export default function App() {
   const [vaultError, setVaultError] = useState<string | null>(null)
   const [pendingFiles, setPendingFiles] = useState<File[] | null>(null)
   const [currentFolder, setCurrentFolder] = useState<string>('')
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const location = useLocation()
+  // Auto-close the mobile drawer whenever the route changes — otherwise
+  // tapping a file in the sidebar leaves it covering the content.
+  useEffect(() => {
+    setMobileSidebarOpen(false)
+  }, [location.pathname])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -225,6 +231,8 @@ export default function App() {
         currentFolder,
         setCurrentFolder,
         currentUsername: auth.user.username,
+        mobileSidebarOpen,
+        setMobileSidebarOpen,
       }}
     >
       <div className="h-full flex flex-col surface">
@@ -232,21 +240,31 @@ export default function App() {
           className="h-12 flex items-center px-3 border-b border-app shrink-0"
           style={{ background: 'var(--panel-2)' }}
         >
-          {/* Three equal thirds: logo on the left, search dead-center,
-              uploads + theme + user on the right. Each section gets
-              w-1/3 so the search input stays anchored to the viewport
-              center regardless of the side widths. */}
-          <div className="w-1/3 flex items-center">
+          {/* Three sections: logo + (mobile-only) hamburger on the
+              left, search in the middle, actions on the right.
+              md+: equal thirds keep the search anchored to the
+              viewport center. Below md: search flexes to fill, logo
+              loses its label, hamburger appears. */}
+          <div className="flex items-center md:w-1/3 shrink-0">
+            <button
+              className="md:hidden inline-flex items-center justify-center w-8 h-8 rounded hover:bg-hover text-fg mr-1"
+              onClick={() => setMobileSidebarOpen(true)}
+              aria-label="Open navigation"
+            >
+              <Menu size={16} />
+            </button>
             <Link
               to="/"
               className="flex items-center gap-2 pl-1 pr-2 hover:bg-hover rounded transition-colors h-8"
             >
               <FileText size={16} className="text-accent" />
-              <span className="text-[13px] font-semibold tracking-tight text-fg">Reader</span>
+              <span className="hidden sm:inline text-[13px] font-semibold tracking-tight text-fg">
+                Reader
+              </span>
             </Link>
           </div>
 
-          <div className="w-1/3 flex items-center justify-center">
+          <div className="flex-1 md:w-1/3 flex items-center justify-center px-2">
             <div className="relative z-50 w-full max-w-[640px]">
               <SearchIcon
                 size={13}
@@ -318,7 +336,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="w-1/3 flex items-center justify-end gap-2">
+          <div className="shrink-0 md:w-1/3 flex items-center justify-end gap-2">
 
             <input
               ref={fileInputRef}

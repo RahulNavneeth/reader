@@ -31,8 +31,23 @@ import { loadSettings } from './stores/settings.js'
 import { startVaultWatcher } from './services/watcher.js'
 import { sweepExpiredTrash } from './stores/trash.js'
 import { migrateLegacyVault } from './services/migrate.js'
+import { createRateLimit } from './lib/rateLimit.js'
 
-async function main() {
+export type BuildAppOptions = {
+  /** Skip background timers + watchers + Ollama probe. Tests pass true
+   *  so the test suite doesn't keep the event loop alive. */
+  skipBackground?: boolean
+  /** Disable Pino logging — keeps test output clean. */
+  silent?: boolean
+}
+
+/**
+ * Construct (but do not listen on) a fully-wired Fastify instance.
+ * Extracted from `main()` so integration tests can call
+ * `await app.inject({ method, url, headers, payload })` without
+ * binding to a port.
+ */
+export async function buildApp(opts: BuildAppOptions = {}) {
   // Make sure all data subdirs exist before any store touches them.
   for (const p of Object.values(config.paths)) {
     if (p.endsWith('.json')) continue
@@ -45,16 +60,18 @@ async function main() {
   await ensureDir(config.vault.root)
 
   const app = Fastify({
-    logger: {
-      transport: {
-        target: 'pino-pretty',
-        options: {
-          translateTime: 'HH:MM:ss',
-          ignore: 'pid,hostname',
-          singleLine: true,
+    logger: opts.silent
+      ? false
+      : {
+          transport: {
+            target: 'pino-pretty',
+            options: {
+              translateTime: 'HH:MM:ss',
+              ignore: 'pid,hostname',
+              singleLine: true,
+            },
+          },
         },
-      },
-    },
     trustProxy: true,
   })
 
@@ -84,6 +101,81 @@ async function main() {
       cb(null, false)
     },
     credentials: true,
+  })
+
+  // Sensible default security headers. We don't pull in helmet — the
+  // small set we actually need is just a handful of static headers
+  // and helmet's defaults turn off too much (no embedded thumbnails,
+  // etc.). Admins behind a reverse proxy can override / extend at
+  // that layer. CSP is intentionally permissive on script-src because
+  // Vite-built bundles include inline JSON state; tightening it
+  // requires SRI/hashing the bundle.
+  // Single CSP applied to every HTML response. We can't fully lock
+  // down script-src because the Vite-built bundle ships inline JSON
+  // state; what we CAN do is keep network/font origins on a known
+  // allow-list. Tile maps come from OpenStreetMap, fonts from rsms.me
+  // (Inter), images can be data: (thumbs) and same-origin. Everything
+  // else is rejected.
+  const CSP = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://rsms.me",
+    "img-src 'self' data: blob: https://*.tile.openstreetmap.org",
+    "font-src 'self' https://rsms.me data:",
+    "connect-src 'self' https://*.tile.openstreetmap.org",
+    "media-src 'self' blob:",
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+  ].join('; ')
+
+  app.addHook('onSend', async (req, reply, payload) => {
+    reply.header('X-Content-Type-Options', 'nosniff')
+    reply.header('X-Frame-Options', 'DENY')
+    reply.header('Referrer-Policy', 'strict-origin-when-cross-origin')
+    reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+    // CSP only on HTML responses — JSON/file/SSE responses don't get
+    // executed in a document context, so the policy is irrelevant
+    // there and the header just wastes bytes.
+    const contentType = (reply.getHeader('content-type') as string | undefined) ?? ''
+    if (
+      contentType.startsWith('text/html') ||
+      (req.method === 'GET' && !req.url.startsWith('/api') && !req.url.startsWith('/mcp'))
+    ) {
+      reply.header('Content-Security-Policy', CSP)
+    }
+    if (isProdEnv) {
+      // 1 year HSTS — only emitted in prod, since dev runs over plain
+      // HTTP and an HSTS cookie would lock the admin out of localhost.
+      reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+    }
+    return payload
+  })
+
+  // Public-endpoint rate limit. Capacity 120 / refill 20 per second
+  // gives a legitimate user generous headroom (a folder of 100
+  // thumbnails loads fine) while choking sustained scrape traffic.
+  // Anonymous + authed callers both go through the same bucket —
+  // scoped per IP not per session so a token-spammer can't bypass
+  // by rotating cookies.
+  const publicLimit = createRateLimit({ capacity: 120, refillPerSecond: 20 })
+  const PUBLIC_PREFIXES = [
+    '/api/list',
+    '/api/resolve',
+    '/api/file/raw',
+    '/api/file/thumbnail',
+    '/api/file/preview',
+    '/api/file/text',
+  ]
+  app.addHook('onRequest', async (req, reply) => {
+    if (!PUBLIC_PREFIXES.some((p) => req.url.startsWith(p))) return
+    const r = publicLimit.check(req.ip)
+    if (!r.allowed) {
+      reply
+        .code(429)
+        .header('Retry-After', String(r.retryAfterSeconds))
+        .send({ error: 'too many requests', retryAfter: r.retryAfterSeconds })
+    }
   })
 
   // CSRF guard for cookie-authed state-changing requests. Browsers
@@ -168,57 +260,65 @@ async function main() {
     })
   }
 
-  // Best-effort: drop expired sessions on boot, then re-run hourly so
-  // orphaned files don't accumulate between restarts. (Used to only
-  // run at boot; long-running deployments leaked stale tokens on
-  // disk.)
-  const runSessionSweep = () =>
-    sweepExpired()
-      .then((n) => n > 0 && app.log.info({ removed: n }, 'session sweep'))
-      .catch((err) => app.log.warn({ err }, 'session sweep failed'))
-  runSessionSweep()
-  setInterval(runSessionSweep, 60 * 60 * 1000).unref()
+  if (!opts.skipBackground) {
+    // Best-effort: drop expired sessions on boot, then re-run hourly so
+    // orphaned files don't accumulate between restarts. (Used to only
+    // run at boot; long-running deployments leaked stale tokens on
+    // disk.)
+    const runSessionSweep = () =>
+      sweepExpired()
+        .then((n) => n > 0 && app.log.info({ removed: n }, 'session sweep'))
+        .catch((err) => app.log.warn({ err }, 'session sweep failed'))
+    runSessionSweep()
+    setInterval(runSessionSweep, 60 * 60 * 1000).unref()
 
-  // Purge trash older than the 30-day retention. Same pattern — hourly.
-  const runTrashSweep = () =>
-    sweepExpiredTrash()
-      .then((n) => n > 0 && app.log.info({ purged: n }, 'trash sweep'))
-      .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
-  runTrashSweep()
-  setInterval(runTrashSweep, 60 * 60 * 1000).unref()
+    // Purge trash older than the 30-day retention. Same pattern — hourly.
+    const runTrashSweep = () =>
+      sweepExpiredTrash()
+        .then((n) => n > 0 && app.log.info({ purged: n }, 'trash sweep'))
+        .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
+    runTrashSweep()
+    setInterval(runTrashSweep, 60 * 60 * 1000).unref()
 
-  // Auto-flip expired public links to private — file metas + folder
-  // metas both. Runs at boot and every minute so an owner who looks
-  // at a file just past its expiry sees it as private within a
-  // minute, not hours.
-  const runPublicExpirySweep = async () => {
-    try {
-      const files = await sweepExpiredPublic()
-      const folders = await sweepExpiredPublicFolders()
-      if (files + folders > 0) {
-        app.log.info({ files, folders }, 'public-expiry sweep flipped to private')
+    // Auto-flip expired public links to private — file metas + folder
+    // metas both. Runs at boot and every minute so an owner who looks
+    // at a file just past its expiry sees it as private within a
+    // minute, not hours.
+    const runPublicExpirySweep = async () => {
+      try {
+        const files = await sweepExpiredPublic()
+        const folders = await sweepExpiredPublicFolders()
+        if (files + folders > 0) {
+          app.log.info({ files, folders }, 'public-expiry sweep flipped to private')
+        }
+      } catch (err) {
+        app.log.warn({ err }, 'public-expiry sweep failed')
       }
-    } catch (err) {
-      app.log.warn({ err }, 'public-expiry sweep failed')
     }
+    runPublicExpirySweep()
+    setInterval(runPublicExpirySweep, 60 * 1000).unref()
+
+    // Warm the search cache; check Ollama presence (just informational).
+    preheat().catch(() => null)
+    ollamaUp()
+      .then((up) => app.log.info({ ollama: up ? 'reachable' : 'down', model: config.ollama.embedModel }, 'embed backend'))
+      .catch(() => null)
+
+    // Migrate the legacy single-vault layout into per-user namespaces. Idempotent
+    // (drops a marker after the first run) so subsequent boots are no-ops.
+    await migrateLegacyVault(app.log).catch((err) =>
+      app.log.warn({ err }, 'vault migration failed'),
+    )
+
+    // Watch the vault for external edits (Obsidian, vim, Finder) and re-ingest.
+    startVaultWatcher(app.log).catch((err) => app.log.warn({ err }, 'vault watcher start failed'))
   }
-  runPublicExpirySweep()
-  setInterval(runPublicExpirySweep, 60 * 1000).unref()
 
-  // Warm the search cache; check Ollama presence (just informational).
-  preheat().catch(() => null)
-  ollamaUp()
-    .then((up) => app.log.info({ ollama: up ? 'reachable' : 'down', model: config.ollama.embedModel }, 'embed backend'))
-    .catch(() => null)
+  return app
+}
 
-  // Migrate the legacy single-vault layout into per-user namespaces. Idempotent
-  // (drops a marker after the first run) so subsequent boots are no-ops.
-  await migrateLegacyVault(app.log).catch((err) =>
-    app.log.warn({ err }, 'vault migration failed'),
-  )
-
-  // Watch the vault for external edits (Obsidian, vim, Finder) and re-ingest.
-  startVaultWatcher(app.log).catch((err) => app.log.warn({ err }, 'vault watcher start failed'))
+async function main() {
+  const app = await buildApp()
 
   try {
     await app.listen({ host: config.server.host, port: config.server.port })
@@ -230,9 +330,34 @@ async function main() {
     app.log.error({ err }, 'failed to start')
     process.exit(1)
   }
+
+  // Graceful shutdown. Docker sends SIGTERM with a 10s grace period
+  // before SIGKILL; we let Fastify finish in-flight requests (uploads
+  // especially) and close the SSE / EventSource connections cleanly.
+  // The idempotent flag stops a double-signal (e.g. user mashes Ctrl-C)
+  // from racing the close handler.
+  let shuttingDown = false
+  const stop = async (signal: NodeJS.Signals) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    app.log.info({ signal }, 'shutting down')
+    try {
+      await app.close()
+      process.exit(0)
+    } catch (err) {
+      app.log.error({ err }, 'shutdown failed')
+      process.exit(1)
+    }
+  }
+  process.once('SIGTERM', () => void stop('SIGTERM'))
+  process.once('SIGINT', () => void stop('SIGINT'))
 }
 
-main().catch((err) => {
-  console.error('fatal:', err)
-  process.exit(1)
-})
+// Only run main() when this file is the process entry point — tests
+// import `buildApp` from here and should not also start the server.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    console.error('fatal:', err)
+    process.exit(1)
+  })
+}

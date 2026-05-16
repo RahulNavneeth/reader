@@ -11,7 +11,6 @@ import {
   Download,
   ChevronLeft,
   HardDrive,
-  Loader2,
   Lock,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
@@ -146,12 +145,6 @@ export function MountBrowser() {
       </header>
 
       <div className="flex-1 overflow-y-auto p-6">
-        {loading && (
-          <div className="flex items-center justify-center h-full text-muted text-[12.5px]">
-            <Loader2 size={14} className="animate-spin mr-2" /> Loading…
-          </div>
-        )}
-
         {error && (
           <div className="px-2 py-4">
             <div className="flex items-center gap-2 text-fg font-semibold mb-1">
