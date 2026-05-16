@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Copy,
   Plus,
@@ -169,7 +170,6 @@ function GeneralPanel() {
   const [dataDraft, setDataDraft] = useState('')
   const [savingPath, setSavingPath] = useState(false)
   const [savingData, setSavingData] = useState(false)
-  const [savingSignup, setSavingSignup] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [pathMsg, setPathMsg] = useState<string | null>(null)
   const [dataMsg, setDataMsg] = useState<string | null>(null)
@@ -286,19 +286,6 @@ function GeneralPanel() {
     folderInputRef.current?.click()
   }
 
-  const toggleSignup = async () => {
-    if (!settings) return
-    setSavingSignup(true)
-    setError(null)
-    try {
-      const r = await api.adminPatchSettings({ allowOpenSignup: !settings.allowOpenSignup })
-      setSettings(r.settings)
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setSavingSignup(false)
-    }
-  }
 
   if (error && !sys) return <ErrText text={error} />
   if (!sys || !settings) return <Muted text="Loading…" />
@@ -424,17 +411,6 @@ function GeneralPanel() {
             <strong>Existing data is not auto-migrated</strong> — move it manually before
             restarting.
           </Hint>
-        </div>
-      </Card>
-
-      <Card title="Sign-ups">
-        <div className="flex items-center gap-3">
-          <Toggle
-            checked={settings.allowOpenSignup}
-            disabled={savingSignup}
-            onChange={toggleSignup}
-          />
-          <span className="text-[12.5px] text-fg font-medium">Anyone can create an account</span>
         </div>
       </Card>
 
@@ -1156,6 +1132,8 @@ function AdvancedPanel() {
 
 function UsersPanel() {
   const [users, setUsers] = useState<PublicUser[] | null>(null)
+  const [settings, setSettings] = useState<WorkspaceSettings | null>(null)
+  const [savingSignup, setSavingSignup] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [newUsername, setNewUsername] = useState('')
@@ -1173,7 +1151,25 @@ function UsersPanel() {
 
   useEffect(() => {
     refresh()
+    api
+      .adminSettings()
+      .then((r) => setSettings(r.settings))
+      .catch(() => null)
   }, [])
+
+  const toggleSignup = async () => {
+    if (!settings) return
+    setSavingSignup(true)
+    setError(null)
+    try {
+      const r = await api.adminPatchSettings({ allowOpenSignup: !settings.allowOpenSignup })
+      setSettings(r.settings)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setSavingSignup(false)
+    }
+  }
 
   const create = async () => {
     if (!newUsername.trim() || newPassword.length < 8) return
@@ -1257,11 +1253,11 @@ function UsersPanel() {
       </div>
 
       {addOpen && (
-        <Modal title="Add user" onClose={() => setAddOpen(false)} width={680}>
-          <div className="grid grid-cols-[1fr_1fr_140px] gap-2">
+        <Modal title="Add user" onClose={() => setAddOpen(false)} width={420}>
+          <div className="space-y-2">
             <input
               className="input"
-              placeholder="username"
+              placeholder="Username"
               value={newUsername}
               onChange={(e) => setNewUsername(e.target.value)}
               autoFocus
@@ -1269,7 +1265,7 @@ function UsersPanel() {
             <input
               type="password"
               className="input"
-              placeholder="password (8+ chars)"
+              placeholder="Password (8+ chars)"
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && create()}
@@ -1284,16 +1280,14 @@ function UsersPanel() {
               <option value="admin">admin</option>
             </select>
           </div>
+          <div className="text-[11.5px] text-subtle mt-2.5">
+            Starts with an empty, isolated workspace.
+          </div>
           {error && (
             <div className="text-[12px] mt-2" style={{ color: '#BF2600' }}>
               {error}
             </div>
           )}
-          <Hint>
-            New users start with an empty, isolated workspace. They can create
-            and upload anything under their own vault; cross-user access is via
-            explicit shares.
-          </Hint>
           <div className="flex justify-end gap-2 mt-4">
             <button className="btn-ghost" onClick={() => setAddOpen(false)}>
               Cancel
@@ -1407,6 +1401,21 @@ function UsersPanel() {
           </table>
         </div>
       </div>
+
+      {settings && (
+        <Card title="Sign-ups">
+          <div className="flex items-center gap-3">
+            <Toggle
+              checked={settings.allowOpenSignup}
+              disabled={savingSignup}
+              onChange={toggleSignup}
+            />
+            <span className="text-[12.5px] text-fg font-medium">
+              Anyone can create an account
+            </span>
+          </div>
+        </Card>
+      )}
     </div>
   )
 }
@@ -2165,10 +2174,22 @@ function Modal({
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  return (
+  // Render into document.body so no ancestor (transform / overflow / etc.)
+  // can clip the backdrop. Explicit top/left/right/bottom guarantees full
+  // viewport coverage independent of Tailwind purging or stacking quirks.
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh] px-4"
-      style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+      className="flex items-start justify-center px-4"
+      style={{
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 100,
+        background: 'rgba(9, 30, 66, 0.42)',
+        paddingTop: '10vh',
+      }}
       onClick={onClose}
     >
       <div
@@ -2187,7 +2208,8 @@ function Modal({
         </div>
         <div className="overflow-y-auto p-4">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }
 

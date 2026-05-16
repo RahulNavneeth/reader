@@ -20,9 +20,13 @@ type Props = {
   onNavigate: (dir: string) => void
   /** Click on the back chevron. Disabled if omitted. */
   onBack?: () => void
+  /** When set, the breadcrumb is showing another user's vault (shared
+   *  context). The root crumb reads "Vault (<owner>)" so the recipient
+   *  immediately sees whose vault they're inside. */
+  ownerLabel?: string
 }
 
-export function PathBreadcrumb({ dir, currentName, currentAction, onNavigate, onBack }: Props) {
+export function PathBreadcrumb({ dir, currentName, currentAction, onNavigate, onBack, ownerLabel }: Props) {
   const parts = dir
     ? dir.split('/').filter(Boolean).map((name, idx, arr) => ({
         name,
@@ -46,9 +50,11 @@ export function PathBreadcrumb({ dir, currentName, currentAction, onNavigate, on
       <button
         className="text-[12.5px] font-medium hover:underline text-fg inline-flex items-center gap-1.5"
         onClick={() => onNavigate('')}
+        title={ownerLabel ? `${ownerLabel}'s vault` : 'Your vault'}
       >
         <Library size={13} className="text-accent" />
         Vault
+        {ownerLabel && <span>({ownerLabel})</span>}
       </button>
       {parts.map((p) => (
         <span key={p.path} className="flex items-center gap-1.5 min-w-0">

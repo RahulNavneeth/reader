@@ -11,6 +11,7 @@ import {
   FileCode,
 } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
+import { useVault } from '../lib/vault-context'
 import { ApiError, api } from '../lib/api'
 
 type Item = {
@@ -20,11 +21,14 @@ type Item = {
   docId: string
   tags: string[]
   public: boolean
+  owner: string
+  type: 'file' | 'dir'
 }
 
 export function TaggedFilesView() {
   const { tag = '' } = useParams()
   const navigate = useNavigate()
+  const { currentUsername } = useVault()
   const [items, setItems] = useState<Item[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -90,11 +94,16 @@ export function TaggedFilesView() {
           >
             {items.map((it) => (
               <TaggedTile
-                key={it.path}
+                key={`${it.owner}:${it.path}`}
                 item={it}
-                onOpen={() =>
-                  navigate('/docs/' + it.path.split('/').map(encodeURIComponent).join('/'))
-                }
+                onOpen={() => {
+                  const segs = it.path.split('/').map(encodeURIComponent).join('/')
+                  const suffix =
+                    it.owner && it.owner !== currentUsername
+                      ? `?owner=${encodeURIComponent(it.owner)}`
+                      : ''
+                  navigate(`/${segs}${suffix}`)
+                }}
               />
             ))}
           </div>

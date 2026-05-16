@@ -69,7 +69,7 @@ export async function adminRoutes(app: FastifyInstance) {
       .object({
         username: z.string().min(2).max(32),
         password: z.string().min(8).max(256),
-        role: roleSchema.default('viewer'),
+        role: roleSchema.default('editor'),
       })
       .parse(req.body)
     if (!isValidUsername(body.username)) {
@@ -449,7 +449,7 @@ export async function adminRoutes(app: FastifyInstance) {
     const body = z
       .object({
         name: z.string().min(1).max(64),
-        role: roleSchema.default('viewer'),
+        role: roleSchema.default('editor'),
       })
       .parse(req.body)
     const { secret, record } = await createToken({ name: body.name, role: body.role, createdBy: req.currentUser!.username })

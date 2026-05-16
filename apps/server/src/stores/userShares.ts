@@ -42,6 +42,28 @@ export async function createUserShare(opts: {
   label?: string
 }): Promise<UserShare> {
   await ensureDir(config.paths.userShares)
+  // De-dupe by (owner, recipient, storageKey). Without this the share
+  // popover happily makes a second record every time the user clicks
+  // Share with the same recipient, and the recipient's sidebar ends up
+  // with "cdsl" twice. Re-share updates the existing grant in-place
+  // (e.g. flipping canEdit) and returns it.
+  const all = await listAllUserShares()
+  const existing = all.find(
+    (s) =>
+      s.owner === opts.owner &&
+      s.recipient === opts.recipient &&
+      s.storageKey === opts.storageKey,
+  )
+  if (existing) {
+    const updated: UserShare = {
+      ...existing,
+      isFolder: opts.isFolder,
+      canEdit: opts.canEdit,
+      label: opts.label?.trim() || existing.label,
+    }
+    await writeFile(shareFile(updated.id), JSON.stringify(updated, null, 2), 'utf8')
+    return updated
+  }
   const share: UserShare = {
     id: nanoid(),
     owner: opts.owner,

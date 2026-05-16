@@ -42,6 +42,12 @@ import type { DocumentMeta } from '../types.js'
 import { resolveUserVault, userVaultRel, ensureUserVault, userVaultRoot } from '../lib/userVault.js'
 import { hashPassword as hashShareSecret, verifyPassword as verifySharePassword } from '../lib/sharePassword.js'
 import { findShareForPath } from '../stores/userShares.js'
+import {
+  freshFolderMeta,
+  getFolderMeta,
+  listFolderMetas,
+  saveFolderMeta,
+} from '../stores/folderMetas.js'
 
 // ─── path helpers ───────────────────────────────────────────────────────────
 
@@ -61,6 +67,79 @@ function resolveVault(rel: string | undefined, owner: string): string {
 
 function toVaultRel(abs: string, owner: string): string {
   return userVaultRel(owner, abs)
+}
+
+/**
+ * Walk a vault path and return every supported file beneath it, paths
+ * relative to the owner's vault root. If the input is a file, returns
+ * just that file; if a directory, walks recursively. Skips hidden entries.
+ */
+async function expandFilesUnder(owner: string, rel: string): Promise<string[]> {
+  const abs = resolveVault(rel, owner)
+  const s = await stat(abs).catch(() => null)
+  if (!s) return []
+  if (s.isFile()) return [rel]
+  if (!s.isDirectory()) return []
+  const out: string[] = []
+  async function walk(curAbs: string, curRel: string): Promise<void> {
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = await readdir(curAbs, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (shouldSkipName(e.name)) continue
+      const childAbs = path.join(curAbs, e.name)
+      const childRel = curRel ? `${curRel}/${e.name}` : e.name
+      if (e.isDirectory()) {
+        await walk(childAbs, childRel)
+      } else if (e.isFile()) {
+        const ext = path.extname(e.name).toLowerCase()
+        if (SUPPORTED_EXTS.has(ext)) out.push(childRel)
+      }
+    }
+  }
+  await walk(abs, rel.replace(/\/+$/, ''))
+  return out
+}
+
+/**
+ * Walk a folder and return every supported file AND subfolder beneath it,
+ * paths relative to the owner's vault root. Used by folder-level visibility
+ * so we can flip both the file metas and the per-folder metas in one pass.
+ */
+async function expandTreeUnder(
+  owner: string,
+  rel: string,
+): Promise<{ files: string[]; folders: string[] }> {
+  const abs = resolveVault(rel, owner)
+  const s = await stat(abs).catch(() => null)
+  if (!s || !s.isDirectory()) return { files: [], folders: [] }
+  const files: string[] = []
+  const folders: string[] = []
+  async function walk(curAbs: string, curRel: string): Promise<void> {
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = await readdir(curAbs, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (shouldSkipName(e.name)) continue
+      const childAbs = path.join(curAbs, e.name)
+      const childRel = curRel ? `${curRel}/${e.name}` : e.name
+      if (e.isDirectory()) {
+        folders.push(childRel)
+        await walk(childAbs, childRel)
+      } else if (e.isFile()) {
+        const ext = path.extname(e.name).toLowerCase()
+        if (SUPPORTED_EXTS.has(ext)) files.push(childRel)
+      }
+    }
+  }
+  await walk(abs, rel.replace(/\/+$/, ''))
+  return { files, folders }
 }
 
 /** Strip the password hash before sending meta to a client. */
@@ -84,6 +163,29 @@ function redactPublicMeta(meta: DocumentMeta): DocumentMeta {
  * Returns `{ meta, owner, sharedGrant }` where `sharedGrant` carries the
  * canEdit flag when this is a cross-user shared access.
  */
+/** True when `meta` is reachable via a user-share grant that the recipient
+ *  holds — checks direct grants AND folder-ancestor grants. Used by the
+ *  read endpoints that go through doc lists (tags, search, by-tag)
+ *  rather than path-based resolveReadContext. */
+async function isReadableViaShares(
+  meta: DocumentMeta,
+  recipient: string,
+  shares: import('../stores/userShares.js').UserShare[],
+): Promise<boolean> {
+  if (meta.owner === recipient) return true
+  const target = meta.storageKey.replace(/^\/+|\/+$/g, '')
+  for (const s of shares) {
+    if (s.owner !== meta.owner) continue
+    const sk = s.storageKey.replace(/^\/+|\/+$/g, '')
+    if (s.isFolder) {
+      if (sk === '' || target === sk || target.startsWith(sk + '/')) return true
+    } else if (target === sk) {
+      return true
+    }
+  }
+  return false
+}
+
 async function resolveReadContext(opts: {
   rel: string
   ownerHint?: string
@@ -103,7 +205,12 @@ async function resolveReadContext(opts: {
     return { meta, owner: ownerHint, sharedGrant: { canEdit: grant.canEdit } }
   }
 
-  const own = docs.find((d) => d.storageKey === rel && d.owner === requester)
+  // Concurrent stub-creation (auto-ingest + visibility) can leave two doc
+  // records pointing at the same (owner, storageKey). Prefer the public
+  // one so a freshly-published file doesn't read back as private just
+  // because the parallel ingest record happens to sort first.
+  const owned = docs.filter((d) => d.storageKey === rel && d.owner === requester)
+  const own = owned.find((d) => d.public) ?? owned[0]
   const pub = docs.find((d) => d.storageKey === rel && d.public)
   const meta = own ?? pub ?? null
   const owner = meta?.owner ?? requester ?? null
@@ -177,6 +284,7 @@ type TreeNode = {
   ingestStatus?: string
   embedded?: boolean
   public?: boolean
+  publicExpiresAt?: number | null
   tags?: string[]
 }
 
@@ -340,12 +448,171 @@ export async function vaultRoutes(app: FastifyInstance) {
 
   // ---- list -----------------------------------------------------------------
 
+  // ---- resolve ------------------------------------------------------------
+  //
+  // Single lookup that tells the client whether `<path>` is a file or a
+  // folder, and whether it's accessible. The web router uses this to
+  // dispatch bare paths (no /docs or /folder prefix) to the right viewer
+  // without the user having to remember which one to use.
+  app.get('/api/resolve', async (req, reply) => {
+    const { path: rel = '', owner: ownerHint, p: providedPassword } =
+      req.query as { path?: string; owner?: string; p?: string }
+    const requester = req.currentUser?.username
+
+    // Resolve owner: prefer authed user; for anonymous, try to find a
+    // public file or folder with this path so the share URL "just works"
+    // without the recipient knowing whose vault it lives in.
+    const candidateOwners: string[] = []
+    if (requester) candidateOwners.push(requester)
+    if (ownerHint && !candidateOwners.includes(ownerHint)) candidateOwners.push(ownerHint)
+
+    for (const owner of candidateOwners) {
+      const abs = resolveVault(rel, owner)
+      const s = await stat(abs).catch(() => null)
+      if (!s) continue
+      // Cross-owner access path: a user-share grant on this path (or any
+      // ancestor folder) counts as access too. The client gets back
+      // canEdit so it can hide owner-only controls (Tags/Activity/etc.)
+      // for read-only shares.
+      const grant =
+        requester && owner !== requester
+          ? await findShareForPath(requester, owner, rel)
+          : null
+      const access: {
+        ownedByRequester: boolean
+        sharedReadOnly: boolean
+        sharedEdit: boolean
+      } = {
+        ownedByRequester: owner === requester,
+        sharedReadOnly: !!grant && !grant.canEdit,
+        sharedEdit: !!grant && grant.canEdit,
+      }
+      if (s.isFile()) {
+        const docs = await listAllDocuments()
+        const meta = docs.find((d) => d.storageKey === rel && d.owner === owner) ?? null
+        if (owner === requester || grant || (meta && meta.public)) {
+          return { kind: 'file', owner, public: !!meta?.public, access }
+        }
+      } else if (s.isDirectory()) {
+        const fm = await getFolderMeta(owner, rel)
+        if (owner === requester || grant || fm?.public) {
+          return { kind: 'folder', owner, public: !!fm?.public, access }
+        }
+      }
+    }
+
+    // Anonymous fallthrough: scan everything for a public match.
+    if (!requester) {
+      const docs = await listAllDocuments()
+      const pubFile = docs.find((d) => d.storageKey === rel && d.public)
+      if (pubFile) {
+        const gate = publicGate(pubFile, providedPassword)
+        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+        if (gate === 'password-required' || gate === 'password-wrong') {
+          return reply
+            .code(401)
+            .send({
+              error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+              passwordRequired: true,
+            })
+        }
+        if (gate === 'ok')
+          return {
+            kind: 'file',
+            owner: pubFile.owner,
+            public: true,
+            access: { ownedByRequester: false, sharedReadOnly: false, sharedEdit: false },
+          }
+      }
+      const allFolders = await listFolderMetas()
+      const pubFolder = allFolders.find((m) => m.storageKey === rel && m.public)
+      if (pubFolder) {
+        const gate = publicGate(pubFolder, providedPassword)
+        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+        if (gate === 'password-required' || gate === 'password-wrong') {
+          return reply
+            .code(401)
+            .send({
+              error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+              passwordRequired: true,
+            })
+        }
+        if (gate === 'ok')
+          return {
+            kind: 'folder',
+            owner: pubFolder.owner,
+            public: true,
+            access: { ownedByRequester: false, sharedReadOnly: false, sharedEdit: false },
+          }
+      }
+    }
+    return reply.code(404).send({ error: 'not found' })
+  })
+
   app.get('/api/list', async (req, reply) => {
-    if (!requireAuth(req, reply)) return
-    const user = req.currentUser!
-    const { path: rel = '' } = req.query as { path?: string }
-    await ensureUserVault(user.username).catch(() => null)
-    const dir = resolveVault(rel, user.username)
+    const { path: rel = '', owner: ownerHint, p: providedPassword } =
+      req.query as { path?: string; owner?: string; p?: string }
+    const requester = req.currentUser?.username
+    // Anonymous (or cross-owner) calls are allowed iff the folder is public
+    // and the gate passes. We also accept the case where the requester is a
+    // share-recipient with a grant on this folder (or any ancestor).
+    let owner: string
+    let anonymous = false
+    if (ownerHint && ownerHint !== requester) {
+      const fm = await getFolderMeta(ownerHint, rel)
+      const gate = publicGate(fm, providedPassword)
+      if (gate === 'ok') {
+        owner = ownerHint
+        anonymous = !requester
+      } else if (requester && (await findShareForPath(requester, ownerHint, rel))) {
+        owner = ownerHint
+      } else {
+        if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+        if (gate === 'password-required' || gate === 'password-wrong') {
+          return reply
+            .code(401)
+            .send({
+              error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+              passwordRequired: true,
+            })
+        }
+        return reply.code(403).send({ error: 'forbidden' })
+      }
+    } else if (!requester) {
+      // Anonymous without an owner hint — same UX files get: scan for any
+      // public folder with this path, gate-check, use that owner.
+      const all = await listFolderMetas()
+      const candidates = all.filter((m) => m.storageKey === rel && m.public)
+      let pick: typeof candidates[number] | null = null
+      let lastGate: ReturnType<typeof publicGate> = 'not-public'
+      for (const c of candidates) {
+        const g = publicGate(c, providedPassword)
+        lastGate = g
+        if (g === 'ok') {
+          pick = c
+          break
+        }
+      }
+      if (!pick) {
+        if (lastGate === 'expired') return reply.code(410).send({ error: 'link expired' })
+        if (lastGate === 'password-required' || lastGate === 'password-wrong') {
+          return reply
+            .code(401)
+            .send({
+              error: lastGate === 'password-wrong' ? 'incorrect password' : 'password required',
+              passwordRequired: true,
+            })
+        }
+        return reply.code(401).send({ error: 'auth required' })
+      }
+      owner = pick.owner
+      anonymous = true
+    } else {
+      if (!requireAuth(req, reply)) return
+      owner = req.currentUser!.username
+    }
+    if (!anonymous) await ensureUserVault(owner).catch(() => null)
+    const dir = resolveVault(rel, owner)
 
     let entries: import('node:fs').Dirent[]
     try {
@@ -356,21 +623,70 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
 
     // Build a map of vault-rel path → indexed-doc meta (scoped to files this
-    // user owns) so we can decorate the tree with index status.
+    // user owns) so we can decorate the tree with index status. When two
+    // doc records happen to share the same (owner, storageKey) — which can
+    // happen if a "Make public" click races with an auto-ingest that hadn't
+    // saved its seed yet, leaving two `nanoid()`s for the same file — merge
+    // them: keep `public`/expiry/password from whichever record set them,
+    // and the readiest ingest record for everything else.
     const docs = await listAllDocuments()
     const indexedByPath = new Map<string, DocumentMeta>()
     for (const d of docs) {
-      if (d.owner !== user.username) continue
-      if (d.storageKey) indexedByPath.set(d.storageKey, d)
+      if (d.owner !== owner) continue
+      if (!d.storageKey) continue
+      const existing = indexedByPath.get(d.storageKey)
+      if (!existing) {
+        indexedByPath.set(d.storageKey, d)
+        continue
+      }
+      const existingTags = existing.tags ?? []
+      const dTags = d.tags ?? []
+      const existingEmbedded = existing.ingest?.embedded ?? false
+      const dEmbedded = d.ingest?.embedded ?? false
+      const merged: DocumentMeta = {
+        ...existing,
+        public: existing.public || d.public,
+        publicExpiresAt: existing.publicExpiresAt ?? d.publicExpiresAt,
+        publicPasswordHash: existing.publicPasswordHash ?? d.publicPasswordHash,
+        tags: existingTags.length ? existingTags : dTags,
+      }
+      // Prefer whichever record actually has the ingest done. Critical
+      // for the sidebar sparkle on shared content — without this the
+      // newest (often a stub) wins and the embedded flag silently
+      // drops to false on the listing response.
+      if (dEmbedded && !existingEmbedded) {
+        merged.id = d.id
+        merged.ingest = d.ingest
+        merged.sha256 = d.sha256 || existing.sha256
+      } else if (existingEmbedded) {
+        merged.ingest = existing.ingest
+      } else if (d.ingest && !existing.ingest) {
+        merged.ingest = d.ingest
+      }
+      indexedByPath.set(d.storageKey, merged)
     }
+
+    // Per-folder visibility comes from the FolderMeta store (folders aren't
+    // documents, so they have their own little JSON-per-folder backend).
+    const folderMetas = await listFolderMetas(owner)
+    const folderByPath = new Map(folderMetas.map((m) => [m.storageKey, m]))
 
     const items: TreeNode[] = []
     for (const e of entries) {
       if (shouldSkipName(e.name)) continue
       const abs = path.join(dir, e.name)
-      const childRel = toVaultRel(abs, user.username)
+      const childRel = toVaultRel(abs, owner)
       if (e.isDirectory()) {
-        items.push({ name: e.name, path: childRel, type: 'dir', hasChildren: true })
+        const fm = folderByPath.get(childRel)
+        items.push({
+          name: e.name,
+          path: childRel,
+          type: 'dir',
+          hasChildren: true,
+          public: fm?.public ?? false,
+          publicExpiresAt: fm?.publicExpiresAt ?? null,
+          tags: fm?.tags ?? [],
+        })
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase()
         if (!SUPPORTED_EXTS.has(ext)) continue
@@ -389,18 +705,24 @@ export async function vaultRoutes(app: FastifyInstance) {
           size,
           mtime,
           docId: indexed?.id,
-          ingestStatus: indexed?.ingest.status,
-          embedded: indexed?.ingest.embedded,
+          ingestStatus: indexed?.ingest?.status,
+          embedded: indexed?.ingest?.embedded ?? false,
           public: indexed?.public ?? false,
+          publicExpiresAt: indexed?.publicExpiresAt ?? null,
           tags: indexed?.tags ?? [],
         })
       }
     }
-    items.sort((a, b) => {
+    // For anonymous viewers, redact items that aren't individually
+    // public — a user can publish a folder and then privately revoke a
+    // child, and that child shouldn't be visible (or even discoverable)
+    // through the parent's public link.
+    const visibleItems = anonymous ? items.filter((it) => it.public) : items
+    visibleItems.sort((a, b) => {
       if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
       return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
     })
-    return { path: rel, items }
+    return { path: rel, items: visibleItems }
   })
 
   // ---- read -----------------------------------------------------------------
@@ -427,7 +749,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
-      if (meta && !userCanRead(meta, u.username, u.role)) {
+      if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
@@ -472,6 +794,8 @@ export async function vaultRoutes(app: FastifyInstance) {
               owner: existing?.owner ?? u.username,
               acl: existing?.acl ?? { readers: [], editors: [] },
               public: existing?.public,
+              publicExpiresAt: existing?.publicExpiresAt ?? null,
+              publicPasswordHash: existing?.publicPasswordHash ?? null,
               tags: existing?.tags ?? [],
               createdAt: existing?.createdAt ?? Date.now(),
               updatedAt: Date.now(),
@@ -514,7 +838,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
-      if (meta && !userCanRead(meta, u.username, u.role)) {
+      if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
@@ -582,7 +906,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
-      if (meta && !userCanRead(meta, u.username, u.role)) {
+      if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
@@ -653,7 +977,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (gate !== 'ok') {
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
-      if (meta && !userCanRead(meta, u.username, u.role)) {
+      if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
     }
@@ -799,6 +1123,11 @@ export async function vaultRoutes(app: FastifyInstance) {
       storageKey: rel,
       owner: existing?.owner ?? user.username,
       acl: existing?.acl ?? { readers: [], editors: [] },
+      // Preserve user-set visibility state across re-index — otherwise
+      // hitting "Index" on a public file silently flips it back to private.
+      public: existing?.public,
+      publicExpiresAt: existing?.publicExpiresAt ?? null,
+      publicPasswordHash: existing?.publicPasswordHash ?? null,
       tags: existing?.tags ?? [],
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -919,14 +1248,70 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
-    const body = req.body as { paths?: string[]; public?: boolean }
+    const body = req.body as {
+      paths?: string[]
+      public?: boolean
+      expiresInSeconds?: number | null
+      password?: string | null
+    }
     if (!Array.isArray(body?.paths) || typeof body.public !== 'boolean') {
       return reply.code(400).send({ error: 'paths[] and public required' })
     }
+    // Pre-compute the share-config once per request so all selected files
+    // land with identical expiry + password (single hash) — much faster than
+    // hashing per-file and matches what the single-file endpoint does.
+    const expiresAt =
+      !body.public || body.expiresInSeconds === null || body.expiresInSeconds === undefined
+        ? null
+        : Date.now() + Math.max(60, Math.floor(body.expiresInSeconds)) * 1000
+    const passwordHash =
+      !body.public || !body.password ? null : hashShareSecret(body.password)
+    // Expand each input path. Files map to themselves; folders fan out
+    // into every supported file beneath them AND every sub-folder so we
+    // can update the per-folder meta too (otherwise the folder tile
+    // never picks up the public state). The same expiry/password gets
+    // applied across the whole subtree.
     const docs = await listAllDocuments()
+    const seenFiles = new Set<string>()
+    const seenFolders = new Set<string>()
+    const fileRels: string[] = []
+    const folderRels: string[] = []
+    for (const inputRel of body.paths) {
+      try {
+        const abs = resolveVault(inputRel, user.username)
+        const s = await stat(abs).catch(() => null)
+        if (s?.isFile()) {
+          if (!seenFiles.has(inputRel)) {
+            seenFiles.add(inputRel)
+            fileRels.push(inputRel)
+          }
+          continue
+        }
+        if (!s?.isDirectory()) continue
+        if (!seenFolders.has(inputRel)) {
+          seenFolders.add(inputRel)
+          folderRels.push(inputRel)
+        }
+        const tree = await expandTreeUnder(user.username, inputRel)
+        for (const r of tree.files) {
+          if (!seenFiles.has(r)) {
+            seenFiles.add(r)
+            fileRels.push(r)
+          }
+        }
+        for (const r of tree.folders) {
+          if (!seenFolders.has(r)) {
+            seenFolders.add(r)
+            folderRels.push(r)
+          }
+        }
+      } catch {
+        /* skip unresolved input */
+      }
+    }
     let ok = 0
     let failed = 0
-    for (const rel of body.paths) {
+    for (const rel of fileRels) {
       try {
         const abs = resolveVault(rel, user.username)
         const s = await stat(abs).catch(() => null)
@@ -957,20 +1342,55 @@ export async function vaultRoutes(app: FastifyInstance) {
           failed++
           continue
         }
-        const next: DocumentMeta = { ...meta, public: body.public, updatedAt: Date.now() }
+        const next: DocumentMeta = {
+          ...meta,
+          public: body.public,
+          publicExpiresAt: body.public ? expiresAt : null,
+          publicPasswordHash: body.public ? passwordHash : null,
+          updatedAt: Date.now(),
+        }
         await saveMeta(next)
         ok++
       } catch {
         failed++
       }
     }
+    // Folder metas — both the selected folders and every sub-folder
+    // discovered while walking. Without this the folder tile keeps
+    // reading as private even though its contents are public.
+    const now = Date.now()
+    for (const folderRel of folderRels) {
+      try {
+        const existing = await getFolderMeta(user.username, folderRel)
+        await saveFolderMeta({
+          ...(existing ?? freshFolderMeta(user.username, folderRel)),
+          owner: user.username,
+          storageKey: folderRel,
+          public: body.public,
+          publicExpiresAt: body.public ? expiresAt : null,
+          publicPasswordHash: body.public ? passwordHash : null,
+          updatedAt: now,
+        })
+      } catch {
+        /* skip; file cascade already succeeded */
+      }
+    }
     invalidateSearchCache()
     await audit({
       actor: user.username,
       action: 'vault.bulk-visibility',
-      meta: { count: body.paths.length, public: body.public, ok, failed },
+      meta: {
+        inputs: body.paths.length,
+        files: fileRels.length,
+        folders: folderRels.length,
+        public: body.public,
+        hasPassword: !!passwordHash,
+        expiresAt,
+        ok,
+        failed,
+      },
     })
-    return { ok, failed }
+    return { ok, failed, folders: folderRels.length }
   })
 
   app.post('/api/file/bulk-delete', async (req, reply) => {
@@ -981,10 +1401,32 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!Array.isArray(body?.paths)) {
       return reply.code(400).send({ error: 'paths[] required' })
     }
+    // Expand folder paths into their files. Each file is sent to trash one
+    // at a time; the empty directory shell is removed afterwards.
     const docs = await listAllDocuments()
+    const seen = new Set<string>()
+    const fileRels: string[] = []
+    const folderRels: string[] = []
+    for (const inputRel of body.paths) {
+      try {
+        const abs = resolveVault(inputRel, user.username)
+        const st = await stat(abs).catch(() => null)
+        if (!st) continue
+        if (st.isDirectory()) folderRels.push(inputRel)
+        const expanded = await expandFilesUnder(user.username, inputRel)
+        for (const r of expanded) {
+          if (!seen.has(r)) {
+            seen.add(r)
+            fileRels.push(r)
+          }
+        }
+      } catch {
+        /* skip */
+      }
+    }
     let ok = 0
     let failed = 0
-    for (const rel of body.paths) {
+    for (const rel of fileRels) {
       try {
         const abs = resolveVault(rel, user.username)
         const meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
@@ -1008,11 +1450,21 @@ export async function vaultRoutes(app: FastifyInstance) {
         failed++
       }
     }
+    // Now sweep the now-empty folder shells. Sort by depth descending so
+    // children get removed before parents.
+    folderRels.sort((a, b) => b.split('/').length - a.split('/').length)
+    for (const rel of folderRels) {
+      try {
+        await rm(resolveVault(rel, user.username), { recursive: true, force: true })
+      } catch {
+        /* ignore */
+      }
+    }
     invalidateSearchCache()
     await audit({
       actor: user.username,
       action: 'vault.bulk-trash',
-      meta: { count: body.paths.length, ok, failed },
+      meta: { inputs: body.paths.length, files: fileRels.length, folders: folderRels.length, ok, failed },
     })
     return { ok, failed }
   })
@@ -1088,15 +1540,21 @@ export async function vaultRoutes(app: FastifyInstance) {
       }
       if (!requireAuth(req, reply)) return
       const u = req.currentUser!
-      if (!userCanRead(meta, u.username, u.role)) {
+      // A share grant from resolveReadContext above already proves read
+      // access — userCanRead only knows about owner + ACL, not shares,
+      // so it would 403 otherwise.
+      if (!ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
       return { meta: safe }
     }
-    // No persisted meta — synthesize a stub if the file exists in the user's vault.
+    // No persisted meta — synthesize a stub if the file exists. Look it
+    // up under the resolved owner (which might be a share owner, not
+    // the caller) so shared files without a doc record still surface.
     if (!requireAuth(req, reply)) return
     const u = req.currentUser!
-    const abs = resolveVault(rel, u.username)
+    const lookupOwner = ctx.owner ?? u.username
+    const abs = resolveVault(rel, lookupOwner)
     const s = await stat(abs).catch(() => null)
     if (!s || !s.isFile()) return { meta: null }
     const filename = path.basename(abs)
@@ -1268,6 +1726,266 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { document: next }
   })
 
+  // ---- folders ------------------------------------------------------------
+  //
+  // Folders aren't documents — they're just directories on disk — but the UI
+  // wants the same affordances files have: tags, public link, activity. We
+  // store per-folder metadata in `folderMetas` (one JSON per folder) and
+  // cascade visibility changes down the subtree so a single "Make public"
+  // click on a folder publishes every file and sub-folder inside it with
+  // one shared expiry/password.
+
+  app.get('/api/folder/meta', async (req, reply) => {
+    const { path: rel, p: providedPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
+    if (typeof rel !== 'string') return reply.code(400).send({ error: 'missing path' })
+    const requester = req.currentUser?.username
+    let owner = ownerHint || requester
+    let fm = owner ? await getFolderMeta(owner, rel) : null
+    // Anonymous + no hint: scan for any public folder with this path. Matches
+    // how the file-side resolves a public URL without needing ?owner=.
+    if (!owner && !requester) {
+      const all = await listFolderMetas()
+      const candidates = all.filter((m) => m.storageKey === rel && m.public)
+      let lastGate: ReturnType<typeof publicGate> = 'not-public'
+      for (const c of candidates) {
+        const g = publicGate(c, providedPassword)
+        lastGate = g
+        if (g === 'ok') {
+          owner = c.owner
+          fm = c
+          break
+        }
+      }
+      if (!owner) {
+        if (lastGate === 'expired') return reply.code(410).send({ error: 'link expired' })
+        if (lastGate === 'password-required' || lastGate === 'password-wrong') {
+          return reply
+            .code(401)
+            .send({
+              error: lastGate === 'password-wrong' ? 'incorrect password' : 'password required',
+              passwordRequired: true,
+            })
+        }
+        return reply.code(401).send({ error: 'auth required' })
+      }
+    }
+    if (!owner) return reply.code(401).send({ error: 'auth required' })
+    if (owner !== requester) {
+      const gate = publicGate(fm, providedPassword)
+      if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+      if (gate === 'password-required' || gate === 'password-wrong') {
+        return reply
+          .code(401)
+          .send({
+            error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+            passwordRequired: true,
+          })
+      }
+      if (gate !== 'ok') return reply.code(403).send({ error: 'forbidden' })
+    }
+    const abs = resolveVault(rel, owner)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isDirectory()) return reply.code(404).send({ error: 'folder not found' })
+    const meta = fm ?? freshFolderMeta(owner, rel)
+    const { publicPasswordHash, ...safe } = meta
+    return { folder: { ...safe, owner, hasPassword: !!publicPasswordHash } }
+  })
+
+  app.post('/api/folder/visibility', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as {
+      path?: string
+      public?: boolean
+      expiresInSeconds?: number | null
+      password?: string | null
+    }
+    if (typeof body?.path !== 'string') return reply.code(400).send({ error: 'missing path' })
+    if (typeof body.public !== 'boolean') return reply.code(400).send({ error: 'missing public flag' })
+    const abs = resolveVault(body.path, user.username)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isDirectory()) return reply.code(404).send({ error: 'folder not found' })
+
+    const now = Date.now()
+    const expiresAt =
+      !body.public || body.expiresInSeconds === null || body.expiresInSeconds === undefined
+        ? null
+        : now + Math.max(60, Math.floor(body.expiresInSeconds)) * 1000
+    const passwordHash =
+      !body.public || !body.password ? null : hashShareSecret(body.password)
+
+    // Own folder meta first — even if the cascade fails halfway, the folder
+    // itself reflects the user's intent.
+    const existing = await getFolderMeta(user.username, body.path)
+    const folderMeta = {
+      ...(existing ?? freshFolderMeta(user.username, body.path)),
+      owner: user.username,
+      storageKey: body.path,
+      public: body.public,
+      publicExpiresAt: body.public ? expiresAt : null,
+      publicPasswordHash: body.public ? passwordHash : null,
+      updatedAt: now,
+    }
+    await saveFolderMeta(folderMeta)
+
+    // Cascade.
+    const { files, folders } = await expandTreeUnder(user.username, body.path)
+    const docs = await listAllDocuments()
+    let okFiles = 0
+    let failedFiles = 0
+    for (const fileRel of files) {
+      try {
+        let meta = docs.find((d) => d.storageKey === fileRel && d.owner === user.username)
+        if (!meta) {
+          const fAbs = resolveVault(fileRel, user.username)
+          const fStat = await stat(fAbs).catch(() => null)
+          if (!fStat?.isFile()) {
+            failedFiles++
+            continue
+          }
+          const filename = path.basename(fAbs)
+          meta = {
+            id: nanoid(),
+            title: filename.replace(/\.[^.]+$/, ''),
+            originalFilename: filename,
+            mime: inferMime(filename),
+            bytes: fStat.size,
+            sha256: '',
+            storageKey: fileRel,
+            owner: user.username,
+            acl: { readers: [], editors: [] },
+            tags: [],
+            createdAt: now,
+            updatedAt: now,
+            ingest: { status: 'pending', embedded: false },
+          }
+        } else if (!userCanEdit(meta, user.username, user.role)) {
+          failedFiles++
+          continue
+        }
+        const next: DocumentMeta = {
+          ...meta,
+          public: body.public,
+          publicExpiresAt: body.public ? expiresAt : null,
+          publicPasswordHash: body.public ? passwordHash : null,
+          updatedAt: now,
+        }
+        await saveMeta(next)
+        // Per-item audit so the file's own activity log reflects the
+        // cascade — without this, opening a file's activity would never
+        // explain why it suddenly went public/private.
+        await audit({
+          actor: user.username,
+          action: 'vault.visibility',
+          target: fileRel,
+          meta: {
+            public: body.public,
+            hasPassword: !!passwordHash,
+            expiresAt,
+            cascadedFrom: body.path,
+          },
+        })
+        okFiles++
+      } catch {
+        failedFiles++
+      }
+    }
+    for (const subRel of folders) {
+      const sub = await getFolderMeta(user.username, subRel)
+      await saveFolderMeta({
+        ...(sub ?? freshFolderMeta(user.username, subRel)),
+        owner: user.username,
+        storageKey: subRel,
+        public: body.public,
+        publicExpiresAt: body.public ? expiresAt : null,
+        publicPasswordHash: body.public ? passwordHash : null,
+        updatedAt: now,
+      })
+      await audit({
+        actor: user.username,
+        action: 'vault.folder-visibility',
+        target: subRel,
+        meta: {
+          public: body.public,
+          hasPassword: !!passwordHash,
+          expiresAt,
+          cascadedFrom: body.path,
+        },
+      })
+    }
+    invalidateSearchCache()
+    publish({ type: 'visibility', path: body.path, public: body.public })
+    await audit({
+      actor: user.username,
+      action: 'vault.folder-visibility',
+      target: body.path,
+      meta: {
+        public: body.public,
+        files: okFiles,
+        failedFiles,
+        folders: folders.length,
+        hasPassword: !!passwordHash,
+        expiresAt,
+      },
+    })
+    const { publicPasswordHash: _drop, ...safe } = folderMeta
+    return {
+      folder: { ...safe, hasPassword: !!passwordHash },
+      cascade: { files: okFiles, folders: folders.length, failedFiles },
+    }
+  })
+
+  app.post('/api/folder/tags', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { path?: string; tags?: unknown }
+    if (typeof body?.path !== 'string') return reply.code(400).send({ error: 'missing path' })
+    if (!Array.isArray(body.tags)) return reply.code(400).send({ error: 'tags must be array' })
+    const tags = Array.from(
+      new Set(
+        body.tags
+          .map((t) => (typeof t === 'string' ? t.trim().toLowerCase() : ''))
+          .filter((t) => t.length > 0 && t.length <= 40),
+      ),
+    ).sort()
+    const abs = resolveVault(body.path, user.username)
+    const s = await stat(abs).catch(() => null)
+    if (!s || !s.isDirectory()) return reply.code(404).send({ error: 'folder not found' })
+    const existing = await getFolderMeta(user.username, body.path)
+    const next = {
+      ...(existing ?? freshFolderMeta(user.username, body.path)),
+      tags,
+      updatedAt: Date.now(),
+    }
+    await saveFolderMeta(next)
+    await audit({
+      actor: user.username,
+      action: 'vault.folder-tags',
+      target: body.path,
+      meta: { tags },
+    })
+    const { publicPasswordHash, ...safe } = next
+    return { folder: { ...safe, hasPassword: !!publicPasswordHash } }
+  })
+
+  app.get('/api/folder/activity', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const { path: rel, limit } = req.query as { path?: string; limit?: string }
+    if (typeof rel !== 'string') return reply.code(400).send({ error: 'missing path' })
+    const { listAudit } = await import('../stores/audit.js')
+    // listAudit can only filter by exact target. For folders we want every
+    // event under the prefix, so pull a wider window and filter here.
+    const all = await listAudit({ limit: Math.min(Number(limit) || 200, 1000) })
+    const prefix = rel ? `${rel}/` : ''
+    const entries = all.filter(
+      (e) => e.target === rel || (typeof e.target === 'string' && e.target.startsWith(prefix)),
+    )
+    return { entries: entries.slice(0, Math.min(Number(limit) || 50, 200)) }
+  })
+
   // Version history: list snapshots taken by the watcher whenever the file's
   // content changed on disk.
   app.get('/api/file/versions', async (req, reply) => {
@@ -1331,10 +2049,42 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
     const docs = await listAllDocuments()
+    // Pull share-grants too — a tag on alice's shared file or folder
+    // should show up in bob's sidebar so he can filter by it.
+    const sharesIn = await import('../stores/userShares.js').then((m) =>
+      m.listSharesTo(user.username),
+    )
     const counts = new Map<string, number>()
+    // File tags from DocumentMeta.
     for (const d of docs) {
-      if (!userCanRead(d, user.username, user.role)) continue
+      const canRead =
+        userCanRead(d, user.username, user.role) ||
+        (await isReadableViaShares(d, user.username, sharesIn))
+      if (!canRead) continue
       for (const t of d.tags || []) {
+        counts.set(t, (counts.get(t) ?? 0) + 1)
+      }
+    }
+    // Folder tags from FolderMeta — without this, tags applied to a
+    // folder (via the folder toolbar) silently disappear from the
+    // sidebar tag list.
+    const folderMetas = await listFolderMetas()
+    for (const fm of folderMetas) {
+      const canRead =
+        fm.owner === user.username ||
+        user.role === 'admin' ||
+        // Treat folder access via share grant: any folder share whose
+        // path is the folder itself or an ancestor counts.
+        sharesIn.some(
+          (s) =>
+            s.owner === fm.owner &&
+            s.isFolder &&
+            (s.storageKey === '' ||
+              s.storageKey === fm.storageKey ||
+              fm.storageKey.startsWith(s.storageKey.replace(/\/+$/, '') + '/')),
+        )
+      if (!canRead) continue
+      for (const t of fm.tags || []) {
         counts.set(t, (counts.get(t) ?? 0) + 1)
       }
     }
@@ -1356,6 +2106,9 @@ export async function vaultRoutes(app: FastifyInstance) {
     const lim = Math.min(Number(limit) || 50, 200)
     if (!needle) return { q: '', items: [], folders: [] }
     const docs = await listAllDocuments()
+    const sharesIn = await import('../stores/userShares.js').then((m) =>
+      m.listSharesTo(user.username),
+    )
     type Hit = {
       path: string
       name: string
@@ -1363,12 +2116,16 @@ export async function vaultRoutes(app: FastifyInstance) {
       docId: string
       tags: string[]
       public: boolean
+      owner: string
       score: number
       matchedTags: string[]
     }
     const hits: Hit[] = []
     for (const d of docs) {
-      if (!userCanRead(d, user.username, user.role)) continue
+      const canRead =
+        userCanRead(d, user.username, user.role) ||
+        (await isReadableViaShares(d, user.username, sharesIn))
+      if (!canRead) continue
       const name = path.basename(d.storageKey).toLowerCase()
       const title = (d.title || '').toLowerCase()
       const tags = d.tags ?? []
@@ -1398,18 +2155,20 @@ export async function vaultRoutes(app: FastifyInstance) {
         docId: d.id,
         tags,
         public: !!d.public,
+        owner: d.owner,
         score,
         matchedTags,
       })
     }
     hits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
 
-    // Folder matches — walk the vault tree once and score against the basename.
-    // The user typing "investments" should see the investments/ folder
-    // surface as well as files under it.
-    type FolderHit = { path: string; name: string; score: number }
+    // Folder matches — walk the caller's own vault AND every shared
+    // folder root the caller has been granted, so a shared subtree is
+    // searchable too. Folder tag matches (FolderMeta) also count here.
+    type FolderHit = { path: string; name: string; owner: string; score: number }
     const folderHits: FolderHit[] = []
-    async function walkFolders(absDir: string, rel: string): Promise<void> {
+    const allFolderMetas = await listFolderMetas()
+    async function walkFolders(absDir: string, rel: string, owner: string): Promise<void> {
       let entries: import('node:fs').Dirent[]
       try {
         entries = await readdir(absDir, { withFileTypes: true })
@@ -1425,11 +2184,30 @@ export async function vaultRoutes(app: FastifyInstance) {
         if (name === needle) score += 6
         else if (name.startsWith(needle)) score += 4
         else if (name.includes(needle)) score += 2
-        if (score > 0) folderHits.push({ path: childRel, name: e.name, score })
-        await walkFolders(path.join(absDir, e.name), childRel)
+        // Folder-tag match — same scoring shape as file-tag match.
+        const fm = allFolderMetas.find(
+          (m) => m.owner === owner && m.storageKey === childRel,
+        )
+        for (const t of fm?.tags ?? []) {
+          if (t === needle) score += 5
+          else if (t.startsWith(needle)) score += 3
+          else if (needle.length >= 3 && t.includes(needle)) score += 1.5
+        }
+        if (score > 0)
+          folderHits.push({ path: childRel, name: e.name, owner, score })
+        await walkFolders(path.join(absDir, e.name), childRel, owner)
       }
     }
-    await walkFolders(userVaultRoot(user.username), '')
+    await walkFolders(userVaultRoot(user.username), '', user.username)
+    // Walk each shared folder subtree under the share owner.
+    for (const s of sharesIn) {
+      if (!s.isFolder) continue
+      const ownerRoot = userVaultRoot(s.owner)
+      const sharedAbs = s.storageKey
+        ? path.join(ownerRoot, s.storageKey)
+        : ownerRoot
+      await walkFolders(sharedAbs, s.storageKey, s.owner)
+    }
     folderHits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
 
     return {
@@ -1448,6 +2226,9 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!tag) return reply.code(400).send({ error: 'missing tag' })
     const t = tag.trim().toLowerCase()
     const docs = await listAllDocuments()
+    const sharesIn = await import('../stores/userShares.js').then((m) =>
+      m.listSharesTo(user.username),
+    )
     const items: Array<{
       path: string
       name: string
@@ -1455,10 +2236,15 @@ export async function vaultRoutes(app: FastifyInstance) {
       docId: string
       tags: string[]
       public: boolean
+      owner: string
+      type: 'file' | 'dir'
     }> = []
     for (const d of docs) {
       if (!d.tags?.includes(t)) continue
-      if (!userCanRead(d, user.username, user.role)) continue
+      const canRead =
+        userCanRead(d, user.username, user.role) ||
+        (await isReadableViaShares(d, user.username, sharesIn))
+      if (!canRead) continue
       items.push({
         path: d.storageKey,
         name: path.basename(d.storageKey),
@@ -1466,9 +2252,42 @@ export async function vaultRoutes(app: FastifyInstance) {
         docId: d.id,
         tags: d.tags,
         public: !!d.public,
+        owner: d.owner,
+        type: 'file',
       })
     }
-    items.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+    // Folder-tag matches — surfaced as items too so clicking a tag in
+    // the sidebar reveals tagged folders alongside tagged files.
+    const folderMetas = await listFolderMetas()
+    for (const fm of folderMetas) {
+      if (!fm.tags?.includes(t)) continue
+      const canRead =
+        fm.owner === user.username ||
+        user.role === 'admin' ||
+        sharesIn.some(
+          (s) =>
+            s.owner === fm.owner &&
+            s.isFolder &&
+            (s.storageKey === '' ||
+              s.storageKey === fm.storageKey ||
+              fm.storageKey.startsWith(s.storageKey.replace(/\/+$/, '') + '/')),
+        )
+      if (!canRead) continue
+      items.push({
+        path: fm.storageKey,
+        name: path.basename(fm.storageKey) || fm.storageKey,
+        ext: '',
+        docId: '',
+        tags: fm.tags,
+        public: !!fm.public,
+        owner: fm.owner,
+        type: 'dir',
+      })
+    }
+    items.sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
+      return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    })
     return { tag: t, items }
   })
 }

@@ -23,9 +23,14 @@ type Props = {
   selectedPath: string | null
   /** Auto-expand this branch when activePath is a descendant of `node.path`. */
   activePath: string | null
+  /** When set, the tree belongs to another user's vault (shared-with-me).
+   *  Every list/list-children call goes out with `?owner=<owner>` and
+   *  file navigation preserves it too, so the recipient stays in the
+   *  share context. Mutations (drag-to-move) are disabled. */
+  owner?: string
 }
 
-export function VaultTree({ node, depth, selectedPath, activePath }: Props) {
+export function VaultTree({ node, depth, selectedPath, activePath, owner }: Props) {
   const isAncestorOfActive =
     node.type === 'dir' &&
     !!activePath &&
@@ -52,7 +57,7 @@ export function VaultTree({ node, depth, selectedPath, activePath }: Props) {
   const loadChildren = async (silent = false) => {
     if (!silent) setLoading(true)
     try {
-      const r = await api.list(node.path)
+      const r = await api.list(node.path, owner ? { owner } : undefined)
       // Only replace state when the data actually changed — keeps the same
       // array reference for identical payloads and avoids re-rendering every
       // child row on every event.
@@ -94,12 +99,16 @@ export function VaultTree({ node, depth, selectedPath, activePath }: Props) {
         await loadChildren()
       }
     } else {
-      navigate(`/docs/${node.path.split('/').map(encodeURIComponent).join('/')}`)
+      const segs = node.path.split('/').map(encodeURIComponent).join('/')
+      const suffix = owner ? `?owner=${encodeURIComponent(owner)}` : ''
+      navigate(`/${segs}${suffix}`)
     }
   }
 
   const onDragStart = (e: React.DragEvent) => {
-    if (node.type !== 'file') return
+    // Drag-to-move is owner-only — share recipients can't restructure
+    // someone else's vault.
+    if (node.type !== 'file' || owner) return
     e.dataTransfer.setData('application/x-reader-path', node.path)
     e.dataTransfer.effectAllowed = 'move'
     // Use the row itself as the drag image, anchored to where the cursor
@@ -115,7 +124,7 @@ export function VaultTree({ node, depth, selectedPath, activePath }: Props) {
   }
 
   const onDragOver = (e: React.DragEvent) => {
-    if (node.type !== 'dir') return
+    if (node.type !== 'dir' || owner) return
     if (!e.dataTransfer.types.includes('application/x-reader-path')) return
     e.preventDefault()
     e.dataTransfer.dropEffect = 'move'
@@ -156,7 +165,7 @@ export function VaultTree({ node, depth, selectedPath, activePath }: Props) {
         className={clsx('tree-item', isSelected && 'selected')}
         style={{ paddingLeft: 8 + depth * 14 }}
         onClick={onClick}
-        draggable={node.type === 'file'}
+        draggable={node.type === 'file' && !owner}
         onDragStart={onDragStart}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -214,6 +223,7 @@ export function VaultTree({ node, depth, selectedPath, activePath }: Props) {
               depth={depth + 1}
               selectedPath={selectedPath}
               activePath={activePath}
+              owner={owner}
             />
           ))}
         </div>

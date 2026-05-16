@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save, Users } from 'lucide-react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
@@ -24,11 +24,12 @@ type FlatHit = {
   docId: string
   tags: string[]
   public: boolean
+  owner: string
   score: number
   matchedTags: string[]
 }
 
-type FolderHit = { path: string; name: string; score: number }
+type FolderHit = { path: string; name: string; owner: string; score: number }
 
 /**
  * The left rail used by both VaultView and the workspace-settings page.
@@ -43,7 +44,7 @@ export function VaultSidebar() {
   const location = useLocation()
   const openPath = (params['*'] || '').trim() || null
   const activeTag = location.pathname.startsWith('/tags/') ? params.tag ?? null : null
-  const { uploadFiles, refreshNonce, uploadingName, vaultError, clearError, currentFolder, setCurrentFolder } = useVault()
+  const { uploadFiles, refreshNonce, uploadingName, vaultError, clearError, currentFolder, currentUsername } = useVault()
   const activePath = openPath ?? (currentFolder || null)
 
   const [tree, setTree] = useState<VaultNode[] | null>(null)
@@ -65,6 +66,8 @@ export function VaultSidebar() {
       canEdit: boolean
       name: string
       ext: string
+      embedded: boolean
+      public: boolean
     }>
   >([])
   const [sharedOpen, setSharedOpen] = useState(true)
@@ -280,29 +283,14 @@ export function VaultSidebar() {
             </button>
             {sharedOpen && (
               <div className="mt-0.5 space-y-0.5">
-                {sharedWithMe.map((s) => (
-                  <button
-                    key={s.id}
-                    onClick={() =>
-                      navigate(
-                        '/docs/' +
-                          s.storageKey.split('/').map(encodeURIComponent).join('/') +
-                          `?owner=${encodeURIComponent(s.owner)}`,
-                      )
-                    }
-                    className="w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left text-fg hover:bg-hover"
-                    title={`${s.storageKey} · shared by ${s.owner}${s.canEdit ? ' · editable' : ''}`}
-                  >
-                    {s.isFolder ? (
-                      <Folder size={11} className="text-accent shrink-0" />
-                    ) : (
-                      <Users size={11} className="text-muted shrink-0" />
-                    )}
-                    <span className="truncate flex-1">{s.name}</span>
-                    <span className="text-[10px] text-subtle truncate" style={{ maxWidth: 80 }}>
-                      {s.owner}
-                    </span>
-                  </button>
+                {buildSharedTree(sharedWithMe).map((n) => (
+                  <SharedNode
+                    key={`${n.owner}:${n.path}`}
+                    node={n}
+                    depth={0}
+                    selectedPath={openPath}
+                    activePath={activePath}
+                  />
                 ))}
               </div>
             )}
@@ -363,7 +351,7 @@ export function VaultSidebar() {
                               key={t.tag}
                               onClick={() => navigate(`/tags/${encodeURIComponent(t.tag)}`)}
                               className={clsx(
-                                'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
+                                'w-full flex items-center gap-2 pl-7 pr-2 h-7 rounded text-[12.5px] text-left',
                                 !isActive && 'hover:bg-hover',
                               )}
                               style={{
@@ -424,10 +412,14 @@ export function VaultSidebar() {
                     </div>
                     {searchFolders.map((f) => (
                       <button
-                        key={f.path}
+                        key={`${f.owner}:${f.path}`}
                         onClick={() => {
-                          setCurrentFolder(f.path)
-                          navigate('/')
+                          const segs = f.path.split('/').filter(Boolean).map(encodeURIComponent).join('/')
+                          const suffix =
+                            f.owner && f.owner !== currentUsername
+                              ? `?owner=${encodeURIComponent(f.owner)}`
+                              : ''
+                          navigate(`${segs ? `/${segs}` : '/'}${suffix}`)
                           setFilter('')
                         }}
                         className="w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left text-fg hover:bg-hover"
@@ -480,10 +472,15 @@ export function VaultSidebar() {
                       const isActive = openPath === h.path
                       return (
                         <button
-                          key={h.path}
-                          onClick={() =>
-                            navigate('/docs/' + h.path.split('/').map(encodeURIComponent).join('/'))
-                          }
+                          key={`${h.owner}:${h.path}`}
+                          onClick={() => {
+                            const segs = h.path.split('/').map(encodeURIComponent).join('/')
+                            const suffix =
+                              h.owner && h.owner !== currentUsername
+                                ? `?owner=${encodeURIComponent(h.owner)}`
+                                : ''
+                            navigate(`/${segs}${suffix}`)
+                          }}
                           className={clsx(
                             'w-full flex items-center gap-2 px-2 h-7 rounded text-[12.5px] text-left',
                             !isActive && 'hover:bg-hover',
@@ -552,5 +549,218 @@ export function VaultSidebar() {
         )}
       </div>
     </aside>
+  )
+}
+
+type SharedShare = {
+  id: string
+  owner: string
+  storageKey: string
+  isFolder: boolean
+  canEdit: boolean
+  name: string
+  ext: string
+  embedded: boolean
+  public: boolean
+}
+
+type SharedTreeNode =
+  | {
+      kind: 'group'
+      owner: string
+      path: string
+      name: string
+      children: SharedTreeNode[]
+    }
+  | {
+      kind: 'share-folder' | 'share-file'
+      owner: string
+      path: string
+      name: string
+      share: SharedShare
+      children: SharedTreeNode[]
+    }
+
+/**
+ * Group `shared with me` items so they read like a real tree:
+ *
+ *   investments/                   ← group (no grant — visual only)
+ *     cdsl/                        ← share (folder)
+ *     exchanges/                   ← share (folder)
+ *     portfolio-target.md          ← share (file)
+ *   2005100123 DEARL TECH…         ← share (file at root)
+ *
+ * Group nodes are purely client-side; they expand/collapse but don't
+ * navigate (the recipient has no grant on the bare `investments` path).
+ * Share nodes hand off to VaultTree, which fetches descendants under
+ * the share grant.
+ */
+function buildSharedTree(shares: SharedShare[]): SharedTreeNode[] {
+  type Bucket = {
+    nodesByPath: Map<string, SharedTreeNode>
+    roots: SharedTreeNode[]
+  }
+  const byOwner = new Map<string, Bucket>()
+
+  for (const s of shares) {
+    const segs = s.storageKey.split('/').filter(Boolean)
+    let bucket = byOwner.get(s.owner)
+    if (!bucket) {
+      bucket = { nodesByPath: new Map(), roots: [] }
+      byOwner.set(s.owner, bucket)
+    }
+
+    // Walk segments, materializing group nodes for any prefix that
+    // doesn't already have a share at it. The last segment becomes
+    // the share node itself.
+    let parent: SharedTreeNode | null = null
+    let prefix = ''
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]
+      prefix = prefix ? `${prefix}/${seg}` : seg
+      const isLeaf = i === segs.length - 1
+      let node = bucket.nodesByPath.get(prefix)
+      if (!node) {
+        if (isLeaf) {
+          node = {
+            kind: s.isFolder ? 'share-folder' : 'share-file',
+            owner: s.owner,
+            path: prefix,
+            name: seg,
+            share: s,
+            children: [],
+          }
+        } else {
+          node = {
+            kind: 'group',
+            owner: s.owner,
+            path: prefix,
+            name: seg,
+            children: [],
+          }
+        }
+        bucket.nodesByPath.set(prefix, node)
+        if (parent) parent.children.push(node)
+        else bucket.roots.push(node)
+      } else if (isLeaf && node.kind === 'group') {
+        // Existing group is actually a share — upgrade in place,
+        // keeping any children that were discovered through other
+        // shares (e.g. a share on /a and another on /a/b).
+        const upgraded: SharedTreeNode = {
+          kind: s.isFolder ? 'share-folder' : 'share-file',
+          owner: s.owner,
+          path: prefix,
+          name: seg,
+          share: s,
+          children: node.children,
+        }
+        bucket.nodesByPath.set(prefix, upgraded)
+        // Swap reference in parent / roots list.
+        const list = parent ? parent.children : bucket.roots
+        const idx = list.indexOf(node)
+        if (idx >= 0) list[idx] = upgraded
+        node = upgraded
+      }
+      parent = node
+    }
+  }
+
+  const out: SharedTreeNode[] = []
+  // Sort folders first within each level, then alphabetical.
+  const sort = (nodes: SharedTreeNode[]): SharedTreeNode[] => {
+    nodes.forEach((n) => sort(n.children))
+    nodes.sort((a, b) => {
+      const aIsFile = a.kind === 'share-file'
+      const bIsFile = b.kind === 'share-file'
+      if (aIsFile !== bIsFile) return aIsFile ? 1 : -1
+      return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    })
+    return nodes
+  }
+  for (const bucket of byOwner.values()) out.push(...sort(bucket.roots))
+  return out
+}
+
+/** Render one node in the shared-with-me virtual tree. Group nodes are
+ *  client-only collapsible headers; share nodes hand off to VaultTree
+ *  (folder) or a navigate-on-click row (file). */
+function SharedNode({
+  node,
+  depth,
+  selectedPath,
+  activePath,
+}: {
+  node: SharedTreeNode
+  depth: number
+  selectedPath: string | null
+  activePath: string | null
+}) {
+  const [open, setOpen] = useState(true)
+
+  if (node.kind === 'share-folder') {
+    return (
+      <VaultTree
+        node={{
+          name: node.name,
+          path: node.path,
+          type: 'dir',
+          hasChildren: true,
+        }}
+        depth={depth}
+        selectedPath={selectedPath}
+        activePath={activePath}
+        owner={node.owner}
+      />
+    )
+  }
+  if (node.kind === 'share-file') {
+    return (
+      <VaultTree
+        node={{
+          name: node.name,
+          path: node.path,
+          type: 'file',
+          ext: node.share.ext,
+          // Surface the owner's indexed/published state so the file
+          // share leaf shows the same sparkle + globe the owner sees.
+          embedded: node.share.embedded,
+          public: node.share.public,
+        }}
+        depth={depth}
+        selectedPath={selectedPath}
+        activePath={activePath}
+        owner={node.owner}
+      />
+    )
+  }
+  // Group node — purely visual. Renders a folder row that expands its
+  // children locally without hitting the server.
+  return (
+    <div>
+      <div
+        className="tree-item"
+        style={{ paddingLeft: 8 + depth * 14, opacity: 0.85 }}
+        onClick={() => setOpen((v) => !v)}
+        title={`${node.path} · grouping (no direct grant)`}
+      >
+        {open ? (
+          <ChevronRight size={13} className="text-subtle" style={{ transform: 'rotate(90deg)' }} />
+        ) : (
+          <ChevronRight size={13} className="text-subtle" />
+        )}
+        <Folder size={14} className="text-subtle" />
+        <span className="truncate flex-1 text-subtle">{node.name}</span>
+      </div>
+      {open &&
+        node.children.map((c) => (
+          <SharedNode
+            key={`${c.owner}:${c.path}`}
+            node={c}
+            depth={depth + 1}
+            selectedPath={selectedPath}
+            activePath={activePath}
+          />
+        ))}
+    </div>
   )
 }

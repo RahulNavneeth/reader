@@ -9,7 +9,7 @@ import { VaultView } from './components/VaultView'
 import { AdminPanel } from './components/AdminPanel'
 import { SearchPalette } from './components/SearchPalette'
 import { UploadDialog } from './components/UploadDialog'
-import { PublicFileView } from './components/PublicFileView'
+import { PublicResolver } from './components/PublicResolver'
 import { VaultContext } from './lib/vault-context'
 import { useReaderEvents } from './lib/events'
 
@@ -129,17 +129,18 @@ export default function App() {
   }
 
   if (auth.status === 'anonymous') {
-    // If the user is hitting a /docs/... URL, attempt to render it as a public file
-    // before falling back to the auth wall.
-    const publicPath =
-      location.pathname.startsWith('/docs/')
-        ? decodeURIComponent(location.pathname.slice('/docs/'.length))
-        : null
-    if (publicPath) {
+    // Bare-path public URLs: `/` for a public vault root, `/<path>` for
+    // any public file or folder. Reserved root segments are app routes
+    // that can't be vault items.
+    const RESERVED = new Set(['settings'])
+    const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
+    const firstSeg = rawPath.split('/')[0] ?? ''
+    const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
+    if (!isReserved) {
       return (
-        <PublicFileView
-          key={publicPath}
-          path={publicPath}
+        <PublicResolver
+          key={rawPath}
+          path={rawPath}
           onNotPublic={() => setAuth({ status: 'anonymous-locked' })}
         />
       )
@@ -164,88 +165,101 @@ export default function App() {
         clearError: () => setVaultError(null),
         currentFolder,
         setCurrentFolder,
+        currentUsername: auth.user.username,
       }}
     >
       <div className="h-full flex flex-col surface">
         <header
-          className="h-12 flex items-center gap-3 px-3 border-b border-app shrink-0"
+          className="h-12 flex items-center px-3 border-b border-app shrink-0"
           style={{ background: 'var(--panel-2)' }}
         >
-          <Link to="/" className="flex items-center gap-2 pl-1 pr-2 hover:bg-hover rounded transition-colors h-8">
-            <FileText size={16} className="text-accent" />
-            <span className="text-[13px] font-semibold tracking-tight text-fg">Reader</span>
-          </Link>
-
-          <div className="flex-1" />
-
-          <div className="relative z-50 w-[640px] max-w-full">
-            <SearchIcon
-              size={13}
-              className="absolute left-3 top-1/2 -translate-y-1/2 text-subtle pointer-events-none"
-            />
-            <input
-              ref={searchInputRef}
-              value={searchQuery}
-              onChange={(e) => {
-                setSearchQuery(e.target.value)
-                if (!paletteOpen) setPaletteOpen(true)
-              }}
-              onFocus={() => setPaletteOpen(true)}
-              placeholder="Search vault, or type &quot;new folder&quot; or &quot;upload&quot;…"
-              className="w-full h-8 pl-8 pr-12 rounded text-[12.5px] text-fg placeholder:text-subtle outline-none transition-colors"
-              style={{
-                background: 'var(--bg)',
-                border: '1px solid var(--border-soft)',
-              }}
-            />
-            <kbd
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] px-1 py-0.5 rounded font-mono shrink-0 pointer-events-none"
-              style={{
-                background: 'var(--panel)',
-                color: 'var(--fg-subtle)',
-                border: '1px solid var(--border-soft)',
-              }}
+          {/* Three equal thirds: logo on the left, search dead-center,
+              uploads + theme + user on the right. Each section gets
+              w-1/3 so the search input stays anchored to the viewport
+              center regardless of the side widths. */}
+          <div className="w-1/3 flex items-center">
+            <Link
+              to="/"
+              className="flex items-center gap-2 pl-1 pr-2 hover:bg-hover rounded transition-colors h-8"
             >
-              ⌘K
-            </kbd>
-            <SearchPalette
-              open={paletteOpen}
-              query={searchQuery}
-              onClose={() => setPaletteOpen(false)}
-              inputRef={searchInputRef}
-            />
+              <FileText size={16} className="text-accent" />
+              <span className="text-[13px] font-semibold tracking-tight text-fg">Reader</span>
+            </Link>
           </div>
 
-          <div className="flex-1" />
+          <div className="w-1/3 flex items-center justify-center">
+            <div className="relative z-50 w-full max-w-[640px]">
+              <SearchIcon
+                size={13}
+                className="absolute left-3 top-1/2 -translate-y-1/2 text-subtle pointer-events-none"
+              />
+              <input
+                ref={searchInputRef}
+                value={searchQuery}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value)
+                  if (!paletteOpen) setPaletteOpen(true)
+                }}
+                onFocus={() => setPaletteOpen(true)}
+                placeholder="Search vault, or type &quot;new folder&quot; or &quot;upload&quot;…"
+                className="w-full h-8 pl-8 pr-12 rounded text-[12.5px] text-fg placeholder:text-subtle outline-none transition-colors"
+                style={{
+                  background: 'var(--bg)',
+                  border: '1px solid var(--border-soft)',
+                }}
+              />
+              <kbd
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] px-1 py-0.5 rounded font-mono shrink-0 pointer-events-none"
+                style={{
+                  background: 'var(--panel)',
+                  color: 'var(--fg-subtle)',
+                  border: '1px solid var(--border-soft)',
+                }}
+              >
+                ⌘K
+              </kbd>
+              <SearchPalette
+                open={paletteOpen}
+                query={searchQuery}
+                onClose={() => setPaletteOpen(false)}
+                inputRef={searchInputRef}
+              />
+            </div>
+          </div>
 
-          {uploadingName && (
-            <span className="text-[12px] text-muted inline-flex items-center gap-1.5 mr-1">
-              <Loader2 size={12} className="animate-spin text-accent" />
-              <span className="truncate max-w-[180px]">{uploadingName}</span>
-            </span>
-          )}
+          <div className="w-1/3 flex items-center justify-end gap-2">
+            {uploadingName && (
+              <span className="text-[12px] text-muted inline-flex items-center gap-1.5">
+                <Loader2 size={12} className="animate-spin text-accent" />
+                <span className="truncate max-w-[180px]">{uploadingName}</span>
+              </span>
+            )}
 
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            style={{ display: 'none' }}
-            onChange={(e) => {
-              if (e.target.files) uploadFiles(e.target.files)
-              e.target.value = ''
-            }}
-          />
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                if (e.target.files) uploadFiles(e.target.files)
+                e.target.value = ''
+              }}
+            />
 
-          <button className="btn-ghost" onClick={toggle} title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}>
-            {theme === 'light' ? <Moon size={14} /> : <Sun size={14} />}
-          </button>
+            <button
+              className="btn-ghost"
+              onClick={toggle}
+              title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+            >
+              {theme === 'light' ? <Moon size={14} /> : <Sun size={14} />}
+            </button>
 
-          <UserMenu user={auth.user} onLogout={handleLogout} />
+            <UserMenu user={auth.user} onLogout={handleLogout} />
+          </div>
         </header>
 
         <Routes>
           <Route path="/" element={<VaultView />} />
-          <Route path="/docs/*" element={<VaultView />} />
           <Route path="/tags/:tag" element={<VaultView />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
           <Route path="*" element={<VaultView />} />

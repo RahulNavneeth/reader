@@ -68,6 +68,7 @@ export type VaultNode = {
   ingestStatus?: IngestStatus
   embedded?: boolean
   public?: boolean
+  publicExpiresAt?: number | null
   tags?: string[]
 }
 
@@ -76,6 +77,9 @@ export type SearchHit = {
   /** vault-relative path — used for navigation */
   path: string
   title: string
+  /** Owner of the file. Differs from the requester when the hit comes
+   *  from a shared subtree; thread `?owner=<owner>` for navigation. */
+  owner: string
   score: number
   snippet: string
   page?: number
@@ -214,7 +218,21 @@ export const api = {
 
   // vault — all paths are vault-relative ("" = root)
   home: () => get<{ vault: string; separator: string }>('/api/home'),
-  list: (rel: string) => get<{ path: string; items: VaultNode[] }>(`/api/list${q({ path: rel })}`),
+  resolve: (rel: string, opts?: { owner?: string; password?: string }) =>
+    get<{
+      kind: 'file' | 'folder'
+      owner: string
+      public: boolean
+      access: {
+        ownedByRequester: boolean
+        sharedReadOnly: boolean
+        sharedEdit: boolean
+      }
+    }>(`/api/resolve${q({ path: rel, owner: opts?.owner, p: opts?.password })}`),
+  list: (rel: string, opts?: { owner?: string; password?: string }) =>
+    get<{ path: string; items: VaultNode[] }>(
+      `/api/list${q({ path: rel, owner: opts?.owner, p: opts?.password })}`,
+    ),
   folders: () => get<{ folders: string[] }>('/api/folders'),
   vaultTree: () => get<{ folders: string[]; files: string[] }>('/api/vault-tree'),
   fileText: (rel: string, opts?: { password?: string; owner?: string }) =>
@@ -225,13 +243,8 @@ export const api = {
     get<{ meta: DocumentMeta | null }>(
       `/api/file/meta${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
     ),
-  rawUrl: (rel: string, opts?: { password?: string; owner?: string }) => {
-    const base = '/docs/' + rel.split('/').map(encodeURIComponent).join('/')
-    const params: string[] = []
-    if (opts?.password) params.push(`p=${encodeURIComponent(opts.password)}`)
-    if (opts?.owner) params.push(`owner=${encodeURIComponent(opts.owner)}`)
-    return params.length ? `${base}?${params.join('&')}` : base
-  },
+  rawUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
+    `/api/file/raw${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
   thumbnailUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
     `/api/file/thumbnail${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
   previewUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
@@ -278,6 +291,8 @@ export const api = {
         docId: string
         tags: string[]
         public: boolean
+        owner: string
+        type: 'file' | 'dir'
       }[]
     }>(`/api/files/by-tag${q({ tag })}`),
   /** Cross-folder filename + tag + folder-name search. */
@@ -291,10 +306,11 @@ export const api = {
         docId: string
         tags: string[]
         public: boolean
+        owner: string
         score: number
         matchedTags: string[]
       }[]
-      folders: { path: string; name: string; score: number }[]
+      folders: { path: string; name: string; owner: string; score: number }[]
     }>(`/api/files/search${q({ q: qstr, limit })}`),
   fileVersions: (rel: string) =>
     get<{ versions: { ts: number; sha256: string; bytes: number; title?: string; hasText: boolean }[] }>(
@@ -306,6 +322,61 @@ export const api = {
   fileActivity: (rel: string, limit = 50) =>
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
       `/api/file/activity${q({ path: rel, limit })}`,
+    ),
+
+  // folder-level metadata
+  getFolderMeta: (rel: string, opts?: { owner?: string; password?: string }) =>
+    get<{
+      folder: {
+        owner: string
+        storageKey: string
+        tags: string[]
+        public?: boolean
+        publicExpiresAt?: number | null
+        hasPassword: boolean
+        createdAt: number
+        updatedAt: number
+      }
+    }>(`/api/folder/meta${q({ path: rel, owner: opts?.owner, p: opts?.password })}`),
+  setFolderVisibility: (
+    rel: string,
+    isPublic: boolean,
+    opts?: { expiresInSeconds?: number | null; password?: string | null },
+  ) =>
+    post<{
+      folder: {
+        owner: string
+        storageKey: string
+        tags: string[]
+        public?: boolean
+        publicExpiresAt?: number | null
+        hasPassword: boolean
+        createdAt: number
+        updatedAt: number
+      }
+      cascade: { files: number; folders: number; failedFiles: number }
+    }>('/api/folder/visibility', {
+      path: rel,
+      public: isPublic,
+      expiresInSeconds: opts?.expiresInSeconds ?? null,
+      password: opts?.password ?? null,
+    }),
+  setFolderTags: (rel: string, tags: string[]) =>
+    post<{
+      folder: {
+        owner: string
+        storageKey: string
+        tags: string[]
+        public?: boolean
+        publicExpiresAt?: number | null
+        hasPassword: boolean
+        createdAt: number
+        updatedAt: number
+      }
+    }>('/api/folder/tags', { path: rel, tags }),
+  folderActivity: (rel: string, limit = 50) =>
+    get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
+      `/api/folder/activity${q({ path: rel, limit })}`,
     ),
 
   // user-to-user shares
@@ -349,6 +420,8 @@ export const api = {
         name: string
         ext: string
         docId?: string
+        embedded: boolean
+        public: boolean
       }[]
     }>('/api/file/shares-to'),
   deleteUserShare: (id: string) =>
@@ -379,8 +452,17 @@ export const api = {
       return r.json() as Promise<{ ok: true }>
     }),
 
-  bulkSetVisibility: (paths: string[], isPublic: boolean) =>
-    post<{ ok: number; failed: number }>('/api/file/bulk-visibility', { paths, public: isPublic }),
+  bulkSetVisibility: (
+    paths: string[],
+    isPublic: boolean,
+    opts?: { expiresInSeconds?: number | null; password?: string | null },
+  ) =>
+    post<{ ok: number; failed: number }>('/api/file/bulk-visibility', {
+      paths,
+      public: isPublic,
+      expiresInSeconds: opts?.expiresInSeconds ?? null,
+      password: opts?.password ?? null,
+    }),
   bulkDelete: (paths: string[]) =>
     post<{ ok: number; failed: number }>('/api/file/bulk-delete', { paths }),
 

@@ -31,7 +31,7 @@ type Props = {
 
 export function SearchPalette({ open, query, onClose, inputRef }: Props) {
   const navigate = useNavigate()
-  const { triggerUpload, triggerNewFolder } = useVault()
+  const { triggerUpload, triggerNewFolder, currentUsername } = useVault()
   const [hits, setHits] = useState<SearchHit[] | null>(null)
   // The query string that actually produced the current `hits`. We render
   // against this — not the live `query` — so the dropdown stays on the last
@@ -85,11 +85,15 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
 
   const openHit = useCallback(
     (hit: SearchHit) => {
-      const href = '/docs/' + hit.path.split('/').map(encodeURIComponent).join('/')
-      navigate(href)
+      const segs = hit.path.split('/').map(encodeURIComponent).join('/')
+      const suffix =
+        hit.owner && hit.owner !== currentUsername
+          ? `?owner=${encodeURIComponent(hit.owner)}`
+          : ''
+      navigate(`/${segs}${suffix}`)
       onClose()
     },
-    [navigate, onClose],
+    [navigate, onClose, currentUsername],
   )
 
   const actions: Action[] = useMemo(

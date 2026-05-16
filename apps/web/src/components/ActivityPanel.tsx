@@ -16,7 +16,13 @@ type Entry = {
  * last N events. Refreshes when the path changes; not subscribed to SSE
  * because audit entries follow other writes that already trigger a refresh.
  */
-export function ActivityPanel({ path }: { path: string }) {
+export function ActivityPanel({
+  path,
+  kind = 'file',
+}: {
+  path: string
+  kind?: 'file' | 'folder'
+}) {
   const [entries, setEntries] = useState<Entry[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -24,8 +30,8 @@ export function ActivityPanel({ path }: { path: string }) {
     let cancelled = false
     setEntries(null)
     setError(null)
-    api
-      .fileActivity(path)
+    const fetcher = kind === 'folder' ? api.folderActivity(path) : api.fileActivity(path)
+    fetcher
       .then((r) => {
         if (!cancelled) setEntries(r.entries)
       })
@@ -35,7 +41,7 @@ export function ActivityPanel({ path }: { path: string }) {
     return () => {
       cancelled = true
     }
-  }, [path])
+  }, [path, kind])
 
   return (
     <div className="text-[12.5px] flex flex-col gap-2">
@@ -53,7 +59,9 @@ export function ActivityPanel({ path }: { path: string }) {
         </div>
       )}
       {entries && entries.length === 0 && (
-        <div className="px-1 text-muted">No recorded activity for this file.</div>
+        <div className="px-1 text-muted">
+          No recorded activity for this {kind === 'folder' ? 'folder' : 'file'}.
+        </div>
       )}
       {entries && entries.length > 0 && (
         <ul className="space-y-1">
@@ -97,13 +105,30 @@ function prettyAction(a: string): string {
     case 'trash.purge': return 'Purged'
     case 'vault.bulk-trash': return 'Trashed (bulk)'
     case 'vault.bulk-visibility': return 'Visibility (bulk)'
+    case 'vault.folder-visibility': return 'Folder visibility changed'
+    case 'vault.folder-tags': return 'Folder tags updated'
+    case 'vault.share-with': return 'Shared with user'
+    case 'vault.share-with-file': return 'Shared via folder'
+    case 'vault.share-with-folder': return 'Shared via folder'
+    case 'vault.share-revoke': return 'Share revoked'
     default: return a
   }
 }
 
 function summarizeMeta(meta: Record<string, any> | undefined): string {
   if (!meta) return ''
-  if (typeof meta.public === 'boolean') return meta.public ? 'made public' : 'made private'
+  if (typeof meta.public === 'boolean') {
+    const base = meta.public ? 'made public' : 'made private'
+    return meta.cascadedFrom
+      ? `${base} via folder ${meta.cascadedFrom || '(root)'}`
+      : base
+  }
+  if (typeof meta.recipient === 'string') {
+    const edit = meta.canEdit ? ' (edit)' : ' (read-only)'
+    return meta.cascadedFrom
+      ? `with ${meta.recipient}${edit} via folder ${meta.cascadedFrom}`
+      : `with ${meta.recipient}${edit}`
+  }
   if (Array.isArray(meta.tags)) {
     if (meta.tags.length === 0) return '(no tags)'
     // Inline preview is only useful when you can scan all of it. Past 5 tags

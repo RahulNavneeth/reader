@@ -138,6 +138,9 @@ export type SearchHit = {
   /** vault-relative path — clients navigate here */
   path: string
   title: string
+  /** Owner of the file. Lets the client thread `?owner=` through
+   *  navigation when a hit comes from a shared subtree. */
+  owner: string
   score: number
   snippet: string
   page?: number
@@ -154,10 +157,30 @@ export async function searchKnowledge(opts: {
   if (!q) return []
   const limit = opts.limit ?? 20
   const c = await getCache()
-  const allowed = c.docs.filter((d) => userCanRead(d, opts.user.username, opts.user.role))
+  // Pull share-grants so chunks/files inside a shared subtree also
+  // surface in semantic search results.
+  const { listSharesTo } = await import('../stores/userShares.js')
+  const sharesIn = await listSharesTo(opts.user.username)
+  const shareAllows = (d: { owner: string; storageKey: string }): boolean => {
+    if (d.owner === opts.user.username) return false
+    const target = d.storageKey.replace(/^\/+|\/+$/g, '')
+    for (const s of sharesIn) {
+      if (s.owner !== d.owner) continue
+      const sk = s.storageKey.replace(/^\/+|\/+$/g, '')
+      if (s.isFolder) {
+        if (sk === '' || target === sk || target.startsWith(sk + '/')) return true
+      } else if (target === sk) return true
+    }
+    return false
+  }
+  const allowed = c.docs.filter(
+    (d) =>
+      userCanRead(d, opts.user.username, opts.user.role) || shareAllows(d),
+  )
   const allowedIds = new Set(allowed.map((d) => d.id))
   const titleById = new Map(allowed.map((d) => [d.id, d.title]))
   const pathById = new Map(allowed.map((d) => [d.id, d.storageKey]))
+  const ownerById = new Map(allowed.map((d) => [d.id, d.owner]))
 
   // Lexical: per-doc token-level scoring with snippet around first hit.
   const lex: Array<{ docId: string; score: number; sample: string }> = []
@@ -266,6 +289,7 @@ export async function searchKnowledge(opts: {
       docId,
       path: pathById.get(docId) ?? '',
       title: titleById.get(docId) ?? docId,
+      owner: ownerById.get(docId) ?? opts.user.username,
       score: hit.score,
       snippet: hit.sample,
       chunkIdx: hit.chunkIdx,

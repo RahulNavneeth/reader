@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import path from 'node:path'
-import { stat } from 'node:fs/promises'
+import { readdir, stat } from 'node:fs/promises'
 import {
   createUserShare,
   deleteUserShare,
@@ -63,6 +63,48 @@ export async function userSharesRoutes(app: FastifyInstance) {
       target: body.path,
       meta: { recipient: recipient.username, canEdit: share.canEdit, isFolder },
     })
+    // When a folder is shared, also write an audit entry for every
+    // descendant file and sub-folder so each item's activity log shows
+    // it became accessible via the cascade. Mirrors the public-cascade
+    // audit behavior.
+    if (isFolder) {
+      const ownerRoot = userVaultRoot(owner.username)
+      const folderAbs = abs
+      try {
+        const walk = async (curAbs: string, curRel: string): Promise<void> => {
+          let entries: import('node:fs').Dirent[]
+          try {
+            entries = await readdir(curAbs, { withFileTypes: true })
+          } catch {
+            return
+          }
+          for (const e of entries) {
+            if (e.name.startsWith('.')) continue
+            if (e.name === 'node_modules' || e.name === 'dist' || e.name === 'build') continue
+            const childAbs = path.join(curAbs, e.name)
+            const childRel = curRel ? `${curRel}/${e.name}` : e.name
+            const fullRel = body.path
+              ? `${body.path.replace(/\/+$/, '')}/${childRel}`
+              : childRel
+            await audit({
+              actor: owner.username,
+              action: e.isDirectory() ? 'vault.share-with-folder' : 'vault.share-with-file',
+              target: fullRel,
+              meta: {
+                recipient: recipient.username,
+                canEdit: share.canEdit,
+                cascadedFrom: body.path,
+              },
+            })
+            if (e.isDirectory()) await walk(childAbs, childRel)
+          }
+        }
+        await walk(folderAbs, '')
+        void ownerRoot // silence unused
+      } catch {
+        /* best-effort; cascade audit isn't worth failing the share over */
+      }
+    }
     return reply.code(201).send({ share })
   })
 
@@ -84,6 +126,10 @@ export async function userSharesRoutes(app: FastifyInstance) {
         name: path.basename(s.storageKey),
         ext: path.extname(s.storageKey).toLowerCase(),
         docId: doc?.id,
+        // Embedded flag so the recipient's sidebar sparkle shows on a
+        // file share without needing a second fetch.
+        embedded: doc?.ingest?.embedded ?? false,
+        public: !!doc?.public,
       }
     })
     return { shares: decorated }

@@ -31,7 +31,11 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.code(409).send({ error: 'username taken' })
     }
     const passwordHash = await hashPassword(password)
-    const role: User['role'] = existingCount === 0 ? 'admin' : 'viewer'
+    // First user becomes admin; subsequent self-signups get the
+    // `editor` role so they can manage their own vault (upload, edit,
+    // share). `viewer` is reserved for admin-provisioned read-only
+    // accounts.
+    const role: User['role'] = existingCount === 0 ? 'admin' : 'editor'
     const user: User = {
       username,
       passwordHash,

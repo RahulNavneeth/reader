@@ -123,7 +123,7 @@ export function PathViewer({ path }: Props) {
     api.fileMeta(path, callerOpts).then((r) => setMeta(r.meta)).catch(() => null)
     if (isMarkdown || isText || isCsv || isJson || isHtml || wantsExtractedText) {
       api
-        .fileText(path)
+        .fileText(path, callerOpts)
         .then((r) => setText(r.content))
         .catch((e) => {
           if (e instanceof ApiError && e.status === 404 && wantsExtractedText) {
@@ -134,7 +134,7 @@ export function PathViewer({ path }: Props) {
           }
         })
     }
-  }, [path, isMarkdown, isText, isCsv, isJson, isHtml, wantsExtractedText])
+  }, [path, isMarkdown, isText, isCsv, isJson, isHtml, wantsExtractedText, callerOpts?.owner])
 
   const filename = path.split('/').pop() || path
   const parentDir = useMemo(() => {
@@ -143,8 +143,14 @@ export function PathViewer({ path }: Props) {
   }, [path])
 
   const goToFolder = (dir: string) => {
+    // Push the actual folder path to the URL so back / breadcrumb clicks
+    // land at the right folder. Preserve `?owner=` so a recipient
+    // browsing a shared subtree doesn't fall back into their own vault
+    // when they hit the parent crumb.
     setCurrentFolder(dir)
-    navigate('/')
+    const segs = dir.split('/').filter(Boolean).map(encodeURIComponent).join('/')
+    const suffix = ownerOpt ? `?owner=${encodeURIComponent(ownerOpt)}` : ''
+    navigate(`${segs ? `/${segs}` : '/'}${suffix}`)
   }
 
   const indexNow = async () => {
@@ -212,6 +218,7 @@ export function PathViewer({ path }: Props) {
           currentAction={<FileInfoButton path={path} meta={meta} />}
           onNavigate={goToFolder}
           onBack={() => goToFolder(parentDir)}
+          ownerLabel={ownerOpt}
         />
         <div className="flex-1" />
         {/* Default rendering: visibility starts as "Private" (the safe
@@ -221,7 +228,10 @@ export function PathViewer({ path }: Props) {
         {meta?.ingest.embedded && (
           <Sparkles size={13} className="text-accent shrink-0 mx-1" aria-label="indexed for AI search" />
         )}
-        {needsReindex && (
+        {/* Owner-only controls. When viewing a shared file (ownerOpt is
+            set), the recipient sees only navigation + Download — they
+            can't mutate the owner's tags, visibility, or shares. */}
+        {!ownerOpt && needsReindex && (
           <button
             className="btn-ghost"
             disabled={indexing}
@@ -232,21 +242,40 @@ export function PathViewer({ path }: Props) {
             {indexing ? 'Indexing…' : reindexLabel}
           </button>
         )}
-        <TagsButton
-          path={path}
-          tags={meta?.tags ?? []}
-          onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
-        />
-        <ActivityButton path={path} />
-        <VersionsButton path={path} />
-        {meta && <ShareWithUserButton path={path} />}
-        {meta ? (
-          <PublicButton path={path} meta={meta} onSaved={setMeta} />
-        ) : (
-          <button className="btn-ghost" disabled>
-            <Lock size={13} />
-            Private
-          </button>
+        {!ownerOpt && (
+          <>
+            <TagsButton
+              path={path}
+              tags={meta?.tags ?? []}
+              onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
+            />
+            <ActivityButton path={path} />
+            <VersionsButton path={path} />
+            {meta && <ShareWithUserButton paths={[path]} />}
+            {meta ? (
+              <PublicButton
+                path={path}
+                meta={meta}
+                onSaved={(next) =>
+                  setMeta((cur) =>
+                    cur
+                      ? {
+                          ...cur,
+                          public: next.public,
+                          publicExpiresAt: next.publicExpiresAt ?? null,
+                          publicPasswordHash: next.publicPasswordHash ?? null,
+                        }
+                      : cur,
+                  )
+                }
+              />
+            ) : (
+              <button className="btn-ghost" disabled>
+                <Lock size={13} />
+                Private
+              </button>
+            )}
+          </>
         )}
         <a className="btn-ghost" href={api.rawUrl(path, callerOpts)} download={filename}>
           <Download size={14} />
@@ -264,7 +293,7 @@ export function PathViewer({ path }: Props) {
             <div className="flex items-center gap-2 text-fg font-semibold mb-1">
               <AlertCircle size={16} style={{ color: '#BF2600' }} /> Couldn't open this file
             </div>
-            <div className="text-[13px]">{error}</div>
+            <div className="text-[13px]">{prettyError(error)}</div>
           </div>
         )}
 
@@ -407,6 +436,24 @@ export function PathViewer({ path }: Props) {
       </div>
     </div>
   )
+}
+
+/** Translate raw API error messages into something the user can act on. */
+function prettyError(raw: string): string {
+  const low = raw.toLowerCase()
+  if (low === 'forbidden' || low.includes('forbidden')) {
+    return "You don't have access to this file. If someone shared a folder with you, you may have lost that grant — ask them to re-share."
+  }
+  if (low === 'file not found' || low.includes('not found')) {
+    return "The file no longer exists at this path. It may have been moved, renamed, or deleted."
+  }
+  if (low.includes('link expired')) {
+    return 'This public link has expired.'
+  }
+  if (low.includes('password')) {
+    return 'A password is required to open this file.'
+  }
+  return raw
 }
 
 

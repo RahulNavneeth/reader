@@ -1,22 +1,40 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Users, Loader2, X } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 
-type Props = { path: string }
+type Props = {
+  /** One or more vault-relative paths to share with a single recipient.
+   *  Single-path callers pass a one-element array; bulk-select uses the
+   *  selected paths so one recipient/permission combo lands grants for
+   *  every selected item in one go. */
+  paths: string[]
+}
 
 type ShareRow = {
   id: string
   recipient: string
   canEdit: boolean
   isFolder: boolean
+  storageKey: string
+}
+
+/** Aggregated view for bulk mode — one row per (recipient, canEdit). */
+type AggregatedShareRow = {
+  recipient: string
+  canEdit: boolean
+  ids: string[]
+  coveredCount: number
 }
 
 /**
  * Private user-to-user share control. Owner picks another username and
- * (optionally) grants edit access. The recipient sees the path in their
- * sidebar's "Shared with me" section.
+ * (optionally) grants edit access. The recipient sees each path in their
+ * sidebar's "Shared with me" section. Supports bulk-share: paths.length
+ * > 1 fans the create call out to every selected path.
  */
-export function ShareWithUserButton({ path }: Props) {
+export function ShareWithUserButton({ paths }: Props) {
+  const isBulk = paths.length > 1
+  const primaryPath = paths[0]
   const [open, setOpen] = useState(false)
   const [recipient, setRecipient] = useState('')
   const [canEdit, setCanEdit] = useState(false)
@@ -41,14 +59,22 @@ export function ShareWithUserButton({ path }: Props) {
       document.removeEventListener('keydown', onKey)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, path])
+  }, [open, primaryPath, isBulk])
+
+  const pathSet = useMemo(() => new Set(paths), [paths])
 
   const refresh = async () => {
     try {
       const r = await api.listUserSharesFrom()
       const rows = r.shares
-        .filter((s) => s.storageKey === path)
-        .map((s) => ({ id: s.id, recipient: s.recipient, canEdit: s.canEdit, isFolder: s.isFolder }))
+        .filter((s) => pathSet.has(s.storageKey))
+        .map((s) => ({
+          id: s.id,
+          recipient: s.recipient,
+          canEdit: s.canEdit,
+          isFolder: s.isFolder,
+          storageKey: s.storageKey,
+        }))
       setShares(rows)
     } catch (e) {
       setShares([])
@@ -56,12 +82,48 @@ export function ShareWithUserButton({ path }: Props) {
     }
   }
 
+  // Aggregate per (recipient, canEdit) so bulk users see "alice — 2 of 3
+  // items (edit)" rather than three separate rows for the same person.
+  const aggregated: AggregatedShareRow[] = useMemo(() => {
+    if (!shares) return []
+    const buckets = new Map<string, AggregatedShareRow>()
+    for (const s of shares) {
+      const key = `${s.recipient}::${s.canEdit ? 'edit' : 'read'}`
+      const existing = buckets.get(key)
+      if (existing) {
+        existing.ids.push(s.id)
+        existing.coveredCount++
+      } else {
+        buckets.set(key, {
+          recipient: s.recipient,
+          canEdit: s.canEdit,
+          ids: [s.id],
+          coveredCount: 1,
+        })
+      }
+    }
+    return Array.from(buckets.values()).sort((a, b) =>
+      a.recipient.localeCompare(b.recipient),
+    )
+  }, [shares])
+
   const create = async () => {
     if (!recipient.trim()) return
     setBusy(true)
     setError(null)
     try {
-      await api.createUserShare({ path, recipient: recipient.trim(), canEdit })
+      // Fan out per path. Continue on individual failures so one bad
+      // path (e.g. recipient already has a grant on it) doesn't stop
+      // the rest. Surface the first error if any happen.
+      let firstErr: string | null = null
+      for (const p of paths) {
+        try {
+          await api.createUserShare({ path: p, recipient: recipient.trim(), canEdit })
+        } catch (e) {
+          if (!firstErr) firstErr = e instanceof ApiError ? e.message : String(e)
+        }
+      }
+      if (firstErr) setError(firstErr)
       setRecipient('')
       setCanEdit(false)
       refresh()
@@ -72,11 +134,13 @@ export function ShareWithUserButton({ path }: Props) {
     }
   }
 
-  const revoke = async (id: string) => {
+  const revoke = async (ids: string[]) => {
     setBusy(true)
     setError(null)
     try {
-      await api.deleteUserShare(id)
+      for (const id of ids) {
+        await api.deleteUserShare(id).catch(() => null)
+      }
       refresh()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -97,7 +161,9 @@ export function ShareWithUserButton({ path }: Props) {
           style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
         >
           <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border-soft)' }}>
-            <div className="text-[12.5px] font-medium text-fg">Share with a user</div>
+            <div className="text-[12.5px] font-medium text-fg">
+              {isBulk ? `Share ${paths.length} items with a user` : 'Share with a user'}
+            </div>
             <input
               className="input h-7 text-[12.5px]"
               placeholder="Username"
@@ -133,28 +199,46 @@ export function ShareWithUserButton({ path }: Props) {
               <div className="px-3 py-2 text-[11.5px] text-muted flex items-center gap-1.5">
                 <Loader2 size={12} className="animate-spin" /> Loading…
               </div>
-            ) : shares.length === 0 ? (
-              <div className="px-3 py-2 text-[11.5px] text-subtle">Not shared with anyone yet.</div>
+            ) : aggregated.length === 0 ? (
+              <div className="px-3 py-2 text-[11.5px] text-subtle">
+                {isBulk
+                  ? 'None of the selected items are shared.'
+                  : 'Not shared with anyone yet.'}
+              </div>
             ) : (
-              shares.map((s) => (
-                <div
-                  key={s.id}
-                  className="flex items-center gap-2 px-3 py-1.5"
-                  style={{ borderTop: '1px solid var(--border-soft)' }}
-                >
-                  <span className="text-[12px] text-fg flex-1 truncate">{s.recipient}</span>
-                  <span className="text-[10.5px] text-subtle">{s.canEdit ? 'edit' : 'read-only'}</span>
-                  <button
-                    className="btn-ghost h-6 w-6 px-0"
-                    onClick={() => revoke(s.id)}
-                    disabled={busy}
-                    title="Revoke"
-                    style={{ color: '#BF2600' }}
+              aggregated.map((row) => {
+                const coverage = isBulk
+                  ? ` — ${row.coveredCount} of ${paths.length}`
+                  : ''
+                return (
+                  <div
+                    key={`${row.recipient}-${row.canEdit ? 'e' : 'r'}`}
+                    className="flex items-center gap-2 px-3 py-1.5"
+                    style={{ borderTop: '1px solid var(--border-soft)' }}
                   >
-                    <X size={11} />
-                  </button>
-                </div>
-              ))
+                    <span className="text-[12px] text-fg flex-1 truncate">
+                      {row.recipient}
+                      <span className="text-subtle">{coverage}</span>
+                    </span>
+                    <span className="text-[10.5px] text-subtle">
+                      {row.canEdit ? 'edit' : 'read-only'}
+                    </span>
+                    <button
+                      className="btn-ghost h-6 w-6 px-0"
+                      onClick={() => revoke(row.ids)}
+                      disabled={busy}
+                      title={
+                        row.ids.length > 1
+                          ? `Revoke all ${row.ids.length} grants`
+                          : 'Revoke'
+                      }
+                      style={{ color: '#BF2600' }}
+                    >
+                      <X size={11} />
+                    </button>
+                  </div>
+                )
+              })
             )}
           </div>
         </div>

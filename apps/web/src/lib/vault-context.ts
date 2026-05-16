@@ -21,6 +21,9 @@ export type VaultContextValue = {
   currentFolder: string
   /** Set the active folder context (called by FolderGrid + PathViewer). */
   setCurrentFolder: (dir: string) => void
+  /** Logged-in user's username — used to decide when to thread
+   *  `?owner=` through navigation (cross-owner shared content). */
+  currentUsername: string
 }
 
 export const VaultContext = createContext<VaultContextValue | null>(null)

@@ -101,6 +101,11 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
     owner: existing?.owner ?? owner,
     acl: existing?.acl ?? { readers: [], editors: [] },
     public: existing?.public,
+    // Preserve share-link state across in-place file edits — otherwise a
+    // user editing the markdown of a published file silently strips the
+    // expiry/password.
+    publicExpiresAt: existing?.publicExpiresAt ?? null,
+    publicPasswordHash: existing?.publicPasswordHash ?? null,
     tags: existing?.tags ?? [],
     createdAt: existing?.createdAt ?? Date.now(),
     updatedAt: Date.now(),
