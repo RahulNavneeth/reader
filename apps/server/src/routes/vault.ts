@@ -142,12 +142,32 @@ async function expandTreeUnder(
   return { files, folders }
 }
 
-/** Strip the password hash before sending meta to a client. */
+/** Strip the password hash before sending meta to a client. Always
+ *  redacts; previously only fired when a hash existed, which leaked the
+ *  hash field shape for passworded files. */
 function redactPublicMeta(meta: DocumentMeta): DocumentMeta {
-  if (!meta.publicPasswordHash) return meta
   const { publicPasswordHash, ...rest } = meta
   void publicPasswordHash
   return { ...rest, publicPasswordHash: null } as DocumentMeta
+}
+
+/** Stricter redaction for callers that aren't the owner — drops the ACL,
+ *  internal id, sha256, and password hash so a public-link viewer can't
+ *  enumerate who else has access or fingerprint the bytes. Used for
+ *  anonymous + cross-owner read responses on /api/file/meta. */
+function redactForPublicViewer(meta: DocumentMeta): Partial<DocumentMeta> {
+  const {
+    publicPasswordHash,
+    acl,
+    sha256,
+    id,
+    ...rest
+  } = meta
+  void publicPasswordHash
+  void acl
+  void sha256
+  void id
+  return { ...rest, publicPasswordHash: null }
 }
 
 /**
@@ -215,6 +235,100 @@ async function resolveReadContext(opts: {
   const meta = own ?? pub ?? null
   const owner = meta?.owner ?? requester ?? null
   return { meta, owner, sharedGrant: null }
+}
+
+/**
+/**
+ * Per-IP failed-gate throttle. `publicGate` calls scrypt-verify which
+ * is intentionally CPU-heavy; an attacker hammering /api/file/raw?p=
+ * with wrong passwords would stall the event loop. Lock the IP out
+ * for 15 min after 20 failed `?p=` attempts in any 15-min window.
+ */
+const GATE_WINDOW_MS = 15 * 60 * 1000
+const GATE_MAX_FAILURES = 20
+type GateBucket = { failures: number; firstFailAt: number; lockedUntil: number }
+const gateBuckets = new Map<string, GateBucket>()
+function gateLockedSeconds(ip: string): number | null {
+  const b = gateBuckets.get(ip)
+  if (!b) return null
+  const now = Date.now()
+  if (b.lockedUntil > now) return Math.ceil((b.lockedUntil - now) / 1000)
+  if (now - b.firstFailAt > GATE_WINDOW_MS) {
+    gateBuckets.delete(ip)
+    return null
+  }
+  return null
+}
+function recordGateFailure(ip: string): void {
+  const now = Date.now()
+  const b = gateBuckets.get(ip)
+  if (!b || now - b.firstFailAt > GATE_WINDOW_MS) {
+    gateBuckets.set(ip, { failures: 1, firstFailAt: now, lockedUntil: 0 })
+    return
+  }
+  b.failures++
+  if (b.failures >= GATE_MAX_FAILURES) b.lockedUntil = now + GATE_WINDOW_MS
+}
+function clearGateFailures(ip: string): void {
+  gateBuckets.delete(ip)
+}
+setInterval(() => {
+  const now = Date.now()
+  for (const [k, b] of gateBuckets) {
+    if (b.lockedUntil < now && now - b.firstFailAt > GATE_WINDOW_MS) {
+      gateBuckets.delete(k)
+    }
+  }
+}, 5 * 60 * 1000).unref()
+
+/**
+ * Walk up the path looking for the closest ancestor folder that has a
+ * public FolderMeta. Returns its public state so a new child can
+ * inherit it. Returns null if no ancestor is public.
+ */
+async function closestPublicAncestor(
+  owner: string,
+  rel: string,
+): Promise<{
+  public: true
+  publicExpiresAt: number | null
+  publicPasswordHash: string | null
+} | null> {
+  const segs = rel.split('/').filter(Boolean)
+  // Walk from root → leaf so we pick the OUTERMOST public ancestor's
+  // settings (the share that established the link, not a deeper
+  // re-cascade that might have been revoked at the parent level).
+  for (let i = 0; i < segs.length; i++) {
+    const ancestorRel = segs.slice(0, i).join('/')
+    const fm = await getFolderMeta(owner, ancestorRel).catch(() => null)
+    if (fm?.public) {
+      return {
+        public: true,
+        publicExpiresAt: fm.publicExpiresAt ?? null,
+        publicPasswordHash: fm.publicPasswordHash ?? null,
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Per-user in-flight upload byte reservation. Without this two
+ * concurrent uploads each see the same `used` snapshot and both pass
+ * the quota check even when they collectively exceed the cap.
+ * Reserved bytes get returned in the finally block of /api/file/upload.
+ */
+const reservedUploadBytes = new Map<string, number>()
+function reserveUploadBytes(username: string, bytes: number): void {
+  reservedUploadBytes.set(username, (reservedUploadBytes.get(username) ?? 0) + bytes)
+}
+function releaseUploadBytes(username: string, bytes: number): void {
+  const next = (reservedUploadBytes.get(username) ?? 0) - bytes
+  if (next <= 0) reservedUploadBytes.delete(username)
+  else reservedUploadBytes.set(username, next)
+}
+function getReservedUploadBytes(username: string): number {
+  return reservedUploadBytes.get(username) ?? 0
 }
 
 /**
@@ -563,7 +677,13 @@ export async function vaultRoutes(app: FastifyInstance) {
       const gate = publicGate(fm, providedPassword)
       if (gate === 'ok') {
         owner = ownerHint
-        anonymous = !requester
+        // Treat every cross-owner public-folder access as "anonymous"
+        // for *filtering* purposes — the caller only holds the public
+        // grant, so they must not see individually-private children
+        // even if they happen to be logged in. (Was `!requester`,
+        // which let an authed user bypass the per-item public
+        // filter.)
+        anonymous = true
       } else if (requester && (await findShareForPath(requester, ownerHint, rel))) {
         owner = ownerHint
       } else {
@@ -821,6 +941,17 @@ export async function vaultRoutes(app: FastifyInstance) {
       req.query as { path?: string; p?: string; owner?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
 
+    // Throttle failed `?p=` attempts before scrypt-verify burns CPU.
+    if (publicPassword) {
+      const locked = gateLockedSeconds(req.ip)
+      if (locked != null) {
+        return reply
+          .code(429)
+          .header('Retry-After', String(locked))
+          .send({ error: 'too many failed password attempts', retryAfter: locked })
+      }
+    }
+
     const requester = req.currentUser?.username
     const ctx = await resolveReadContext({ rel, ownerHint, requester })
     if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
@@ -833,6 +964,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     const gate = publicGate(meta, publicPassword)
     if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
     if (gate === 'password-required' || gate === 'password-wrong') {
+      if (gate === 'password-wrong') recordGateFailure(req.ip)
       return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
     }
     if (gate !== 'ok') {
@@ -841,6 +973,9 @@ export async function vaultRoutes(app: FastifyInstance) {
       if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
+    } else if (publicPassword) {
+      // Successful gate with password — reset the bucket.
+      clearGateFailures(req.ip)
     }
     const abs = resolveVault(rel, owner)
     const s = await stat(abs).catch(() => null)
@@ -1023,73 +1158,95 @@ export async function vaultRoutes(app: FastifyInstance) {
     // Quota check. Sums bytes across docs the user owns; rejects if this
     // upload would push them over their configured cap. Admins are exempt
     // because they're the one setting the limits.
+    // Quota enforcement with reservation — two concurrent uploads of
+    // 60MB against a 100MB cap used to both pass since neither saw
+    // the other's bytes on disk yet. Reserving and releasing around
+    // the write closes that TOCTOU window.
+    let reserved = 0
     if (user.role !== 'admin' && user.quotaBytes && user.quotaBytes > 0) {
       const docs = await listAllDocuments()
-      const used = docs.reduce((sum, d) => (d.owner === user.username ? sum + (d.bytes || 0) : sum), 0)
-      if (used + buffer.length > user.quotaBytes) {
+      const used = docs.reduce(
+        (sum, d) => (d.owner === user.username ? sum + (d.bytes || 0) : sum),
+        0,
+      )
+      const inflight = getReservedUploadBytes(user.username)
+      if (used + inflight + buffer.length > user.quotaBytes) {
         return reply.code(413).send({
           error: 'quota exceeded',
           quota: user.quotaBytes,
           used,
+          inflight,
           incoming: buffer.length,
         })
       }
+      reserveUploadBytes(user.username, buffer.length)
+      reserved = buffer.length
     }
 
-    const fields = part.fields as Record<string, { value: string } | undefined>
-    const targetRel = ((fields?.path as any)?.value as string | undefined) || ''
-    const tagsCSV = ((fields?.tags as any)?.value as string | undefined) || ''
-    const titleField = ((fields?.title as any)?.value as string | undefined) || ''
+    try {
+      const fields = part.fields as Record<string, { value: string } | undefined>
+      const targetRel = ((fields?.path as any)?.value as string | undefined) || ''
+      const tagsCSV = ((fields?.tags as any)?.value as string | undefined) || ''
+      const titleField = ((fields?.title as any)?.value as string | undefined) || ''
 
-    await ensureUserVault(user.username).catch(() => null)
-    const targetDir = resolveVault(targetRel, user.username)
-    await mkdir(targetDir, { recursive: true })
+      await ensureUserVault(user.username).catch(() => null)
+      const targetDir = resolveVault(targetRel, user.username)
+      await mkdir(targetDir, { recursive: true })
 
-    const filename = safeFilename(part.filename || 'upload.bin')
-    const finalAbs = await uniquePath(targetDir, filename)
-    const finalRel = toVaultRel(finalAbs, user.username)
-    await import('node:fs/promises').then(({ writeFile }) => writeFile(finalAbs, buffer))
+      const filename = safeFilename(part.filename || 'upload.bin')
+      const finalAbs = await uniquePath(targetDir, filename)
+      const finalRel = toVaultRel(finalAbs, user.username)
+      await import('node:fs/promises').then(({ writeFile }) => writeFile(finalAbs, buffer))
 
-    const mime = inferMime(filename, part.mimetype || undefined)
-    const sha256 = sha256Of(buffer)
-    const now = Date.now()
-    const meta: DocumentMeta = {
-      id: nanoid(),
-      title: titleField.trim() || filename.replace(/\.[^.]+$/, ''),
-      originalFilename: filename,
-      mime,
-      bytes: buffer.length,
-      sha256,
-      storageKey: finalRel, // vault-relative path doubles as the storage key
-      owner: user.username,
-      acl: { readers: [], editors: [] },
-      tags: tagsCSV.split(',').map((s) => s.trim()).filter(Boolean),
-      createdAt: now,
-      updatedAt: now,
-      ingest: { status: 'pending', embedded: false },
+      const mime = inferMime(filename, part.mimetype || undefined)
+      const sha256 = sha256Of(buffer)
+      const now = Date.now()
+      // Folder cascade for new children: if the closest published
+      // ancestor folder is public, the new file inherits its
+      // public-link state (expiry, password). Without this an owner
+      // who dropped a file into "Public" gets surprised when the
+      // recipient sees nothing.
+      const inheritedPublic = await closestPublicAncestor(user.username, finalRel)
+      const meta: DocumentMeta = {
+        id: nanoid(),
+        title: titleField.trim() || filename.replace(/\.[^.]+$/, ''),
+        originalFilename: filename,
+        mime,
+        bytes: buffer.length,
+        sha256,
+        storageKey: finalRel,
+        owner: user.username,
+        acl: { readers: [], editors: [] },
+        public: inheritedPublic?.public ?? undefined,
+        publicExpiresAt: inheritedPublic?.publicExpiresAt ?? null,
+        publicPasswordHash: inheritedPublic?.publicPasswordHash ?? null,
+        tags: tagsCSV.split(',').map((s) => s.trim()).filter(Boolean),
+        createdAt: now,
+        updatedAt: now,
+        ingest: { status: 'pending', embedded: false },
+      }
+      await saveMeta(meta)
+      const { runJob } = await import('../services/jobs.js')
+      runJob('ingest', finalRel, () => ingestDocument(meta, buffer)).catch((err) => {
+        req.log.warn({ err, rel: finalRel }, 'ingest job failed')
+      })
+
+      await audit({
+        actor: user.username,
+        action: 'vault.upload',
+        target: finalRel,
+        meta: { bytes: buffer.length, mime },
+      })
+      dispatchWebhook({
+        type: 'upload',
+        path: finalRel,
+        actor: user.username,
+        bytes: buffer.length,
+      }).catch(() => null)
+      return reply.code(201).send({ document: meta, path: finalRel })
+    } finally {
+      if (reserved) releaseUploadBytes(user.username, reserved)
     }
-    await saveMeta(meta)
-    // Fire ingest as a tracked background job so upload returns immediately.
-    // The SSE channel pushes status updates as the job moves through
-    // extracting → embedding → ready, so the UI updates without polling.
-    const { runJob } = await import('../services/jobs.js')
-    runJob('ingest', finalRel, () => ingestDocument(meta, buffer)).catch((err) => {
-      req.log.warn({ err, rel: finalRel }, 'ingest job failed')
-    })
-
-    await audit({
-      actor: user.username,
-      action: 'vault.upload',
-      target: finalRel,
-      meta: { bytes: buffer.length, mime },
-    })
-    dispatchWebhook({
-      type: 'upload',
-      path: finalRel,
-      actor: user.username,
-      bytes: buffer.length,
-    }).catch(() => null)
-    return reply.code(201).send({ document: meta, path: finalRel })
   })
 
   app.post('/api/file/index', async (req, reply) => {
@@ -1107,10 +1264,13 @@ export async function vaultRoutes(app: FastifyInstance) {
     const now = Date.now()
 
     // Replace any existing index for this path scoped to this user's owned files.
+    // Reuse the existing id so the doc directory is overwritten in
+    // place rather than delete-then-create — that ordering left the
+    // file permanently unindexed if the process died between the two
+    // ops.
     const docs = await listAllDocuments()
     const existing = docs.find((d) => d.storageKey === rel && d.owner === user.username)
     const id = existing?.id ?? nanoid()
-    if (existing) await deleteDocument(existing.id)
 
     const filename = path.basename(abs)
     const meta: DocumentMeta = {
@@ -1136,7 +1296,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     await saveMeta(meta)
     const finalMeta = await ingestDocument(meta, buffer)
     await audit({ actor: user.username, action: 'vault.index', target: rel })
-    return { document: finalMeta }
+    return { document: redactPublicMeta(finalMeta) }
   })
 
   app.delete('/api/file', async (req, reply) => {
@@ -1207,7 +1367,18 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (entry.owner !== user.username && user.role !== 'admin') {
       return reply.code(403).send({ error: 'forbidden' })
     }
+    // POSIX rename clobbers — if a new file was created at the
+    // original path after deletion, restoring would silently destroy
+    // it (and the clobbered file has no trash entry, so it's gone
+    // forever). Refuse if the target already exists; require the
+    // caller to clear it first or restore via a renamed path.
     const targetAbs = resolveVault(entry.storageKey, entry.owner)
+    const existing = await stat(targetAbs).catch(() => null)
+    if (existing) {
+      return reply.code(409).send({
+        error: 'destination path is in use; remove or rename it before restoring',
+      })
+    }
     await mkdir(path.dirname(targetAbs), { recursive: true })
     const blobName = entry.filename.replace(/\.\./g, '_').replace(/[\/\\]/g, '_')
     const src = path.join(config.paths.trash, entry.id, blobName)
@@ -1216,12 +1387,15 @@ export async function vaultRoutes(app: FastifyInstance) {
     } catch (e: any) {
       return reply.code(500).send({ error: `restore failed: ${e?.message ?? e}` })
     }
-    // Restore doc meta dir if present.
+    // Restore doc meta dir if present. Same collision guard so a
+    // concurrent re-index that allocated the same id doesn't get
+    // overwritten and the meta dir doesn't vanish silently.
     if (entry.docId) {
       const docSrc = path.join(config.paths.trash, entry.id, '_doc')
       const docDest = path.join(config.paths.documents, entry.docId)
-      const s = await stat(docSrc).catch(() => null)
-      if (s?.isDirectory()) {
+      const sSrc = await stat(docSrc).catch(() => null)
+      const sDest = await stat(docDest).catch(() => null)
+      if (sSrc?.isDirectory() && !sDest) {
         await rename(docSrc, docDest).catch(() => null)
       }
     }
@@ -1478,6 +1652,20 @@ export async function vaultRoutes(app: FastifyInstance) {
     await ensureUserVault(user.username).catch(() => null)
     const abs = resolveVault(rel, user.username)
     await mkdir(abs, { recursive: true })
+    // Inherit public state from the closest published ancestor so a
+    // sub-folder created inside a publicly-shared folder is itself
+    // public (cascade re-apply for late-created children).
+    const inherited = await closestPublicAncestor(user.username, rel)
+    if (inherited) {
+      const now = Date.now()
+      await saveFolderMeta({
+        ...freshFolderMeta(user.username, rel),
+        public: true,
+        publicExpiresAt: inherited.publicExpiresAt,
+        publicPasswordHash: inherited.publicPasswordHash,
+        updatedAt: now,
+      })
+    }
     await audit({ actor: user.username, action: 'vault.mkdir', target: rel })
     return { ok: true, path: rel }
   })
@@ -1488,17 +1676,50 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const { from, to } = req.body as { from?: string; to?: string }
     if (!from || !to) return reply.code(400).send({ error: 'missing from/to' })
+    if (from === to) return reply.code(400).send({ error: 'from and to are identical' })
     const absFrom = resolveVault(from, user.username)
     const absTo = resolveVault(to, user.username)
+    const srcStat = await stat(absFrom).catch(() => null)
+    if (!srcStat) return reply.code(404).send({ error: 'source not found' })
+    // POSIX rename silently clobbers the destination. Guard explicitly
+    // so a move never destroys an existing file/folder at `to`.
+    const dstStat = await stat(absTo).catch(() => null)
+    if (dstStat) return reply.code(409).send({ error: 'destination already exists' })
     await mkdir(path.dirname(absTo), { recursive: true })
     await rename(absFrom, absTo)
 
-    // If indexed, update the storageKey.
     const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === from && d.owner === user.username)
-    if (meta) {
-      await saveMeta({ ...meta, storageKey: to, updatedAt: Date.now() })
+    if (srcStat.isFile()) {
+      const meta = docs.find(
+        (d) => d.storageKey === from && d.owner === user.username,
+      )
+      if (meta) await saveMeta({ ...meta, storageKey: to, updatedAt: Date.now() })
+    } else if (srcStat.isDirectory()) {
+      // Folder move: rewrite the storageKey on every descendant doc
+      // and folder-meta so public/tag state survives the move and the
+      // index doesn't point at the old path.
+      const fromPrefix = from.replace(/\/+$/, '') + '/'
+      const toPrefix = to.replace(/\/+$/, '') + '/'
+      for (const d of docs) {
+        if (d.owner !== user.username) continue
+        if (d.storageKey !== from && !d.storageKey.startsWith(fromPrefix)) continue
+        const next =
+          d.storageKey === from ? to : toPrefix + d.storageKey.slice(fromPrefix.length)
+        await saveMeta({ ...d, storageKey: next, updatedAt: Date.now() })
+      }
+      const { deleteFolderMeta } = await import('../stores/folderMetas.js')
+      const folderMetas = await listFolderMetas(user.username)
+      for (const fm of folderMetas) {
+        if (fm.storageKey !== from && !fm.storageKey.startsWith(fromPrefix)) continue
+        const nextKey =
+          fm.storageKey === from ? to : toPrefix + fm.storageKey.slice(fromPrefix.length)
+        await saveFolderMeta({ ...fm, storageKey: nextKey, updatedAt: Date.now() })
+        if (nextKey !== fm.storageKey) {
+          await deleteFolderMeta(user.username, fm.storageKey).catch(() => null)
+        }
+      }
     }
+    invalidateSearchCache()
     await audit({ actor: user.username, action: 'vault.move', target: from, meta: { to } })
     return { ok: true }
   })
@@ -1518,9 +1739,14 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     const meta = ctx.meta
     if (meta) {
-      // Redact the password hash from public meta so the UI can show
-      // "password required" without leaking the hash.
-      const safe = redactPublicMeta(meta)
+      // Owner sees the full meta (their own data); cross-owner /
+      // anonymous viewers get the stricter redaction so we don't leak
+      // ACL members, the sha256, or internal id alongside the public
+      // share. (Password hash is always stripped.)
+      const isOwner = !!requester && meta.owner === requester
+      const safe = isOwner
+        ? redactPublicMeta(meta)
+        : (redactForPublicViewer(meta) as DocumentMeta)
       if (meta.public) {
         const gate = publicGate(meta, publicPassword)
         if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
@@ -1723,7 +1949,7 @@ export async function vaultRoutes(app: FastifyInstance) {
       target: body.path,
       meta: { tags },
     })
-    return { document: next }
+    return { document: redactPublicMeta(next) }
   })
 
   // ---- folders ------------------------------------------------------------
@@ -1892,28 +2118,35 @@ export async function vaultRoutes(app: FastifyInstance) {
         failedFiles++
       }
     }
+    let failedFolders = 0
     for (const subRel of folders) {
-      const sub = await getFolderMeta(user.username, subRel)
-      await saveFolderMeta({
-        ...(sub ?? freshFolderMeta(user.username, subRel)),
-        owner: user.username,
-        storageKey: subRel,
-        public: body.public,
-        publicExpiresAt: body.public ? expiresAt : null,
-        publicPasswordHash: body.public ? passwordHash : null,
-        updatedAt: now,
-      })
-      await audit({
-        actor: user.username,
-        action: 'vault.folder-visibility',
-        target: subRel,
-        meta: {
+      try {
+        const sub = await getFolderMeta(user.username, subRel)
+        await saveFolderMeta({
+          ...(sub ?? freshFolderMeta(user.username, subRel)),
+          owner: user.username,
+          storageKey: subRel,
           public: body.public,
-          hasPassword: !!passwordHash,
-          expiresAt,
-          cascadedFrom: body.path,
-        },
-      })
+          publicExpiresAt: body.public ? expiresAt : null,
+          publicPasswordHash: body.public ? passwordHash : null,
+          updatedAt: now,
+        })
+        await audit({
+          actor: user.username,
+          action: 'vault.folder-visibility',
+          target: subRel,
+          meta: {
+            public: body.public,
+            hasPassword: !!passwordHash,
+            expiresAt,
+            cascadedFrom: body.path,
+          },
+        })
+      } catch {
+        // Don't abort the whole cascade on one sub-folder failure;
+        // record + continue so the rest still flip.
+        failedFolders++
+      }
     }
     invalidateSearchCache()
     publish({ type: 'visibility', path: body.path, public: body.public })

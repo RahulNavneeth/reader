@@ -15,6 +15,7 @@ import {
 } from '../stores/users.js'
 import { ensureUserVault } from '../lib/userVault.js'
 import { createToken, deleteToken, listTokens } from '../stores/tokens.js'
+import { deleteAllSessionsForUser } from '../stores/sessions.js'
 import { loadSettings, saveSettings, RESTART_REQUIRED_KEYS, type WorkspaceSettings } from '../stores/settings.js'
 import { hashPassword } from '../services/auth.js'
 import type { Role, User } from '../types.js'
@@ -55,6 +56,13 @@ export async function adminRoutes(app: FastifyInstance) {
         body.quotaBytes === undefined ? u.quotaBytes : body.quotaBytes ?? undefined,
     }
     await saveUser(next)
+    // If we just disabled the user OR demoted them, revoke every
+    // active session so other tabs don't keep working until expiry.
+    const becameDisabled = !u.disabled && next.disabled
+    const roleChanged = body.role !== undefined && body.role !== u.role
+    if (becameDisabled || roleChanged) {
+      await deleteAllSessionsForUser(username).catch(() => null)
+    }
     await audit({
       actor: req.currentUser!.username,
       action: 'admin.user.patch',
@@ -199,7 +207,28 @@ export async function adminRoutes(app: FastifyInstance) {
     if (body.smtp) invalidateMailCache()
     // Vault root may have moved — re-arm the file watcher against the new path.
     if (body.vaultRoot !== undefined) restartVaultWatcher(req.server.log)
-    await audit({ actor: req.currentUser!.username, action: 'admin.settings.patch', meta: { ...body, smtp: body.smtp ? { ...body.smtp, pass: body.smtp.pass ? '***' : undefined } : undefined } })
+    // Redact every secret-bearing field before audit: SMTP password, S3
+    // credentials. Previously the S3 access/secret keys went to the
+    // audit log in plaintext alongside whatever rest got spread in.
+    const auditMeta = {
+      ...body,
+      smtp: body.smtp
+        ? { ...body.smtp, pass: body.smtp.pass ? '***' : undefined }
+        : undefined,
+      storage: body.storage
+        ? {
+            ...body.storage,
+            s3: body.storage.s3
+              ? {
+                  ...body.storage.s3,
+                  accessKey: body.storage.s3.accessKey ? '***' : undefined,
+                  secretKey: body.storage.s3.secretKey ? '***' : undefined,
+                }
+              : undefined,
+          }
+        : undefined,
+    }
+    await audit({ actor: req.currentUser!.username, action: 'admin.settings.patch', meta: auditMeta })
     const touchedRestartKey = RESTART_REQUIRED_KEYS.some((k) => k in body)
     return { settings: next, restartRequired: touchedRestartKey }
   })
@@ -439,7 +468,9 @@ export async function adminRoutes(app: FastifyInstance) {
         role: t.role,
         createdBy: t.createdBy,
         createdAt: t.createdAt,
+        expiresAt: t.expiresAt,
         lastUsedAt: t.lastUsedAt,
+        useCount: t.useCount,
         disabled: t.disabled,
       })),
     }
@@ -450,11 +481,22 @@ export async function adminRoutes(app: FastifyInstance) {
       .object({
         name: z.string().min(1).max(64),
         role: roleSchema.default('editor'),
+        // null = non-expiring (opt-in); default 90 days.
+        expiresInDays: z.number().int().min(1).max(3650).nullable().optional(),
       })
       .parse(req.body)
-    const { secret, record } = await createToken({ name: body.name, role: body.role, createdBy: req.currentUser!.username })
-    await audit({ actor: req.currentUser!.username, action: 'admin.token.create', target: record.id })
-    // Plain secret returned ONCE; never persisted.
+    const { secret, record } = await createToken({
+      name: body.name,
+      role: body.role,
+      createdBy: req.currentUser!.username,
+      expiresInDays: body.expiresInDays,
+    })
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.token.create',
+      target: record.id,
+      meta: { role: body.role, expiresAt: record.expiresAt },
+    })
     return reply.code(201).send({
       secret,
       token: {
@@ -463,6 +505,7 @@ export async function adminRoutes(app: FastifyInstance) {
         role: record.role,
         createdBy: record.createdBy,
         createdAt: record.createdAt,
+        expiresAt: record.expiresAt,
       },
     })
   })
@@ -564,7 +607,11 @@ export async function adminRoutes(app: FastifyInstance) {
       .object({
         url: z.string().url(),
         events: z.array(z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility'])).min(1),
-        secret: z.string().optional(),
+        // Secret is REQUIRED — without it, any third party that
+        // discovers the receiver URL can forge events. Min 16 chars
+        // because HMAC truncation isn't a meaningful attack on shorter
+        // keys but key entropy still matters.
+        secret: z.string().min(16),
         enabled: z.boolean().optional(),
       })
       .parse(req.body)

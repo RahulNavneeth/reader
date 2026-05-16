@@ -58,16 +58,57 @@ async function main() {
     parseOptions: {},
   })
 
+  // CORS — in production, only the configured origin(s) are allowed
+  // with credentials. ALLOWED_ORIGINS is a comma-separated list. In
+  // dev (NODE_ENV != production), any localhost / 127.0.0.1 origin is
+  // accepted so the Vite dev server on whatever port works.
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const isProdEnv = process.env.NODE_ENV === 'production'
   await app.register(cors, {
     origin: (origin, cb) => {
       if (!origin) return cb(null, true)
-      // Allow any localhost origin in dev; production should set CORS via reverse proxy.
-      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      if (allowedOrigins.includes(origin)) return cb(null, true)
+      if (!isProdEnv && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
         return cb(null, true)
       }
       cb(null, false)
     },
     credentials: true,
+  })
+
+  // CSRF guard for cookie-authed state-changing requests. Browsers
+  // attach the session cookie to any cross-site POST by default; if
+  // we trust them blindly, attacker.com can submit /api/file/bulk-
+  // delete on the user's behalf. Strategy: every mutating request
+  // must either (a) be same-origin (Origin header matches Host) or
+  // (b) come with `X-Requested-With: fetch` which non-Reader sites
+  // can't set without a CORS preflight (and our CORS allowlist
+  // already blocks unknown origins).
+  app.addHook('preHandler', async (req, reply) => {
+    const method = req.method.toUpperCase()
+    if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return
+    // SSE / health / public unauthenticated endpoints don't need a
+    // cookie, so they aren't CSRF targets. The check only kicks in
+    // for cookie-bearing requests.
+    if (!req.cookies?.[config.session.cookieName]) return
+    const origin = (req.headers.origin as string | undefined) ?? ''
+    const host = (req.headers.host as string | undefined) ?? ''
+    const xrw = (req.headers['x-requested-with'] as string | undefined) ?? ''
+    // Same-origin check: extract host from Origin and compare.
+    let originHost = ''
+    try {
+      if (origin) originHost = new URL(origin).host
+    } catch {
+      /* malformed Origin → fall through, will fail check */
+    }
+    const sameOrigin = !!origin && originHost === host
+    const hasXrw = xrw.toLowerCase() === 'fetch' || xrw.toLowerCase() === 'xmlhttprequest'
+    if (!sameOrigin && !hasXrw) {
+      reply.code(403).send({ error: 'csrf check failed; missing Origin or X-Requested-With' })
+    }
   })
 
   await app.register(multipart, {
@@ -115,15 +156,24 @@ async function main() {
     })
   }
 
-  // Best-effort: drop expired sessions on boot.
-  sweepExpired()
-    .then((n) => n > 0 && app.log.info({ removed: n }, 'session sweep'))
-    .catch((err) => app.log.warn({ err }, 'session sweep failed'))
+  // Best-effort: drop expired sessions on boot, then re-run hourly so
+  // orphaned files don't accumulate between restarts. (Used to only
+  // run at boot; long-running deployments leaked stale tokens on
+  // disk.)
+  const runSessionSweep = () =>
+    sweepExpired()
+      .then((n) => n > 0 && app.log.info({ removed: n }, 'session sweep'))
+      .catch((err) => app.log.warn({ err }, 'session sweep failed'))
+  runSessionSweep()
+  setInterval(runSessionSweep, 60 * 60 * 1000).unref()
 
-  // Purge trash older than the 30-day retention.
-  sweepExpiredTrash()
-    .then((n) => n > 0 && app.log.info({ purged: n }, 'trash sweep'))
-    .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
+  // Purge trash older than the 30-day retention. Same pattern — hourly.
+  const runTrashSweep = () =>
+    sweepExpiredTrash()
+      .then((n) => n > 0 && app.log.info({ purged: n }, 'trash sweep'))
+      .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
+  runTrashSweep()
+  setInterval(runTrashSweep, 60 * 60 * 1000).unref()
 
   // Warm the search cache; check Ollama presence (just informational).
   preheat().catch(() => null)

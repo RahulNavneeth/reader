@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import crypto from 'node:crypto'
 
 const HOME = os.homedir()
 
@@ -52,11 +53,20 @@ function envBool(key: string, fallback: boolean): boolean {
 const dataDir = anchor.dataDir
   ? expand(anchor.dataDir)
   : expand(envStr('DATA_DIR', './data'))
+const nodeEnv = process.env.NODE_ENV ?? 'development'
+const isProd = nodeEnv === 'production'
 const sessionSecret = envStr('SESSION_SECRET', '')
 if (!sessionSecret || sessionSecret.length < 32) {
+  if (isProd) {
+    // Refuse to boot in production with a missing/weak signing key —
+    // forging session cookies would otherwise be trivial.
+    throw new Error(
+      '[config] SESSION_SECRET is required (>= 32 chars) in production. Refusing to boot.',
+    )
+  }
   console.warn(
     '[config] SESSION_SECRET is missing or shorter than 32 chars. ' +
-      'Cookies will use a generated dev secret that resets on every boot — DO NOT use in production.',
+      'Cookies will use a CSPRNG dev secret that resets on every boot — DO NOT use in production.',
   )
 }
 
@@ -107,7 +117,9 @@ export const config = {
   session: {
     secret: sessionSecret || randomDevSecret(),
     cookieName: 'reader_sid',
-    secure: envBool('COOKIE_SECURE', false),
+    // Default `secure: true` in production so session cookies are never
+    // sent over plain HTTP; opt-out is `COOKIE_SECURE=false` only.
+    secure: envBool('COOKIE_SECURE', isProd),
     sameSite: (envStr('COOKIE_SAMESITE', 'lax') as 'lax' | 'strict' | 'none'),
     ttlMs: envInt('SESSION_TTL_DAYS', 30) * 24 * 60 * 60 * 1000,
   },
@@ -138,8 +150,10 @@ export const config = {
 }
 
 function randomDevSecret(): string {
-  // Stable-ish per process. Cookies issued in dev will not survive a restart — fine.
-  return 'dev-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
+  // CSPRNG, not Math.random — even in dev, a guessable cookie signing
+  // key is a footgun (V8 random state is recoverable from a few
+  // outputs). Stable per-process; cookies don't survive restart.
+  return 'dev-' + crypto.randomBytes(32).toString('hex')
 }
 
 export function expandPath(p: string): string {

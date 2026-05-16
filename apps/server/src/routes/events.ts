@@ -24,11 +24,28 @@ export async function eventsRoutes(app: FastifyInstance) {
     })
     reply.raw.write(`: connected ${Date.now()}\n\n`)
 
+    // Bail on slow clients — without backpressure handling, a stuck
+    // socket buffers in Node's writable stream and a burst (e.g. a
+    // folder-cascade firing N visibility events) grows memory
+    // unbounded per stuck client. Cap pending bytes ~256 KB; over
+    // that, close the connection and let the client reconnect.
+    let dropped = false
+    const PENDING_LIMIT = 256 * 1024
     const send = (e: ReaderEvent) => {
+      if (dropped) return
       try {
-        reply.raw.write(`data: ${JSON.stringify(e)}\n\n`)
+        const writable = reply.raw.write(`data: ${JSON.stringify(e)}\n\n`)
+        const bufLen = (reply.raw as { writableLength?: number }).writableLength ?? 0
+        if (!writable && bufLen > PENDING_LIMIT) {
+          dropped = true
+          try {
+            reply.raw.end()
+          } catch {
+            /* socket already gone */
+          }
+        }
       } catch {
-        // Socket has gone away; the close handler below will clean up.
+        dropped = true
       }
     }
 

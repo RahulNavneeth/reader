@@ -10,7 +10,7 @@ import {
 } from '../stores/userShares.js'
 import { getUser } from '../stores/users.js'
 import { listAllDocuments } from '../stores/documents.js'
-import { userVaultRoot } from '../lib/userVault.js'
+import { resolveUserVault, userVaultRoot } from '../lib/userVault.js'
 import { audit } from '../stores/audit.js'
 
 /**
@@ -28,6 +28,9 @@ export async function userSharesRoutes(app: FastifyInstance) {
   app.post('/api/file/share-with', async (req, reply) => {
     if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
     const owner = req.currentUser
+    // Viewer accounts are read-only by policy; minting share grants is a
+    // mutation (creates an ACL record + audit trail + cascade writes).
+    if (owner.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const body = req.body as {
       path?: string
       recipient?: string
@@ -41,10 +44,23 @@ export async function userSharesRoutes(app: FastifyInstance) {
     }
     const recipient = await getUser(body.recipient)
     if (!recipient) return reply.code(404).send({ error: 'unknown recipient' })
+    if (recipient.disabled) return reply.code(400).send({ error: 'recipient disabled' })
 
-    // The path must exist under the owner's namespace; figure out whether
-    // it's a file or directory so cascade rules apply correctly.
-    const abs = path.join(userVaultRoot(owner.username), body.path)
+    // Normalize + harden the share path through resolveUserVault — without
+    // this, a raw `path.join` accepts `..` segments and lets the caller
+    // forge a share record pointing into another user's vault (which then
+    // leaks structure via /api/files/search's shared-folder walk).
+    let abs: string
+    let normalizedPath: string
+    try {
+      abs = resolveUserVault(owner.username, body.path)
+      // Re-derive the canonical relative form so the saved storageKey
+      // doesn't carry trailing slashes or redundant segments.
+      const rootLen = userVaultRoot(owner.username).length
+      normalizedPath = abs.slice(rootLen + 1)
+    } catch {
+      return reply.code(400).send({ error: 'invalid path' })
+    }
     const st = await stat(abs).catch(() => null)
     if (!st) return reply.code(404).send({ error: 'path not found in your vault' })
     const isFolder = st.isDirectory()
@@ -52,7 +68,7 @@ export async function userSharesRoutes(app: FastifyInstance) {
     const share = await createUserShare({
       owner: owner.username,
       recipient: recipient.username,
-      storageKey: body.path,
+      storageKey: normalizedPath,
       isFolder,
       canEdit: !!body.canEdit,
       label: body.label,
@@ -60,7 +76,7 @@ export async function userSharesRoutes(app: FastifyInstance) {
     await audit({
       actor: owner.username,
       action: 'vault.share-with',
-      target: body.path,
+      target: normalizedPath,
       meta: { recipient: recipient.username, canEdit: share.canEdit, isFolder },
     })
     // When a folder is shared, also write an audit entry for every
@@ -83,8 +99,8 @@ export async function userSharesRoutes(app: FastifyInstance) {
             if (e.name === 'node_modules' || e.name === 'dist' || e.name === 'build') continue
             const childAbs = path.join(curAbs, e.name)
             const childRel = curRel ? `${curRel}/${e.name}` : e.name
-            const fullRel = body.path
-              ? `${body.path.replace(/\/+$/, '')}/${childRel}`
+            const fullRel = normalizedPath
+              ? `${normalizedPath.replace(/\/+$/, '')}/${childRel}`
               : childRel
             await audit({
               actor: owner.username,
@@ -93,7 +109,7 @@ export async function userSharesRoutes(app: FastifyInstance) {
               meta: {
                 recipient: recipient.username,
                 canEdit: share.canEdit,
-                cascadedFrom: body.path,
+                cascadedFrom: normalizedPath,
               },
             })
             if (e.isDirectory()) await walk(childAbs, childRel)
@@ -138,6 +154,7 @@ export async function userSharesRoutes(app: FastifyInstance) {
   app.delete('/api/file/share-with/:id', async (req, reply) => {
     if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
     const user = req.currentUser
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const { id } = req.params as { id: string }
     const share = await getUserShare(id)
     if (!share) return reply.code(404).send({ error: 'not found' })

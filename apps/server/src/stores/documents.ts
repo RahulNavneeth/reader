@@ -64,8 +64,26 @@ export async function writePreview(id: string, buffer: Buffer): Promise<void> {
   await writeFile(previewFile(id), buffer)
 }
 
+// Per-doc-id serialization. Without this, two concurrent saveMeta(sameId)
+// calls each create their own temp file and the second rename silently
+// wins — the first writer's mutation vanishes (e.g. concurrent tag edit
+// + visibility flip would lose one side). Cheap promise chain per id;
+// chain is dropped once empty so the map can't grow unbounded.
+const saveLocks = new Map<string, Promise<void>>()
+
 export async function saveMeta(meta: DocumentMeta): Promise<void> {
-  await writeJson(metaFile(meta.id), meta)
+  const id = meta.id
+  const prev = saveLocks.get(id) ?? Promise.resolve()
+  const next = prev
+    .catch(() => undefined)
+    .then(() => writeJson(metaFile(id), meta))
+  saveLocks.set(id, next)
+  try {
+    await next
+  } finally {
+    // Only clear if no newer call has taken the slot since.
+    if (saveLocks.get(id) === next) saveLocks.delete(id)
+  }
 }
 
 export async function loadMeta(id: string): Promise<DocumentMeta | null> {

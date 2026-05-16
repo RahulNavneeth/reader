@@ -110,6 +110,10 @@ export type ApiToken = {
   role: Role
   createdBy: string
   createdAt: number
+  /** Epoch ms after which the token is rejected. null = no expiry. */
+  expiresAt?: number | null
   lastUsedAt?: number
+  /** Total accepted uses. Surfaced in the admin UI for orphan-detection. */
+  useCount?: number
   disabled?: boolean
 }

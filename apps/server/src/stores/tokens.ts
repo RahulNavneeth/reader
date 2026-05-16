@@ -13,10 +13,17 @@ export function hashToken(secret: string): string {
 }
 
 /** Returns the plaintext secret to show ONCE; the hash is what's stored. */
-export async function createToken(opts: { name: string; role: Role; createdBy: string }): Promise<{ secret: string; record: ApiToken }> {
+export async function createToken(opts: {
+  name: string
+  role: Role
+  createdBy: string
+  /** Token expiry. Defaults to 90 days; pass `null` for non-expiring. */
+  expiresInDays?: number | null
+}): Promise<{ secret: string; record: ApiToken }> {
   const secret = 'rkn_' + crypto.randomBytes(24).toString('base64url')
   const id = secret.slice(0, 12)
   const hash = hashToken(secret)
+  const expiresIn = opts.expiresInDays === undefined ? 90 : opts.expiresInDays
   const rec: ApiToken = {
     id,
     name: opts.name,
@@ -24,6 +31,9 @@ export async function createToken(opts: { name: string; role: Role; createdBy: s
     role: opts.role,
     createdBy: opts.createdBy,
     createdAt: Date.now(),
+    expiresAt:
+      expiresIn === null ? null : Date.now() + expiresIn * 24 * 60 * 60 * 1000,
+    useCount: 0,
   }
   await writeJson(tokenFile(hash), rec)
   return { secret, record: rec }
@@ -33,8 +43,14 @@ export async function findTokenBySecret(secret: string): Promise<ApiToken | null
   const hash = hashToken(secret)
   const rec = await readJson<ApiToken>(tokenFile(hash))
   if (!rec || rec.disabled) return null
-  // Touch lastUsedAt async, fire and forget.
-  void writeJson(tokenFile(hash), { ...rec, lastUsedAt: Date.now() }).catch(() => {})
+  // Reject expired tokens; non-expiring (expiresAt === null) is fine.
+  if (rec.expiresAt != null && rec.expiresAt < Date.now()) return null
+  // Touch lastUsedAt + bump useCount async, fire and forget.
+  void writeJson(tokenFile(hash), {
+    ...rec,
+    lastUsedAt: Date.now(),
+    useCount: (rec.useCount ?? 0) + 1,
+  }).catch(() => {})
   return rec
 }
 

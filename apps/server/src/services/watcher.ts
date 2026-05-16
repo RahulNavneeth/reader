@@ -87,7 +87,16 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
   const existing = docs.find((d) => d.storageKey === rel && d.owner === owner)
   // No-op if disk content matches stored sha — saves work when the daemon
   // itself triggered the write (uploads, our own ingest writes, etc.).
+  //
+  // Special case: stub metas created by visibility/tag endpoints write
+  // sha256: ''. Those shouldn't trigger a re-ingest on the next
+  // chokidar event for an unchanged file. Backfill the real sha into
+  // the stub and skip the re-ingest.
   if (existing && existing.sha256 === sha) return
+  if (existing && existing.sha256 === '') {
+    await saveMeta({ ...existing, sha256: sha, bytes: buffer.length, updatedAt: Date.now() })
+    return
+  }
   const id = existing?.id ?? nanoid()
   const filename = path.basename(absPath)
   const meta: DocumentMeta = {

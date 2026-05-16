@@ -168,7 +168,9 @@ export type ApiTokenInfo = {
   role: Role
   createdBy: string
   createdAt: number
+  expiresAt?: number | null
   lastUsedAt?: number
+  useCount?: number
   disabled?: boolean
 }
 
@@ -181,10 +183,16 @@ export class ApiError extends Error {
 }
 
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
+  // X-Requested-With satisfies the server's CSRF guard on mutating
+  // requests (browsers can't set custom headers cross-origin without
+  // a CORS preflight, which our origin allowlist blocks). Cheap to
+  // always send.
+  const headers: Record<string, string> = { 'X-Requested-With': 'fetch' }
+  if (body) headers['Content-Type'] = 'application/json'
   const res = await fetch(url, {
     method,
     credentials: 'include',
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   })
   if (!res.ok) {
@@ -258,6 +266,7 @@ export const api = {
     const res = await fetch('/api/file/upload', {
       method: 'POST',
       credentials: 'include',
+      headers: { 'X-Requested-With': 'fetch' },
       body: fd,
     })
     if (!res.ok) {
@@ -428,6 +437,7 @@ export const api = {
     fetch(`/api/file/share-with/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       credentials: 'include',
+      headers: { 'X-Requested-With': 'fetch' },
     }).then(async (r) => {
       if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
       return r.json() as Promise<{ ok: true }>
@@ -447,6 +457,7 @@ export const api = {
     fetch(`/api/views/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       credentials: 'include',
+      headers: { 'X-Requested-With': 'fetch' },
     }).then(async (r) => {
       if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
       return r.json() as Promise<{ ok: true }>
@@ -481,7 +492,7 @@ export const api = {
     }>('/api/trash'),
   trashRestore: (id: string) => post<{ ok: true }>(`/api/trash/${encodeURIComponent(id)}/restore`),
   trashPurge: (id: string) =>
-    fetch(`/api/trash/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include' }).then(
+    fetch(`/api/trash/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include', headers: { 'X-Requested-With': 'fetch' } }).then(
       async (r) => {
         if (!r.ok) {
           const data = await r.json().catch(() => ({}))
@@ -491,7 +502,7 @@ export const api = {
       },
     ),
   deleteFile: (rel: string) =>
-    fetch(`/api/file${q({ path: rel })}`, { method: 'DELETE', credentials: 'include' }).then(
+    fetch(`/api/file${q({ path: rel })}`, { method: 'DELETE', credentials: 'include', headers: { 'X-Requested-With': 'fetch' } }).then(
       async (r) => {
         if (!r.ok) {
           const data = await r.json().catch(() => ({}))
@@ -520,6 +531,7 @@ export const api = {
     fetch(`/api/admin/users/${encodeURIComponent(username)}`, {
       method: 'DELETE',
       credentials: 'include',
+      headers: { 'X-Requested-With': 'fetch' },
     }).then(async (r) => {
       if (!r.ok) {
         const data = await r.json().catch(() => ({}))
@@ -598,7 +610,7 @@ export const api = {
   }) =>
     post<{ webhook: any }>('/api/admin/webhooks', body),
   adminDeleteWebhook: (id: string) =>
-    fetch(`/api/admin/webhooks/${id}`, { method: 'DELETE', credentials: 'include' }).then(
+    fetch(`/api/admin/webhooks/${id}`, { method: 'DELETE', credentials: 'include', headers: { 'X-Requested-With': 'fetch' } }).then(
       async (r) => {
         if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
         return r.json() as Promise<{ ok: true }>
@@ -621,7 +633,7 @@ export const api = {
   adminCreateToken: (name: string, role: Role) =>
     post<{ secret: string; token: ApiTokenInfo }>('/api/admin/tokens', { name, role }),
   adminDeleteToken: (id: string) =>
-    fetch(`/api/admin/tokens/${id}`, { method: 'DELETE', credentials: 'include' }).then((r) => {
+    fetch(`/api/admin/tokens/${id}`, { method: 'DELETE', credentials: 'include', headers: { 'X-Requested-With': 'fetch' } }).then((r) => {
       if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
       return r.json() as Promise<{ ok: true }>
     }),
