@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { History, Loader2 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
 type Version = {
   ts: number
@@ -23,6 +24,11 @@ export function VersionsButton({ path }: { path: string }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
+  const resolvedAlign = useAnchoredAlign({
+    triggerRef: rootRef,
+    popoverWidth: 480,
+    open,
+  })
 
   useEffect(() => {
     if (!open) {
@@ -82,14 +88,20 @@ export function VersionsButton({ path }: { path: string }) {
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
         title="Version history"
+        aria-expanded={open}
+        style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
       >
         <History size={13} />
         Versions
       </button>
       {open && (
         <div
-          className="absolute right-0 top-full mt-1 z-50 w-[480px] rounded-md shadow-card overflow-hidden"
-          style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
+          className="absolute top-full mt-1 z-50 w-[480px] rounded-md shadow-card overflow-hidden"
+          style={{
+            background: 'var(--panel)',
+            border: '1px solid var(--border)',
+            ...alignStyle(resolvedAlign),
+          }}
         >
           <div className="flex h-[320px]">
             <div className="w-[180px] overflow-y-auto" style={{ borderRight: '1px solid var(--border-soft)' }}>

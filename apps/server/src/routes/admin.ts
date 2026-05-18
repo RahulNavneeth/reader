@@ -29,6 +29,26 @@ import { readFile } from 'node:fs/promises'
 
 const roleSchema = z.enum(['admin', 'editor', 'viewer'])
 
+// Shared shape returned by the Duplicates endpoint for each member
+// of an exact or perceptual group.
+function toDocSummary(d: {
+  id: string
+  storageKey: string
+  title: string
+  bytes: number
+  createdAt: number
+  owner: string
+}) {
+  return {
+    id: d.id,
+    storageKey: d.storageKey,
+    title: d.title,
+    bytes: d.bytes,
+    createdAt: d.createdAt,
+    owner: d.owner,
+  }
+}
+
 export async function adminRoutes(app: FastifyInstance) {
   app.addHook('preHandler', app.requireAdmin)
 
@@ -563,37 +583,97 @@ export async function adminRoutes(app: FastifyInstance) {
   // Groups of documents sharing a sha256. The "keep" candidate is the oldest;
   // the admin can trash the rest from the UI.
   app.get('/api/admin/duplicates', async () => {
+    const { hammingDistance } = await import('../services/perceptualHash.js')
     const docs = await listAllDocuments()
-    const groups = new Map<string, typeof docs>()
+
+    // ─── Exact duplicates (sha256) ─────────────────────────────────
+    const shaGroups = new Map<string, typeof docs>()
     for (const d of docs) {
       if (!d.sha256) continue
-      const arr = groups.get(d.sha256) ?? []
+      const arr = shaGroups.get(d.sha256) ?? []
       arr.push(d)
-      groups.set(d.sha256, arr)
+      shaGroups.set(d.sha256, arr)
     }
-    const out: Array<{
+    const exact: Array<{
+      kind: 'exact'
       sha256: string
       bytes: number
       docs: Array<{ id: string; storageKey: string; title: string; bytes: number; createdAt: number; owner: string }>
     }> = []
-    for (const [sha256, arr] of groups) {
+    for (const [sha256, arr] of shaGroups) {
       if (arr.length < 2) continue
       arr.sort((a, b) => a.createdAt - b.createdAt)
-      out.push({
+      exact.push({
+        kind: 'exact',
         sha256,
         bytes: arr[0].bytes,
-        docs: arr.map((d) => ({
-          id: d.id,
-          storageKey: d.storageKey,
-          title: d.title,
-          bytes: d.bytes,
-          createdAt: d.createdAt,
-          owner: d.owner,
-        })),
+        docs: arr.map(toDocSummary),
       })
     }
-    out.sort((a, b) => b.docs.length - a.docs.length || b.bytes - a.bytes)
-    return { groups: out }
+
+    // ─── Near-duplicates (perceptual hash) ─────────────────────────
+    // Bucket images by pHash, then union-find by Hamming distance ≤ 6
+    // (the typical "same shot, re-encoded" threshold for an 8x8
+    // dHash). Skip anything already in an exact group — those would
+    // also dHash-match but we don't want to double-list them.
+    const exactIds = new Set<string>()
+    for (const g of exact) for (const d of g.docs) exactIds.add(d.id)
+
+    const hashed = docs.filter(
+      (d) => d.pHash && typeof d.pHash === 'string' && !exactIds.has(d.id),
+    )
+    // Simple O(n²) clustering — fine up to a few thousand images. For
+    // a larger vault this becomes the bottleneck; consider an LSH
+    // index then.
+    const parent = new Map<string, string>()
+    const find = (x: string): string => {
+      const p = parent.get(x)
+      if (!p || p === x) return x
+      const root = find(p)
+      parent.set(x, root)
+      return root
+    }
+    const union = (a: string, b: string) => {
+      const ra = find(a)
+      const rb = find(b)
+      if (ra !== rb) parent.set(ra, rb)
+    }
+    for (const d of hashed) parent.set(d.id, d.id)
+    for (let i = 0; i < hashed.length; i++) {
+      for (let j = i + 1; j < hashed.length; j++) {
+        if (hammingDistance(hashed[i].pHash!, hashed[j].pHash!) <= 6) {
+          union(hashed[i].id, hashed[j].id)
+        }
+      }
+    }
+    const clusters = new Map<string, typeof docs>()
+    for (const d of hashed) {
+      const root = find(d.id)
+      const arr = clusters.get(root) ?? []
+      arr.push(d)
+      clusters.set(root, arr)
+    }
+    const near: Array<{
+      kind: 'near'
+      pHash: string
+      docs: Array<{ id: string; storageKey: string; title: string; bytes: number; createdAt: number; owner: string }>
+    }> = []
+    for (const arr of clusters.values()) {
+      if (arr.length < 2) continue
+      arr.sort((a, b) => a.createdAt - b.createdAt)
+      near.push({
+        kind: 'near',
+        pHash: arr[0].pHash!,
+        docs: arr.map(toDocSummary),
+      })
+    }
+
+    const groups = [...exact, ...near].sort(
+      (a, b) =>
+        b.docs.length - a.docs.length ||
+        ('bytes' in b ? b.bytes : 0) - ('bytes' in a ? a.bytes : 0),
+    )
+    return { groups }
   })
 
   // Webhook config CRUD. Stored in workspace settings — global, not per-user.
@@ -606,7 +686,7 @@ export async function adminRoutes(app: FastifyInstance) {
     const body = z
       .object({
         url: z.string().url(),
-        events: z.array(z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility'])).min(1),
+        events: z.array(z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility', 'ingest'])).min(1),
         // Secret is REQUIRED — without it, any third party that
         // discovers the receiver URL can forge events. Min 16 chars
         // because HMAC truncation isn't a meaningful attack on shorter

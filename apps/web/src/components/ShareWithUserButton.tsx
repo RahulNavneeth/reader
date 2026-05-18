@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Users, Loader2, X } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
 type Props = {
   /** One or more vault-relative paths to share with a single recipient.
@@ -47,6 +48,11 @@ export function ShareWithUserButton({ paths }: Props) {
   // click.
   const [rowBusy, setRowBusy] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
+  const resolvedAlign = useAnchoredAlign({
+    triggerRef: rootRef,
+    popoverWidth: 340,
+    open,
+  })
 
   useEffect(() => {
     if (!open) return
@@ -181,14 +187,24 @@ export function ShareWithUserButton({ paths }: Props) {
 
   return (
     <div ref={rootRef} className="relative inline-flex">
-      <button className="btn-ghost" onClick={() => setOpen((v) => !v)} title="Share with another user">
+      <button
+        className="btn-ghost"
+        onClick={() => setOpen((v) => !v)}
+        title="Share with another user"
+        aria-expanded={open}
+        style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
+      >
         <Users size={13} />
         Share
       </button>
       {open && (
         <div
-          className="absolute right-0 top-full mt-1 z-50 w-[340px] rounded-md shadow-card overflow-hidden"
-          style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
+          className="absolute top-full mt-1 z-50 w-[340px] rounded-md shadow-card overflow-hidden"
+          style={{
+            background: 'var(--panel)',
+            border: '1px solid var(--border)',
+            ...alignStyle(resolvedAlign),
+          }}
         >
           <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border-soft)' }}>
             <div className="text-[12.5px] font-medium text-fg">

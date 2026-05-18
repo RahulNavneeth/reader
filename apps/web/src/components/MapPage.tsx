@@ -119,20 +119,25 @@ export function MapPage() {
   }, [])
 
   // Proximity-based clustering. Each pin joins the nearest existing
-  // cluster within CLUSTER_RADIUS_M; otherwise it seeds a new one.
-  // Why not coord-rounding? toFixed(4) buckets photos by *grid cells*,
-  // so two shots taken 2m apart can land in different cells purely
-  // because they straddle a 4-decimal boundary — looks broken to a
-  // user who knows they were standing in the same spot.
+  // cluster within a zoom-aware radius; otherwise it seeds a new one.
   //
-  // 120m is a deliberate choice: bigger than typical phone-GPS jitter
-  // (~10-30m), but small enough that two photos on different blocks
-  // stay separate at city zoom. Cluster centroid is updated as a
-  // running mean so pins added later still pull the marker toward
-  // the centroid.
+  // The radius scales with the current map zoom: at world zoom (2)
+  // we want ~100km clusters so a continent doesn't render as 5,000
+  // separate markers, but at street zoom (16) we want ~10m so two
+  // photos on the same block stay distinct. Empirical scaling:
+  //
+  //   zoom  2 → 100_000 m  (continent)
+  //   zoom  6 →   6_000 m  (metro)
+  //   zoom 10 →     400 m  (neighborhood)
+  //   zoom 14 →      25 m  (street)
+  //   zoom 18+→       2 m  (individual)
+  //
+  // Halving every zoom level roughly tracks the tile-size doubling,
+  // so cluster density on screen stays visually constant as the user
+  // zooms in/out.
   const clusters: Cluster[] = useMemo(() => {
     if (!pins) return []
-    const CLUSTER_RADIUS_M = 120
+    const CLUSTER_RADIUS_M = Math.max(2, Math.round(400000 / Math.pow(2, zoom)))
     const out: Cluster[] = []
     for (const p of pins) {
       let nearest: Cluster | null = null
@@ -156,7 +161,7 @@ export function MapPage() {
       }
     }
     return out
-  }, [pins])
+  }, [pins, zoom])
 
   // Initial bounds-fit view, computed exactly once when pins + size
   // are both available. We snapshot it into state so subsequent

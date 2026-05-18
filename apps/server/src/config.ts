@@ -56,16 +56,22 @@ const dataDir = anchor.dataDir
 const isProd = process.env.NODE_ENV === 'production'
 const sessionSecret = envStr('SESSION_SECRET', '')
 if (!sessionSecret || sessionSecret.length < 32) {
+  // Print the actual command to generate one. Newcomers stare at the
+  // "required >= 32 chars" message and don't know what to type.
+  const HINT =
+    'Generate one with:  openssl rand -hex 32\n' +
+    '              or:   node apps/server/dist/cli/genSecret.js'
   if (isProd) {
     // Refuse to boot in production with a missing/weak signing key —
     // forging session cookies would otherwise be trivial.
     throw new Error(
-      '[config] SESSION_SECRET is required (>= 32 chars) in production. Refusing to boot.',
+      `[config] SESSION_SECRET is required (>= 32 chars) in production. Refusing to boot.\n${HINT}`,
     )
   }
   console.warn(
     '[config] SESSION_SECRET is missing or shorter than 32 chars. ' +
-      'Cookies will use a CSPRNG dev secret that resets on every boot — DO NOT use in production.',
+      'Cookies will use a CSPRNG dev secret that resets on every boot — DO NOT use in production.\n' +
+      HINT,
   )
 }
 
@@ -103,6 +109,22 @@ export const config = {
     baseUrl: envStr('OLLAMA_BASE_URL', 'http://localhost:11434'),
     embedModel: envStr('OLLAMA_EMBED_MODEL', 'nomic-embed-text'),
     enabled: envBool('OLLAMA_ENABLED', true),
+  },
+  /**
+   * CLIP image-search. Opt-in because the model (~150 MB ONNX) is
+   * downloaded lazily on first use; not every Reader install wants
+   * that startup cost or the network round-trip. When disabled, the
+   * image search code paths are noops and `searchKnowledge` falls
+   * back to the lexical + semantic mix it always had.
+   */
+  clip: {
+    enabled: envBool('CLIP_ENABLED', false),
+    /** Hugging Face hub id. Quantized base patch-32 is the smallest
+     *  CLIP variant that still produces useful retrieval scores. */
+    model: envStr('CLIP_MODEL', 'Xenova/clip-vit-base-patch32'),
+    /** Where the transformers.js cache lands. Stays inside dataDir
+     *  so a `rm -rf data` cleanup is sufficient. */
+    cacheDir: path.join(dataDir, 'clip-cache'),
   },
   ingest: {
     chunkChars: envInt('CHUNK_CHARS', 1800),

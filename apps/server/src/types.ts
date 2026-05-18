@@ -102,6 +102,21 @@ export type DocumentMeta = {
    *  `undefined`) means we tried to extract and the image had no GPS — we
    *  cache the negative so we don't re-parse next time. */
   gps?: { lat: number; lng: number } | null
+  /** Perceptual dHash (16-hex chars) for image files. Used by the
+   *  admin Duplicates panel to surface near-identical photos
+   *  (recompressed, resized) that sha256 wouldn't catch. `null` =
+   *  tried and failed (corrupt/unsupported). */
+  pHash?: string | null
+  /** When this file is one half of a Live Photo / Motion Photo pair,
+   *  the vault-relative path of the other half (typically the .mov
+   *  paired with a .heic). Set on both files when the pair is
+   *  detected; null when we know there's no pair. */
+  livePhotoPair?: string | null
+  /** For videos: true once ffmpeg has produced an HLS bundle on disk
+   *  under the doc's storage dir. The MediaPlayer streams from the
+   *  HLS endpoint when this is true; otherwise it falls back to the
+   *  direct /api/file/raw byte stream. */
+  hlsReady?: boolean
 }
 
 export type Chunk = {

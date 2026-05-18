@@ -13,7 +13,7 @@ import {
 import { ApiError, api } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
 
-type WebhookEvent = 'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'
+type WebhookEvent = 'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'
 type Webhook = {
   id: string
   url: string
@@ -25,7 +25,7 @@ type Webhook = {
   lastDelivery?: { ts: number; status: number | null; error?: string }
 }
 
-const ALL_EVENTS: WebhookEvent[] = ['upload', 'edit', 'delete', 'share', 'tags', 'visibility']
+const ALL_EVENTS: WebhookEvent[] = ['upload', 'edit', 'delete', 'share', 'tags', 'visibility', 'ingest']
 
 /**
  * User-scoped webhook management at /account/webhooks. Hooks fire only

@@ -288,9 +288,19 @@ export function FolderGrid({
     setBusy('delete')
     setError(null)
     try {
-      await api.bulkDelete(selectedPaths)
+      const r = await api.bulkDelete(selectedPaths)
       setSelection(new Set())
       refresh()
+      if (r.failed > 0 && r.errors.length > 0) {
+        // Surface the per-file reasons so the user can act on them
+        // (fix a permission, re-select after rename, etc.) instead of
+        // seeing a silent "0 deleted".
+        const preview = r.errors.slice(0, 5)
+          .map((e) => `• ${e.path} — ${e.reason}`)
+          .join('\n')
+        const more = r.errors.length > 5 ? `\n…and ${r.errors.length - 5} more` : ''
+        setError(`${r.failed} item${r.failed === 1 ? '' : 's'} could not be deleted:\n${preview}${more}`)
+      }
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -516,16 +526,10 @@ export function FolderGrid({
                 />
                 <ActivityButton path={dir} kind="folder" />
                 <ShareWithUserButton paths={[dir]} />
-                {/* Pin a folder to the sidebar. Root folder (dir === "")
-                    can't be pinned — that's the whole vault. */}
-                {dir !== '' && (
-                  <PinButton
-                    path={dir}
-                    owner={ownerHint}
-                    isFolder
-                    onChanged={refresh}
-                  />
-                )}
+                {/* Public/Private sit before Pin so their popovers
+                    (centered, ~340px wide) hang from a more interior
+                    button and don't clip off the right edge of the
+                    viewport on narrower windows. */}
                 {/* Folder Public/Private toggle. Mirrors the file
                     viewer's PublicButton: label + popover both come
                     from the folder's own visibility flag, so the user
@@ -579,6 +583,16 @@ export function FolderGrid({
                         Private ({folderSummary.priv})
                       </button>
                     }
+                  />
+                )}
+                {/* Pin a folder to the sidebar. Root folder (dir === "")
+                    can't be pinned — that's the whole vault. */}
+                {dir !== '' && (
+                  <PinButton
+                    path={dir}
+                    owner={ownerHint}
+                    isFolder
+                    onChanged={refresh}
                   />
                 )}
 

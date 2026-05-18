@@ -6,11 +6,13 @@ import {
   writeChunks,
   writeThumbnail,
   writePreview,
+  writeClipEmbedding,
   loadMeta,
 } from '../stores/documents.js'
 import { extractText } from './extract.js'
 import { extractEntities } from './entities.js'
 import { extractGps } from './gps.js'
+import { canPerceptualHash, dHash } from './perceptualHash.js'
 import { embedBatch, EmbedError } from './embed.js'
 import { generateThumbnail } from './thumbnail.js'
 import {
@@ -19,9 +21,12 @@ import {
   transcodeImageToJpeg,
   videoFrameAt,
 } from './media.js'
+import { isVideoForHls, transcodeToHls } from './videoTranscode.js'
+import { canClipEmbed, embedImage, isClipEnabled } from './clipEmbed.js'
 import type { Chunk, DocumentMeta } from '../types.js'
 import { invalidateSearchCache } from './search.js'
 import { publish } from './events.js'
+import { dispatch as dispatchWebhook } from './webhooks.js'
 
 /**
  * Run the full ingestion pipeline for a freshly-uploaded document:
@@ -67,6 +72,37 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
     } catch {
       /* swallow — preview is best-effort */
     }
+    // CLIP image embedding (opt-in). Lazy-loads a ~150 MB ONNX model
+    // on first use; skipped entirely when CLIP_ENABLED is off. Vector
+    // written as a sidecar so searchKnowledge can mix it into the
+    // RRF score without re-decoding the image.
+    try {
+      if (isClipEnabled() && canClipEmbed(meta.originalFilename)) {
+        const vec = await embedImage(buffer, meta.originalFilename)
+        if (vec) await writeClipEmbedding(meta.id, vec)
+      }
+    } catch {
+      /* swallow — CLIP is opt-in and best-effort */
+    }
+    // HLS bundle for video. Decoupled from the frame-grab above — that
+    // produces the poster; this produces the streamable playlist + .ts
+    // segments served at /api/file/hls/:docId/*. Skipped when ffmpeg
+    // is missing or the input isn't a recognized video container.
+    try {
+      if (isVideoForHls(meta.originalFilename)) {
+        const ok = await transcodeToHls(buffer, meta.originalFilename, meta.id)
+        if (ok) {
+          const latest = await loadMeta(meta.id)
+          if (latest) {
+            const updated: DocumentMeta = { ...latest, hlsReady: true, updatedAt: Date.now() }
+            await saveMeta(updated)
+            publish({ type: 'preview', path: meta.storageKey, docId: meta.id })
+          }
+        }
+      }
+    } catch {
+      /* swallow — HLS is best-effort, original raw stream still works */
+    }
   })()
 
   let next: DocumentMeta = { ...meta, ingest: { ...meta.ingest, status: 'extracting' } }
@@ -95,12 +131,19 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
   // persist the result (including the null absence-cache) so the /map
   // view doesn't re-decode every image on each load.
   const gps = await extractGps(buffer, meta.originalFilename)
+  // Perceptual hash for the admin Duplicates panel — catches near-
+  // identical copies (resize, recompress) that sha256 alone misses.
+  // Cached as null when image decode fails so we don't keep retrying.
+  const pHash = canPerceptualHash(meta.originalFilename)
+    ? await dHash(buffer)
+    : undefined
   next = {
     ...next,
     updatedAt: Date.now(),
     ingest: { ...next.ingest, extractedAt: Date.now() },
     entities,
     ...(gps !== undefined ? { gps } : {}),
+    ...(pHash !== undefined ? { pHash } : {}),
   }
 
   if (!text.trim()) {
@@ -154,6 +197,16 @@ export async function ingestDocument(meta: DocumentMeta, buffer: Buffer): Promis
   }
   await saveMeta(next)
   publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
+  // Final ingest status — fire the webhook once for n8n / Zapier flows.
+  dispatchWebhook({
+    type: 'ingest',
+    path: meta.storageKey,
+    actor: meta.owner,
+    docId: meta.id,
+    status: next.ingest.status as 'ready' | 'no-text' | 'failed',
+    chunkCount: next.ingest.chunkCount ?? 0,
+    embedded: !!next.ingest.embedded,
+  }).catch(() => undefined)
   invalidateSearchCache()
   return next
 }
@@ -184,6 +237,15 @@ export async function reembedDocument(id: string): Promise<DocumentMeta | null> 
   }
   await saveMeta(next)
   publish({ type: 'ingest', path: meta.storageKey, docId: meta.id, status: next.ingest.status })
+  dispatchWebhook({
+    type: 'ingest',
+    path: meta.storageKey,
+    actor: meta.owner,
+    docId: meta.id,
+    status: next.ingest.status as 'ready' | 'no-text' | 'failed',
+    chunkCount: next.ingest.chunkCount ?? 0,
+    embedded: !!next.ingest.embedded,
+  }).catch(() => undefined)
   invalidateSearchCache()
   return next
 }

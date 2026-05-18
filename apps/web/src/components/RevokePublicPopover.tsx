@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Globe, Lock } from 'lucide-react'
 import { ApiError } from '../lib/api'
+import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
 type Props = {
   /** Override the trigger label. Defaults to `Public (N)`. */
@@ -42,6 +43,11 @@ export function RevokePublicPopover({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
+  const resolvedAlign = useAnchoredAlign({
+    triggerRef: rootRef,
+    popoverWidth: 340,
+    open,
+  })
 
   useEffect(() => {
     if (!open) return
@@ -84,15 +90,23 @@ export function RevokePublicPopover({
             ? `Revoke ${publicCount} public items`
             : 'Public — configure'
         }
-        style={{ color: '#00875A' }}
+        aria-expanded={open}
+        // The Public button always tints accent-green; when the
+        // popover is open we deepen the background so the active
+        // state matches the other toolbar triggers.
+        style={{ color: '#00875A', ...(open ? { background: 'var(--selected)' } : null) }}
       >
         <Globe size={13} />
         {triggerLabel ?? `Public (${publicCount})`}
       </button>
       {open && (
         <div
-          className="absolute right-0 top-full mt-1 z-50 w-[340px] rounded-md shadow-card overflow-hidden"
-          style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
+          className="absolute top-full mt-1 z-50 w-[340px] rounded-md shadow-card overflow-hidden"
+          style={{
+            background: 'var(--panel)',
+            border: '1px solid var(--border)',
+            ...alignStyle(resolvedAlign),
+          }}
         >
           <div
             className="flex items-center gap-2 px-3 h-8"

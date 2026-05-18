@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Tag, X, Loader2, Plus } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
 type Props = {
   path: string
@@ -36,6 +37,11 @@ export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props)
   const [hover, setHover] = useState<number>(0)
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const resolvedAlign = useAnchoredAlign({
+    triggerRef: rootRef,
+    popoverWidth: 320,
+    open,
+  })
 
   useEffect(() => setLocal(tags), [tags])
 
@@ -164,15 +170,23 @@ export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props)
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
         title="Edit tags"
-        style={local.length > 0 ? { color: 'var(--accent)' } : undefined}
+        aria-expanded={open}
+        style={{
+          ...(local.length > 0 ? { color: 'var(--accent)' } : null),
+          ...(open ? { background: 'var(--selected)', color: 'var(--accent)' } : null),
+        }}
       >
         <Tag size={13} />
         <span className="truncate max-w-[140px]">{triggerLabel}</span>
       </button>
       {open && (
         <div
-          className="absolute right-0 top-full mt-1 z-50 w-[320px] rounded-md shadow-card overflow-hidden"
-          style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
+          className="absolute top-full mt-1 z-50 w-[320px] rounded-md shadow-card overflow-hidden"
+          style={{
+            background: 'var(--panel)',
+            border: '1px solid var(--border)',
+            ...alignStyle(resolvedAlign),
+          }}
         >
           {/* Chip field: applied chips + inline input share one outlined box.
               Caps height so a few hundred tags still scroll instead of pushing

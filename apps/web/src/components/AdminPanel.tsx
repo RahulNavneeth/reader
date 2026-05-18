@@ -1395,19 +1395,31 @@ function DuplicatesPanel() {
 
   if (error) return <ErrText text={error} />
   if (!groups) return <Muted text="Loading…" />
-  if (groups.length === 0) return <Muted text="No duplicates — every file's sha256 is unique." />
+  if (groups.length === 0) return <Muted text="No duplicates — every file's sha256 + perceptual hash is unique." />
 
   return (
     <div className="space-y-5">
       <Hint>
-        Groups of files that share a sha256. Keep one and Trash the rest, or Trash all to clear them.
+        <strong>Exact</strong> groups share a sha256 (byte-identical copies).{' '}
+        <strong>Near</strong> groups share a perceptual hash (visually
+        identical — resized, recompressed, mild crop). Trash whichever
+        copies you don't want to keep.
       </Hint>
       {groups.map((g) => (
-        <Card key={g.sha256} title={`${g.docs.length} copies • ${formatBytes(g.bytes)} each`}>
+        <Card
+          key={g.kind === 'exact' ? `sha:${g.sha256}` : `phash:${g.pHash}`}
+          title={
+            g.kind === 'exact'
+              ? `${g.docs.length} exact copies • ${formatBytes(g.bytes)} each`
+              : `${g.docs.length} near-duplicates`
+          }
+        >
           <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
-            sha256
+            {g.kind === 'exact' ? 'sha256' : 'pHash (dHash)'}
           </div>
-          <code className="text-[11px] text-muted break-all block mb-2">{g.sha256}</code>
+          <code className="text-[11px] text-muted break-all block mb-2">
+            {g.kind === 'exact' ? g.sha256 : g.pHash}
+          </code>
           <div className="rounded border border-app overflow-hidden">
             <table className="w-full text-[12.5px]">
               <thead style={{ background: 'var(--panel)' }}>

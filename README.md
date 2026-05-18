@@ -201,6 +201,55 @@ step.
 
 ---
 
+## Optional: S3-compatible blob store
+
+If `STORAGE=s3` is set, file blobs go to an S3-compatible bucket
+(MinIO / R2 / AWS) instead of the local `vault/` directory. The doc
+index, sessions, tags, audit log, etc. still live on disk under
+`data/` regardless.
+
+Recommended bucket lifecycle rules to keep storage costs bounded:
+
+```xml
+<!-- AWS S3 / MinIO example -->
+<LifecycleConfiguration>
+  <Rule>
+    <ID>tier-old-blobs-to-cheap</ID>
+    <Status>Enabled</Status>
+    <!-- Promote rarely-accessed bytes to Glacier / Deep-Archive
+         (or MinIO equivalent) after a year. Reader re-fetches on
+         demand; the latency hit is acceptable for cold reads. -->
+    <Transition>
+      <Days>365</Days>
+      <StorageClass>GLACIER</StorageClass>
+    </Transition>
+  </Rule>
+  <Rule>
+    <ID>expire-multipart-aborts</ID>
+    <Status>Enabled</Status>
+    <!-- Reader uses single-part uploads but multipart aborts can
+         accumulate from interrupted client SDKs. Sweep weekly. -->
+    <AbortIncompleteMultipartUpload>
+      <DaysAfterInitiation>7</DaysAfterInitiation>
+    </AbortIncompleteMultipartUpload>
+  </Rule>
+  <Rule>
+    <ID>noncurrent-version-cap</ID>
+    <Status>Enabled</Status>
+    <!-- If versioning is on (recommended for accidental-delete
+         recovery), keep at most 5 non-current versions then expire. -->
+    <NoncurrentVersionExpiration>
+      <NoncurrentDays>30</NoncurrentDays>
+      <NewerNoncurrentVersions>5</NewerNoncurrentVersions>
+    </NoncurrentVersionExpiration>
+  </Rule>
+</LifecycleConfiguration>
+```
+
+Reader doesn't manage bucket policies — set these via `aws s3api
+put-bucket-lifecycle-configuration` or the MinIO console, once,
+when you provision the bucket.
+
 ## Reverse proxy
 
 The app expects an HTTPS reverse proxy in front of it for any deployment

@@ -21,6 +21,8 @@ import { pinsRoutes } from './routes/pins.js'
 import { exportRoutes } from './routes/export.js'
 import { memoriesRoutes } from './routes/memories.js'
 import { accountRoutes } from './routes/account.js'
+import { feedRoutes } from './routes/feed.js'
+import { timelineRoutes } from './routes/timeline.js'
 import { externalMountsRoutes } from './routes/externalMounts.js'
 import { sweepExpired } from './stores/sessions.js'
 import { sweepExpiredPublic } from './stores/documents.js'
@@ -234,6 +236,8 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await app.register(memoriesRoutes)
   await app.register(externalMountsRoutes)
   await app.register(accountRoutes)
+  await app.register(feedRoutes)
+  await app.register(timelineRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
   // SPA fallback rewrites unknown paths to index.html so React Router-style
@@ -243,7 +247,12 @@ export async function buildApp(opts: BuildAppOptions = {}) {
     await app.register(fastifyStatic, {
       root: webRoot,
       prefix: '/',
-      decorateReply: false,
+      // decorateReply MUST be true so the SPA fallback below can
+      // call reply.sendFile(). Was false in an earlier rev which
+      // crashed every SPA route with `reply.sendFile is not a
+      // function`. The minor per-request prototype cost is
+      // negligible — every fallback hit needs it.
+      decorateReply: true,
       wildcard: false,
     })
     app.setNotFoundHandler(async (req, reply) => {

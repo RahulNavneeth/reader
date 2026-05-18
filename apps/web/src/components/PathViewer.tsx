@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock, Info } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -9,6 +9,7 @@ import 'highlight.js/styles/github.css'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
+import { useConfirm } from '../lib/confirm'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { TagsButton } from './TagsButton'
@@ -39,6 +40,10 @@ export function PathViewer({ path, canEdit = true }: Props) {
   const ownerOpt = searchParams.get('owner') || undefined
   const callerOpts = ownerOpt ? { owner: ownerOpt } : undefined
   const { setCurrentFolder, refresh } = useVault()
+  const confirm = useConfirm()
+  const [copyBusy, setCopyBusy] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [deleteBusy, setDeleteBusy] = useState(false)
   const [text, setText] = useState<string | null>(null)
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -221,7 +226,13 @@ export function PathViewer({ path, canEdit = true }: Props) {
 
   return (
     <div className="h-full flex flex-col">
-      <header className="min-h-11 px-3 py-1.5 flex items-center gap-2 border-b border-app shrink-0 flex-wrap overflow-x-auto" style={{ background: 'var(--panel-2)' }}>
+      {/* No `overflow-x-auto` here even though buttons can wrap on
+          narrow viewports. CSS spec: when one overflow axis is
+          non-visible, the other clips too — and that silently chopped
+          the Share / Private / Tags popovers off below the header.
+          `flex-wrap` already handles narrow layouts by wrapping to a
+          new row, so horizontal scroll is not needed. */}
+      <header className="min-h-11 px-3 py-1.5 flex items-center gap-2 border-b border-app shrink-0 flex-wrap" style={{ background: 'var(--panel-2)' }}>
         <PathBreadcrumb
           dir={parentDir}
           currentName={filename}
@@ -318,10 +329,110 @@ export function PathViewer({ path, canEdit = true }: Props) {
           </>
         )}
         <PinButton path={path} owner={ownerOpt} isFolder={false} onChanged={refresh} />
+        {/* Copy the file's actual content to the system clipboard:
+            text for markdown/csv/json/txt/html and any file we've
+            extracted text for; PNG/JPEG/GIF/WebP go on as image
+            blobs (via ClipboardItem) so they paste into chat /
+            docs / image editors. Other binary types (PDF, audio,
+            video, zips) can't be put on the clipboard meaningfully
+            — the button is disabled with a tooltip in that case. */}
+        {(() => {
+          const isCopyableImage = ['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext)
+          const hasCopyableText =
+            isMarkdown || isText || isCsv || isJson || isHtml || wantsExtractedText
+          const canCopy = isCopyableImage || (hasCopyableText && text != null)
+          const titleMsg = canCopy
+            ? isCopyableImage
+              ? 'Copy image to clipboard'
+              : 'Copy file contents to clipboard'
+            : copySupportHint(ext)
+          return (
+            <button
+              className="btn-ghost"
+              disabled={copyBusy || !canCopy}
+              onClick={async () => {
+                if (copyBusy || !canCopy) return
+                setCopyBusy(true)
+                try {
+                  if (isCopyableImage) {
+                    // Fetch the raw bytes and write the matching MIME
+                    // through ClipboardItem. Chrome/Safari accept
+                    // PNG/JPEG/WebP/GIF; Firefox is PNG-only and will
+                    // throw — we catch + surface the error rather than
+                    // silently fall back, so the user knows nothing
+                    // landed on the clipboard.
+                    const res = await fetch(api.rawUrl(path, callerOpts), { credentials: 'include' })
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+                    const blob = await res.blob()
+                    await navigator.clipboard.write([
+                      new ClipboardItem({ [blob.type || 'image/png']: blob }),
+                    ])
+                  } else if (text != null) {
+                    await navigator.clipboard.writeText(text)
+                  }
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 1500)
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e))
+                } finally {
+                  setCopyBusy(false)
+                }
+              }}
+              title={titleMsg}
+            >
+              {copyBusy ? (
+                <Loader2 size={13} className="animate-spin" />
+              ) : copied ? (
+                <Check size={13} className="text-accent" />
+              ) : (
+                <CopyIcon size={13} />
+              )}
+              {copied ? 'Copied' : 'Copy'}
+            </button>
+          )
+        })()}
         <a className="btn-ghost" href={api.rawUrl(path, callerOpts)} download={filename}>
           <Download size={14} />
           Download
         </a>
+        {/* Move to Trash (30-day retention; user can restore). Hidden
+            for share-recipients — they can't delete in the owner's
+            vault. */}
+        {!ownerOpt && (
+          <button
+            className="btn-ghost"
+            onClick={async () => {
+              if (deleteBusy) return
+              const ok = await confirm({
+                title: 'Move to Trash',
+                message: `"${filename}" goes to Trash where it can still be restored. Purges automatically after 30 days.`,
+                confirmLabel: 'Move to Trash',
+                destructive: true,
+              })
+              if (!ok) return
+              setDeleteBusy(true)
+              try {
+                await api.deleteFile(path)
+                refresh()
+                navigate(parentDir ? `/${parentDir.split('/').map(encodeURIComponent).join('/')}` : '/')
+              } catch (e) {
+                setError(e instanceof ApiError ? e.message : String(e))
+              } finally {
+                setDeleteBusy(false)
+              }
+            }}
+            disabled={deleteBusy}
+            style={{ color: '#BF2600' }}
+            title="Move to Trash"
+          >
+            {deleteBusy ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <Trash2 size={13} />
+            )}
+            Delete
+          </button>
+        )}
         <button className="btn-ghost" onClick={() => navigate('/')} title="Close">
           <X size={14} />
         </button>
@@ -361,6 +472,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
           <MediaPlayer
             kind="video"
             src={api.rawUrl(path, callerOpts)}
+            hlsSrc={meta?.hlsReady ? api.hlsUrl(path, callerOpts) : undefined}
             poster={api.previewUrl(path, callerOpts)}
             filename={filename}
           />
@@ -510,3 +622,21 @@ function prettyError(raw: string): string {
 
 
 
+
+/** Tooltip explaining why the Copy button is disabled for a given
+ *  file type. The system clipboard only natively understands text
+ *  and a handful of image MIMEs; PDFs / audio / video / archives
+ *  have no clipboard representation. */
+function copySupportHint(ext: string): string {
+  if (ext === '.pdf') return 'Copy not supported for PDFs — use Download.'
+  if (['.mp4', '.mov', '.mkv', '.webm', '.avi'].includes(ext)) {
+    return 'Copy not supported for video — use Download.'
+  }
+  if (['.mp3', '.m4a', '.wav', '.flac', '.ogg'].includes(ext)) {
+    return 'Copy not supported for audio — use Download.'
+  }
+  if (['.zip', '.tar', '.gz', '.7z'].includes(ext)) {
+    return 'Copy not supported for archives — use Download.'
+  }
+  return 'Copy not supported for this file type — use Download.'
+}

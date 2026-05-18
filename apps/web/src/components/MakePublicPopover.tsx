@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Globe, Lock, Loader2 } from 'lucide-react'
+import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
 type Props = {
   /** Element rendered as the popover trigger (the toolbar button). */
@@ -10,8 +11,8 @@ type Props = {
   onConfirm: (opts: { expiresInSeconds: number | null; password: string | null }) => Promise<void>
   /** Label on the confirm button. */
   confirmLabel?: string
-  /** Anchor side — defaults to right edge. */
-  align?: 'left' | 'right'
+  /** Anchor side — defaults to centered under the trigger. */
+  align?: 'left' | 'right' | 'center'
 }
 
 const EXPIRY_OPTIONS: Array<{ label: string; seconds: number | null }> = [
@@ -32,7 +33,7 @@ export function MakePublicPopover({
   title,
   onConfirm,
   confirmLabel = 'Make public',
-  align = 'right',
+  align = 'center',
 }: Props) {
   const [open, setOpen] = useState(false)
   const [expiry, setExpiry] = useState<number | null>(86400 * 7)
@@ -41,6 +42,14 @@ export function MakePublicPopover({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
+  // Centered alignment is the default; flips to 'right' when the
+  // trigger is too close to the viewport's right edge for the
+  // 340-px popover to fit without clipping.
+  const resolvedAlign = useAnchoredAlign({
+    triggerRef: rootRef,
+    popoverWidth: 340,
+    open,
+  })
 
   useEffect(() => {
     if (!open) return
@@ -78,10 +87,27 @@ export function MakePublicPopover({
     }
   }
 
+  // When open, deepen the trigger button's background AND switch the
+  // text/icon to the accent color so it matches the rest of the
+  // toolbar's active state. Order matters: accent color is a default,
+  // the caller's own style overrides (e.g. PublicButton's green
+  // forceActiveStyle), but our `background` always wins because
+  // that's the actual "I'm open" indicator.
+  const renderedTrigger =
+    open && React.isValidElement(trigger)
+      ? React.cloneElement(trigger as React.ReactElement<{ style?: React.CSSProperties }>, {
+          style: {
+            color: 'var(--accent)',
+            ...((trigger as React.ReactElement<{ style?: React.CSSProperties }>).props.style ?? {}),
+            background: 'var(--selected)',
+          },
+        })
+      : trigger
+
   return (
     <div ref={rootRef} className="relative inline-flex">
       <span onClick={() => setOpen((v) => !v)} className="inline-flex">
-        {trigger}
+        {renderedTrigger}
       </span>
       {open && (
         <div
@@ -89,7 +115,15 @@ export function MakePublicPopover({
           style={{
             background: 'var(--panel)',
             border: '1px solid var(--border)',
-            ...(align === 'right' ? { right: 0 } : { left: 0 }),
+            // If the caller forced a side, honor it. Otherwise use the
+            // viewport-aware resolved alignment (defaults to center,
+            // flips to right/left when the trigger is too close to an
+            // edge).
+            ...(align === 'left'
+              ? { left: 0 }
+              : align === 'right'
+                ? { right: 0 }
+                : alignStyle(resolvedAlign)),
           }}
         >
           <div

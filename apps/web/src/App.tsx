@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FileText, Sun, Moon, Loader2, Search as SearchIcon, Upload, FolderPlus, Menu } from 'lucide-react'
+import { FileText, Sun, Moon, Loader2, Search as SearchIcon, Menu } from 'lucide-react'
 import { Routes, Route, Link, useLocation } from 'react-router-dom'
 import { ApiError, api, type PublicUser } from './lib/api'
 import { useTheme } from './hooks/useTheme'
@@ -12,13 +12,14 @@ import { AccountTokensPage } from './components/AccountTokensPage'
 import { AccountWebhooksPage } from './components/AccountWebhooksPage'
 import { MountBrowser } from './components/MountBrowser'
 import { MapPage } from './components/MapPage'
+import { TimelinePage } from './components/TimelinePage'
+import { NewFolderButton } from './components/NewFolderButton'
 import { TrashPage } from './components/TrashPage'
 import { SearchPalette } from './components/SearchPalette'
-import { UploadDialog } from './components/UploadDialog'
+import { UploadButton } from './components/UploadButton'
 import { PublicResolver } from './components/PublicResolver'
 import { VaultContext } from './lib/vault-context'
 import { useReaderEvents } from './lib/events'
-import { usePrompt } from './lib/confirm'
 
 type AuthState =
   | { status: 'loading' }
@@ -28,7 +29,6 @@ type AuthState =
 
 export default function App() {
   const { theme, toggle } = useTheme()
-  const prompt = usePrompt()
   const [auth, setAuth] = useState<AuthState>({ status: 'loading' })
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -166,23 +166,14 @@ export default function App() {
     fileInputRef.current?.click()
   }, [])
 
+  // Controlled open-state for the inline NewFolderButton popover.
+  // The ⌘K palette (and anyone else with the vault context) calls
+  // `triggerNewFolder` to flip this on, which pops the popover under
+  // the header's FolderPlus icon — no modal dialog.
+  const [newFolderOpen, setNewFolderOpen] = useState(false)
   const triggerNewFolder = useCallback(async () => {
-    const name = await prompt({
-      title: 'New folder',
-      message: 'Use "/" for nesting, e.g. "notes/2026".',
-      placeholder: 'folder-name',
-      confirmLabel: 'Create',
-    })
-    if (!name) return
-    const clean = name.replace(/^\/+|\/+$/g, '')
-    if (!clean) return
-    try {
-      await api.mkdir(clean)
-      setRefreshNonce((n) => n + 1)
-    } catch (e) {
-      setVaultError(e instanceof ApiError ? e.message : String(e))
-    }
-  }, [prompt])
+    setNewFolderOpen(true)
+  }, [])
 
   if (auth.status === 'loading') {
     return (
@@ -196,7 +187,7 @@ export default function App() {
     // Bare-path public URLs: `/` for a public vault root, `/<path>` for
     // any public file or folder. Reserved root segments are app routes
     // that can't be vault items.
-    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map'])
+    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline'])
     const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
     const firstSeg = rawPath.split('/')[0] ?? ''
     const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
@@ -291,26 +282,28 @@ export default function App() {
                   first. Mousedown is on the icon itself so focus
                   doesn't shift onto the button mid-click. */}
               <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5">
-                <button
-                  type="button"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={triggerNewFolder}
-                  className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-hover text-subtle hover:text-fg transition-colors"
-                  title="New folder"
-                  aria-label="New folder"
-                >
-                  <FolderPlus size={13} />
-                </button>
-                <button
-                  type="button"
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={triggerUpload}
-                  className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-hover text-subtle hover:text-fg transition-colors"
-                  title="Upload files"
-                  aria-label="Upload files"
-                >
-                  <Upload size={13} />
-                </button>
+                {/* Both icon buttons render their own popover anchored
+                    to themselves — Share/Tags-style — instead of
+                    opening a centered modal. Controlled-open for the
+                    new-folder one so the ⌘K palette's "New folder"
+                    action can pop it open without the user re-clicking
+                    the icon. Upload's popover opens automatically when
+                    pendingFiles is set (either from clicking the icon
+                    OR from drag-and-drop). */}
+                <NewFolderButton
+                  open={newFolderOpen}
+                  onOpenChange={setNewFolderOpen}
+                  currentDir={currentFolder}
+                  onCreated={() => setRefreshNonce((n) => n + 1)}
+                />
+                <UploadButton
+                  pendingFiles={pendingFiles}
+                  setPendingFiles={setPendingFiles}
+                  defaultDir={currentFolder}
+                  onConfirm={async (files, dir) => {
+                    await doUpload(files, dir)
+                  }}
+                />
                 <span
                   className="mx-1 h-3 w-px"
                   style={{ background: 'var(--border)' }}
@@ -369,6 +362,7 @@ export default function App() {
           <Route path="/account/webhooks" element={<AccountWebhooksPage />} />
           <Route path="/trash" element={<TrashPage />} />
           <Route path="/map" element={<MapPage />} />
+          <Route path="/timeline" element={<TimelinePage />} />
           <Route path="/library/:mountId/*" element={<MountBrowser />} />
           <Route path="/library/:mountId" element={<MountBrowser />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
@@ -380,19 +374,6 @@ export default function App() {
             className="fixed inset-0 z-40"
             style={{ background: 'rgba(9, 30, 66, 0.42)' }}
             onClick={() => setPaletteOpen(false)}
-          />
-        )}
-
-        {pendingFiles && (
-          <UploadDialog
-            files={pendingFiles}
-            defaultDir={currentFolder}
-            onCancel={() => setPendingFiles(null)}
-            onConfirm={async (dir) => {
-              const files = pendingFiles
-              setPendingFiles(null)
-              await doUpload(files, dir)
-            }}
           />
         )}
 

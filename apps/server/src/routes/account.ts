@@ -257,7 +257,7 @@ export async function accountRoutes(app: FastifyInstance) {
       .object({
         url: z.string().url(),
         events: z.array(
-          z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility']),
+          z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility', 'ingest']),
         ),
         secret: z.string().max(256).optional(),
         enabled: z.boolean().optional(),

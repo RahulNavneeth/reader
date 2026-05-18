@@ -61,6 +61,17 @@ services:
     volumes:
       - ./_state/data:/data
       - ./_state/vault:/vault
+    # Honor the linuxserver.io convention so the entrypoint can chown
+    # bind-mounted volumes to your host uid/gid. Defaults to 10001.
+    #   id -u && id -g    on the host to find yours.
+    # PUID: ${PUID:-10001}
+    # PGID: ${PGID:-10001}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     depends_on:
       ollama:
         condition: service_started

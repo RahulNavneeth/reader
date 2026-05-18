@@ -36,6 +36,13 @@ import { writeThumbnail, writePreview } from '../stores/documents.js'
 import { moveToTrash } from '../stores/trash.js'
 import { ingestDocument } from '../services/ingest.js'
 import { couldHaveGps, extractGps } from '../services/gps.js'
+import { validateUpload } from '../lib/uploadGuard.js'
+import {
+  couldBeLiveMotion,
+  couldBeLiveStill,
+  findMotionFor,
+  findStillFor,
+} from '../services/livePhoto.js'
 import { invalidateSearchCache } from '../services/search.js'
 import { publish } from '../services/events.js'
 import { dispatch as dispatchWebhook } from '../services/webhooks.js'
@@ -444,6 +451,49 @@ type TreeNode = {
 }
 
 // ─── filename helpers ───────────────────────────────────────────────────────
+
+/**
+ * Live-Photo pair detection. After a still or motion file uploads,
+ * scan its directory's other DocumentMeta records owned by the same
+ * user for an opposite-kind sibling with the same stem; tag both
+ * metas with `livePhotoPair = <other path>` so the timeline UI can
+ * play the motion when the user hovers the still.
+ */
+async function detectAndLinkLivePhotoPair(meta: DocumentMeta): Promise<void> {
+  const isStill = couldBeLiveStill(meta.originalFilename)
+  const isMotion = couldBeLiveMotion(meta.originalFilename)
+  if (!isStill && !isMotion) return
+  const dir = meta.storageKey.includes('/')
+    ? meta.storageKey.slice(0, meta.storageKey.lastIndexOf('/'))
+    : ''
+  const all = await listAllDocuments()
+  const siblings = all.filter(
+    (d) =>
+      d.owner === meta.owner &&
+      d.id !== meta.id &&
+      (d.storageKey.includes('/')
+        ? d.storageKey.slice(0, d.storageKey.lastIndexOf('/')) === dir
+        : dir === ''),
+  )
+  const siblingNames = siblings.map((s) => s.originalFilename)
+  const matchName = isStill
+    ? findMotionFor(meta.originalFilename, siblingNames)
+    : findStillFor(meta.originalFilename, siblingNames)
+  if (!matchName) {
+    // Cache the negative so a same-folder upload that doesn't pair
+    // doesn't keep re-scanning siblings on every reload.
+    if (meta.livePhotoPair === undefined) {
+      await saveMeta({ ...meta, livePhotoPair: null })
+    }
+    return
+  }
+  const matchDoc = siblings.find((s) => s.originalFilename === matchName)
+  if (!matchDoc) return
+  await Promise.all([
+    saveMeta({ ...meta, livePhotoPair: matchDoc.storageKey }),
+    saveMeta({ ...matchDoc, livePhotoPair: meta.storageKey }),
+  ])
+}
 
 function safeFilename(name: string): string {
   const base = path.basename(name).replace(/[^a-zA-Z0-9._\- ()]+/g, '_').replace(/^[ ._]+/, '')
@@ -1210,6 +1260,128 @@ export async function vaultRoutes(app: FastifyInstance) {
       .send(createReadStream(abs))
   })
 
+  /*
+   * HLS streaming for videos.
+   *
+   *   GET /api/file/hls/playlist.m3u8?path=&owner=&p=  → m3u8 playlist
+   *   GET /api/file/hls/:segment?path=&owner=&p=       → .ts segment
+   *
+   * Both endpoints share the same path/owner/password auth as
+   * /api/file/raw. The playlist is rewritten on the fly to append the
+   * original query string to each segment URI so authenticated and
+   * password-gated playback work uniformly — relative URI resolution
+   * in browsers drops the parent's query string otherwise.
+   *
+   * We don't keep an in-memory cache of the rewritten playlist (it's
+   * tiny, kilobytes at most), and segments are streamed straight off
+   * disk with Range support so a single 10s scrub doesn't re-download
+   * the whole bundle.
+   */
+  app.get<{ Params: { segment: string } }>('/api/file/hls/:segment', async (req, reply) => {
+    const { path: rel, p: publicPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
+    if (!rel) return reply.code(400).send({ error: 'missing path' })
+    const segName = req.params.segment
+    // Whitelist: playlist.m3u8 or seg_NNN.ts. Reject anything else so
+    // a crafted name (`..`, absolute paths) can't escape the hls dir.
+    if (
+      segName !== 'playlist.m3u8' &&
+      !/^seg_\d{3,5}\.ts$/.test(segName)
+    ) {
+      return reply.code(400).send({ error: 'bad segment name' })
+    }
+
+    if (publicPassword) {
+      const locked = gateLockedSeconds(req.ip)
+      if (locked != null) {
+        return reply
+          .code(429)
+          .header('Retry-After', String(locked))
+          .send({ error: 'too many failed password attempts', retryAfter: locked })
+      }
+    }
+
+    const requester = req.currentUser?.username
+    const ctx = await resolveReadContext({ rel, ownerHint, requester })
+    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const meta = ctx.meta
+    if (!meta) return reply.code(404).send({ error: 'not indexed' })
+
+    const gate = publicGate(meta, publicPassword)
+    if (gate === 'password-required' || gate === 'password-wrong') {
+      if (gate === 'password-wrong') recordGateFailure(req.ip)
+      return reply.code(401).send({
+        error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+        passwordRequired: true,
+      })
+    }
+    if (gate !== 'ok') {
+      if (!requireAuth(req, reply)) return
+      const u = req.currentUser!
+      if (!ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
+        return reply.code(403).send({ error: 'forbidden' })
+      }
+    } else if (publicPassword) {
+      clearGateFailures(req.ip)
+    }
+
+    const { hlsDir } = await import('../services/videoTranscode.js')
+    const segPath = path.join(hlsDir(meta.id), segName)
+    const segStat = await stat(segPath).catch(() => null)
+    if (!segStat || !segStat.isFile()) {
+      return reply.code(404).send({ error: 'hls not ready' })
+    }
+
+    if (segName === 'playlist.m3u8') {
+      const text = await readFile(segPath, 'utf8')
+      // Rebuild the query string so segments inherit owner/path/p.
+      const qs = new URLSearchParams()
+      qs.set('path', rel)
+      if (ownerHint) qs.set('owner', ownerHint)
+      if (publicPassword) qs.set('p', publicPassword)
+      const query = `?${qs.toString()}`
+      const rewritten = text.replace(
+        /^(seg_\d{3,5}\.ts)$/gm,
+        (_m, name) => `${name}${query}`,
+      )
+      return reply
+        .header('Content-Type', 'application/vnd.apple.mpegurl')
+        .header('Cache-Control', 'private, no-store')
+        .send(rewritten)
+    }
+
+    // Segment — stream with Range support for hls.js seeking.
+    const range = (req.headers.range || '') as string
+    const rm2 = /^bytes=(\d*)-(\d*)$/.exec(range)
+    if (rm2) {
+      const total = segStat.size
+      const start = rm2[1] ? Number(rm2[1]) : 0
+      const end = rm2[2] ? Math.min(Number(rm2[2]), total - 1) : total - 1
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+        return reply
+          .code(416)
+          .header('Content-Range', `bytes */${total}`)
+          .send({ error: 'range not satisfiable' })
+      }
+      return reply
+        .code(206)
+        .header('Content-Type', 'video/mp2t')
+        .header('Content-Length', String(end - start + 1))
+        .header('Content-Range', `bytes ${start}-${end}/${total}`)
+        .header('Accept-Ranges', 'bytes')
+        .header('Cache-Control', 'private, max-age=3600')
+        .send(createReadStream(segPath, { start, end }))
+    }
+    return reply
+      .header('Content-Type', 'video/mp2t')
+      .header('Content-Length', String(segStat.size))
+      .header('Accept-Ranges', 'bytes')
+      .header('Cache-Control', 'private, max-age=3600')
+      .send(createReadStream(segPath))
+  })
+
   // Tiny PNG preview for the folder grid. Cached on disk per doc. If the
   // thumbnail hasn't been generated yet, we render-on-demand and persist.
   app.get('/api/file/thumbnail', async (req, reply) => {
@@ -1293,6 +1465,17 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     if (buffer.length === 0) return reply.code(400).send({ error: 'empty file' })
 
+    // Magic-byte validation. The browser's claimed MIME is spoofable
+    // (a malicious upload can say `image/png` while shipping HTML/JS).
+    // We sniff the actual bytes and reject when the sniffed type
+    // disagrees with the file extension — keeps `.png` from harboring
+    // a script payload.
+    const claimedMime = part.mimetype || undefined
+    const guard = await validateUpload(buffer, part.filename || 'upload.bin', claimedMime)
+    if (!guard.ok) {
+      return reply.code(415).send({ error: `unsupported file: ${guard.reason}` })
+    }
+
     // Quota check. Sums bytes across docs the user owns; rejects if this
     // upload would push them over their configured cap. Admins are exempt
     // because they're the one setting the limits.
@@ -1364,6 +1547,13 @@ export async function vaultRoutes(app: FastifyInstance) {
         ingest: { status: 'pending', embedded: false },
       }
       await saveMeta(meta)
+      // Live Photo pair detection — when this upload's stem matches
+      // a sibling in the same dir of the opposite kind (still vs
+      // motion), tag both metas so the timeline can play the motion
+      // half on hover. Best-effort; failures don't block the upload.
+      await detectAndLinkLivePhotoPair(meta).catch((err) => {
+        req.log.warn({ err }, 'live-photo pair check failed')
+      })
       const { runJob } = await import('../services/jobs.js')
       runJob('ingest', finalRel, () => ingestDocument(meta, buffer)).catch((err) => {
         req.log.warn({ err, rel: finalRel }, 'ingest job failed')
@@ -1713,53 +1903,97 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!Array.isArray(body?.paths)) {
       return reply.code(400).send({ error: 'paths[] required' })
     }
+    // Per-path failure reasons. Returned to the client AND logged
+    // server-side so a `{ok:0,failed:N}` response isn't a black box.
+    // `path` is the input as the client sent it (so the UI can match
+    // it back to a row); `reason` is a short human-readable cause.
+    const errors: Array<{ path: string; reason: string }> = []
+    const recordError = (p: string, reason: string, err?: unknown) => {
+      errors.push({ path: p, reason })
+      req.log.warn({ err, path: p, reason }, 'bulk-delete: per-file failure')
+    }
+
     // Expand folder paths into their files. Each file is sent to trash one
     // at a time; the empty directory shell is removed afterwards.
     const docs = await listAllDocuments()
     const seen = new Set<string>()
     const fileRels: string[] = []
+    // Map every expanded file back to the original input path the
+    // caller asked about, so per-file failures get reported against
+    // something the client recognizes (and not, e.g., a deeply nested
+    // file inside a folder the user dropped on the page).
+    const fileOrigin = new Map<string, string>()
     const folderRels: string[] = []
     for (const inputRel of body.paths) {
+      let abs: string
       try {
-        const abs = resolveVault(inputRel, user.username)
-        const st = await stat(abs).catch(() => null)
-        if (!st) continue
-        if (st.isDirectory()) folderRels.push(inputRel)
+        abs = resolveVault(inputRel, user.username)
+      } catch (e) {
+        recordError(inputRel, 'invalid path', e)
+        continue
+      }
+      const st = await stat(abs).catch(() => null)
+      if (!st) {
+        recordError(inputRel, 'not found')
+        continue
+      }
+      if (st.isDirectory()) folderRels.push(inputRel)
+      try {
         const expanded = await expandFilesUnder(user.username, inputRel)
         for (const r of expanded) {
           if (!seen.has(r)) {
             seen.add(r)
             fileRels.push(r)
+            fileOrigin.set(r, inputRel)
           }
         }
-      } catch {
-        /* skip */
+      } catch (e) {
+        recordError(inputRel, 'failed to list folder contents', e)
       }
     }
     let ok = 0
     let failed = 0
     for (const rel of fileRels) {
+      const reportAs = fileOrigin.get(rel) ?? rel
+      let abs: string
       try {
-        const abs = resolveVault(rel, user.username)
-        const meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
-        if (meta && !userCanEdit(meta, user.username, user.role)) {
-          failed++
-          continue
-        }
-        const s = await stat(abs).catch(() => null)
-        if (s?.isFile()) {
-          await moveToTrash({
-            storageKey: rel,
-            vaultAbs: abs,
-            docId: meta?.id,
-            owner: user.username,
-            bytes: s.size,
-            trashedBy: user.username,
-          })
-          ok++
-        }
-      } catch {
+        abs = resolveVault(rel, user.username)
+      } catch (e) {
         failed++
+        recordError(reportAs, 'invalid path', e)
+        continue
+      }
+      const meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
+      if (meta && !userCanEdit(meta, user.username, user.role)) {
+        failed++
+        recordError(reportAs, 'permission denied')
+        continue
+      }
+      const s = await stat(abs).catch(() => null)
+      if (!s) {
+        failed++
+        recordError(reportAs, 'not found')
+        continue
+      }
+      if (!s.isFile()) {
+        // Reached here only via the folder-expansion path; treat as
+        // a non-fatal skip rather than a failure (the folder itself
+        // is handled in the sweep below).
+        continue
+      }
+      try {
+        await moveToTrash({
+          storageKey: rel,
+          vaultAbs: abs,
+          docId: meta?.id,
+          owner: user.username,
+          bytes: s.size,
+          trashedBy: user.username,
+        })
+        ok++
+      } catch (e) {
+        failed++
+        recordError(reportAs, `trash failed: ${(e as Error).message ?? 'unknown'}`, e)
       }
     }
     // Now sweep the now-empty folder shells. Sort by depth descending so
@@ -1768,17 +2002,27 @@ export async function vaultRoutes(app: FastifyInstance) {
     for (const rel of folderRels) {
       try {
         await rm(resolveVault(rel, user.username), { recursive: true, force: true })
-      } catch {
-        /* ignore */
+      } catch (e) {
+        // Folder failures don't bump `failed` (the per-file counter)
+        // but they DO show up in `errors[]` so the user sees why a
+        // folder they expected to vanish is still there.
+        recordError(rel, `folder removal failed: ${(e as Error).message ?? 'unknown'}`, e)
       }
     }
     invalidateSearchCache()
     await audit({
       actor: user.username,
       action: 'vault.bulk-trash',
-      meta: { inputs: body.paths.length, files: fileRels.length, folders: folderRels.length, ok, failed },
+      meta: {
+        inputs: body.paths.length,
+        files: fileRels.length,
+        folders: folderRels.length,
+        ok,
+        failed,
+        errorCount: errors.length,
+      },
     })
-    return { ok, failed }
+    return { ok, failed, errors }
   })
 
   app.post('/api/folder', async (req, reply) => {
@@ -1861,6 +2105,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     await audit({ actor: user.username, action: 'vault.move', target: from, meta: { to } })
     return { ok: true }
   })
+
 
   // Resolve a raw path → docId. Public-aware: anonymous callers can fetch
   // metadata for a file that has `public: true`. For vault files without an

@@ -47,17 +47,23 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 # tini for proper SIGTERM forwarding (graceful shutdown).
+# gosu so the entrypoint can drop privileges to the reader user
+# after fixing volume ownership for PUID/PGID.
 # fontconfig + dejavu so PDF thumbnails render real text instead of
 # fallback tofu. libheif/libde265 for HEIC/HEIF decode in heic-convert.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      tini \
+      tini gosu \
       fontconfig fonts-dejavu-core \
       libheif1 libde265-0 \
+      # ffmpeg powers video HLS transcoding (videoTranscode.ts);
+      # libraw-bin gives us dcraw_emu for RAW photo previews.
+      ffmpeg libraw-bin \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root. Admins bind-mount /data + /vault and we won't write as
 # root into their NAS share. UID/GID 10001 are arbitrary but stable
-# so volume permissions survive image upgrades.
+# so volume permissions survive image upgrades. PUID/PGID env vars
+# at run time override these via docker-entrypoint.sh.
 RUN groupadd -r -g 10001 reader && useradd -r -u 10001 -g reader -d /app -s /sbin/nologin reader
 
 COPY --from=builder --chown=reader:reader /app/node_modules               ./node_modules
@@ -85,11 +91,15 @@ VOLUME ["/data", "/vault"]
 EXPOSE 3001
 
 RUN mkdir -p /data /vault && chown -R reader:reader /data /vault /app
-USER reader
+
+# Entrypoint script handles PUID/PGID remap + volume chown before
+# dropping to the reader user. Run as root so it can do those —
+# the script execs gosu to drop privileges before the server boots.
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Native fetch in Node 22 — no curl/wget needed in the image.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+process.env.SERVER_PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "apps/server/dist/index.js"]

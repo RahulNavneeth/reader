@@ -21,6 +21,18 @@ export type WebhookEvent =
   | { type: 'share'; path: string; actor: string; shareId: string; expiresAt: number | null }
   | { type: 'tags'; path: string; actor: string; tags: string[] }
   | { type: 'visibility'; path: string; actor: string; public: boolean }
+  // Fires once ingest completes (text extracted + chunks embedded).
+  // Useful for n8n / Zapier-style flows that want to react to "new
+  // searchable content" rather than just "file landed on disk."
+  | {
+      type: 'ingest'
+      path: string
+      actor: string
+      docId: string
+      status: 'ready' | 'no-text' | 'failed'
+      chunkCount: number
+      embedded: boolean
+    }
 
 export async function dispatch(event: WebhookEvent): Promise<void> {
   const settings = await loadSettings().catch(() => null)

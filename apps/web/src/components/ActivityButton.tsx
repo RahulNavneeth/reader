@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { History } from 'lucide-react'
 import { ActivityPanel } from './ActivityPanel'
+import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
 /**
  * Header trigger that opens the file's activity log in a small popover.
@@ -15,6 +16,11 @@ export function ActivityButton({
 }) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
+  const resolvedAlign = useAnchoredAlign({
+    triggerRef: rootRef,
+    popoverWidth: 320,
+    open,
+  })
 
   useEffect(() => {
     if (!open) return
@@ -36,14 +42,24 @@ export function ActivityButton({
 
   return (
     <div ref={rootRef} className="relative inline-flex">
-      <button className="btn-ghost" onClick={() => setOpen((v) => !v)} title="Activity">
+      <button
+        className="btn-ghost"
+        onClick={() => setOpen((v) => !v)}
+        title="Activity"
+        aria-expanded={open}
+        style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
+      >
         <History size={13} />
         Activity
       </button>
       {open && (
         <div
-          className="absolute right-0 top-full mt-1 z-50 w-[320px] max-h-[420px] overflow-y-auto p-2 rounded-md shadow-card"
-          style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}
+          className="absolute top-full mt-1 z-50 w-[320px] max-h-[420px] overflow-y-auto p-2 rounded-md shadow-card"
+          style={{
+            background: 'var(--panel-2)',
+            border: '1px solid var(--border)',
+            ...alignStyle(resolvedAlign),
+          }}
         >
           <ActivityPanel path={path} kind={kind} />
         </div>

@@ -49,7 +49,7 @@ type RpcResponse =
 const SERVER_INFO = {
   protocolVersion: '2024-11-05',
   serverInfo: { name: 'reader-knowledge', version: '0.3.0' },
-  capabilities: { tools: {} },
+  capabilities: { tools: {}, resources: {}, prompts: {} },
 }
 
 const TOOLS = [
@@ -69,11 +69,16 @@ const TOOLS = [
   {
     name: 'list_documents',
     description:
-      'List all documents accessible to the API token, with metadata (title, tags, mime, size, status).',
+      'List all documents accessible to the API token. Returns `documents` and `nextCursor`; pass `nextCursor` back as `cursor` to fetch the next page. `null` cursor means no more results.',
     inputSchema: {
       type: 'object',
       properties: {
         limit: { type: 'number', default: 50, minimum: 1, maximum: 500 },
+        cursor: {
+          type: 'string',
+          description:
+            'Opaque pagination cursor from a previous response. Omit for the first page.',
+        },
       },
     },
   },
@@ -205,24 +210,52 @@ async function handleCall(token: ApiToken, name: string, args: any) {
 
   if (name === 'list_documents') {
     const limit = Number.isFinite(args?.limit) ? Math.min(500, Math.max(1, Number(args.limit))) : 50
-    const docs = (await listAllDocuments())
-      .filter((d) => userCanRead(d, principal.username, principal.role))
-      .slice(0, limit)
-      .map((d) => ({
-        id: d.id,
-        title: d.title,
-        path: d.storageKey,
-        mime: d.mime,
-        bytes: d.bytes,
-        tags: d.tags,
-        owner: d.owner,
-        createdAt: d.createdAt,
-        ingestStatus: d.ingest.status,
-        chunkCount: d.ingest.chunkCount ?? 0,
-      }))
+    // Cursor is base64(JSON({ skip })). Opaque to the client; we
+    // bump `skip` by `limit` each page. Stable while the underlying
+    // listAllDocuments order is stable (it's sorted by createdAt
+    // desc) — if a new doc lands mid-pagination it'll appear at
+    // the top of the next request, which is acceptable for a list-
+    // documents tool.
+    const cursor = typeof args?.cursor === 'string' ? args.cursor : null
+    let skip = 0
+    if (cursor) {
+      try {
+        const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'))
+        if (typeof parsed?.skip === 'number' && parsed.skip >= 0) skip = parsed.skip
+      } catch {
+        throw new Error('invalid cursor')
+      }
+    }
+    const filtered = (await listAllDocuments()).filter((d) =>
+      userCanRead(d, principal.username, principal.role),
+    )
+    const page = filtered.slice(skip, skip + limit).map((d) => ({
+      id: d.id,
+      title: d.title,
+      path: d.storageKey,
+      mime: d.mime,
+      bytes: d.bytes,
+      tags: d.tags,
+      owner: d.owner,
+      createdAt: d.createdAt,
+      ingestStatus: d.ingest.status,
+      chunkCount: d.ingest.chunkCount ?? 0,
+    }))
+    const nextSkip = skip + page.length
+    const nextCursor =
+      nextSkip < filtered.length
+        ? Buffer.from(JSON.stringify({ skip: nextSkip }), 'utf8').toString('base64')
+        : null
     return {
-      content: [{ type: 'text', text: `${docs.length} document(s).` }],
-      structuredContent: { documents: docs },
+      content: [
+        {
+          type: 'text',
+          text:
+            `${page.length} document(s).` +
+            (nextCursor ? ` ${filtered.length - nextSkip} more — pass cursor to continue.` : ''),
+        },
+      ],
+      structuredContent: { documents: page, nextCursor, total: filtered.length },
     }
   }
 
@@ -383,6 +416,16 @@ async function dispatch(token: ApiToken, msg: RpcRequest): Promise<RpcResponse |
       return isNotification ? null : ok(id, {})
     case 'tools/list':
       return ok(id, { tools: TOOLS })
+    // First-class MCP server: even when we have no resources or
+    // prompts to expose, return empty arrays so clients (Claude
+    // Desktop, the MCP inspector) light up the panels and don't
+    // log "method not supported" errors.
+    case 'resources/list':
+      return ok(id, { resources: [] })
+    case 'resources/templates/list':
+      return ok(id, { resourceTemplates: [] })
+    case 'prompts/list':
+      return ok(id, { prompts: [] })
     case 'tools/call': {
       const name = msg.params?.name as string
       const args = msg.params?.arguments ?? {}

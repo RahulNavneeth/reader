@@ -57,6 +57,12 @@ export type DocumentMeta = {
   }
   /** GPS coords from image EXIF (HEIC/JPEG/TIFF); null = parsed but absent. */
   gps?: { lat: number; lng: number } | null
+  /** Perceptual dHash (16-hex) for image files. */
+  pHash?: string | null
+  /** Vault-relative path of the paired motion file (Live Photo). */
+  livePhotoPair?: string | null
+  /** For videos: true once ffmpeg has produced an HLS bundle on disk. */
+  hlsReady?: boolean
 }
 
 export type VaultNode = {
@@ -85,10 +91,13 @@ export type SearchHit = {
    *  from a shared subtree; thread `?owner=<owner>` for navigation. */
   owner: string
   score: number
+  /** Per-source RRF contributions; sum equals `score`. `image` is the
+   *  CLIP image-text match (always 0 unless CLIP_ENABLED on server). */
+  scores?: { lexical: number; semantic: number; metadata: number; image: number }
   snippet: string
   page?: number
   chunkIdx?: number
-  source: 'lexical' | 'semantic' | 'hybrid'
+  source: 'lexical' | 'semantic' | 'hybrid' | 'image'
 }
 
 export type WorkspaceSettings = {
@@ -293,6 +302,8 @@ export const api = {
     `/api/file/thumbnail${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
   previewUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
     `/api/file/preview${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
+  hlsUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
+    `/api/file/hls/playlist.m3u8${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
   upload: async (file: File, opts?: { dir?: string; title?: string; tags?: string }) => {
     const fd = new FormData()
     fd.set('file', file)
@@ -515,7 +526,12 @@ export const api = {
       password: opts?.password ?? null,
     }),
   bulkDelete: (paths: string[]) =>
-    post<{ ok: number; failed: number }>('/api/file/bulk-delete', { paths }),
+    post<{
+      ok: number
+      failed: number
+      /** Per-path failure reasons. Empty when nothing failed. */
+      errors: Array<{ path: string; reason: string }>
+    }>('/api/file/bulk-delete', { paths }),
 
   // trash
   trashList: () =>
@@ -635,7 +651,7 @@ export const api = {
       webhooks: {
         id: string
         url: string
-        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
         secret?: string
         enabled?: boolean
         createdAt: number
@@ -644,7 +660,7 @@ export const api = {
     }>('/api/admin/webhooks'),
   adminCreateWebhook: (body: {
     url: string
-    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
     secret?: string
     enabled?: boolean
   }) =>
@@ -659,11 +675,19 @@ export const api = {
 
   adminDuplicates: () =>
     get<{
-      groups: {
-        sha256: string
-        bytes: number
-        docs: { id: string; storageKey: string; title: string; bytes: number; createdAt: number; owner: string }[]
-      }[]
+      groups: Array<
+        | {
+            kind: 'exact'
+            sha256: string
+            bytes: number
+            docs: { id: string; storageKey: string; title: string; bytes: number; createdAt: number; owner: string }[]
+          }
+        | {
+            kind: 'near'
+            pHash: string
+            docs: { id: string; storageKey: string; title: string; bytes: number; createdAt: number; owner: string }[]
+          }
+      >
     }>('/api/admin/duplicates'),
   adminOllamaModels: () =>
     get<{ models: string[]; error?: string }>('/api/admin/ollama/models'),
@@ -724,7 +748,7 @@ export const api = {
       webhooks: Array<{
         id: string
         url: string
-        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
         secret?: string
         enabled?: boolean
         createdAt: number
@@ -734,13 +758,34 @@ export const api = {
     }>('/api/account/webhooks'),
   accountCreateWebhook: (body: {
     url: string
-    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
     secret?: string
     enabled?: boolean
   }) =>
     post<{ webhook: any }>('/api/account/webhooks', body),
   accountDeleteWebhook: (id: string) =>
     request<{ ok: true }>('DELETE', `/api/account/webhooks/${encodeURIComponent(id)}`),
+
+  // timeline — chronological photo + video feed
+  accountTimeline: (cursor?: string, limit = 200) =>
+    get<{
+      days: Array<{
+        day: string
+        items: Array<{
+          docId: string
+          path: string
+          name: string
+          mime: string
+          kind: 'image' | 'video'
+          createdAt: number
+          bytes: number
+          gps?: { lat: number; lng: number } | null
+          livePhotoPair?: string | null
+        }>
+      }>
+      nextCursor: string | null
+      total: number
+    }>(`/api/account/timeline${q({ cursor, limit })}`),
 
   // map — geotagged photos
   accountMap: () =>

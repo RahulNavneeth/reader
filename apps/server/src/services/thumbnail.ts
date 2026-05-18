@@ -5,6 +5,7 @@ import {
   transcodeImageToJpeg,
   videoFrameAt,
 } from './media.js'
+import { extractRawPreview, isRaw } from './raw.js'
 
 /**
  * Generate a small PNG preview for a file. Used by the folder grid so each
@@ -22,6 +23,14 @@ export async function generateThumbnail(
   if (ext === '.pdf') return thumbnailFromPdf(buffer)
   if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif', '.bmp'].includes(ext)) {
     return thumbnailFromImage(buffer)
+  }
+  // RAW camera files (CR2/NEF/ARW/DNG/...). Shell out to dcraw_emu
+  // to pull the embedded JPEG preview, then resize through the same
+  // canvas pipeline as any other image. Returns null when LibRaw
+  // isn't installed or the file has no embedded preview.
+  if (isRaw(filename)) {
+    const preview = await extractRawPreview(buffer, filename)
+    return preview ? thumbnailFromImage(preview) : null
   }
   if (isImageNeedingTranscode(filename)) {
     const jpeg = await transcodeImageToJpeg(buffer, filename)

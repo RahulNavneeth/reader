@@ -4,6 +4,7 @@ import {
   FileText,
   Sparkles,
   Type,
+  Image as ImageIcon,
   FolderPlus,
   Upload,
   CornerDownLeft,
@@ -304,7 +305,12 @@ function HitRow({
   onHover: () => void
   onClick: () => void
 }) {
-  const SourceIcon = hit.source === 'semantic' || hit.source === 'hybrid' ? Sparkles : Type
+  const SourceIcon =
+    hit.source === 'image'
+      ? ImageIcon
+      : hit.source === 'semantic' || hit.source === 'hybrid'
+        ? Sparkles
+        : Type
   return (
     <div
       data-pos={pos}

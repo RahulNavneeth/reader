@@ -3,6 +3,11 @@ import { Play, Pause, Volume2, VolumeX, Maximize2 } from 'lucide-react'
 
 type Props = {
   src: string
+  /** Optional HLS playlist URL. When provided we prefer streaming over
+   *  the raw byte source — Safari plays HLS natively; other browsers
+   *  get it via hls.js (dynamically imported so the lib isn't loaded
+   *  for non-video pages). Falls back to `src` if HLS fails to start. */
+  hlsSrc?: string
   /** Optional poster image (videos only). */
   poster?: string
   /** Display filename — shown on the audio player so the user knows
@@ -18,7 +23,7 @@ type Props = {
  * surface for a vault viewer: play/pause, seek, time, mute,
  * fullscreen (video only).
  */
-export function MediaPlayer({ src, poster, filename, kind }: Props) {
+export function MediaPlayer({ src, hlsSrc, poster, filename, kind }: Props) {
   const ref = useRef<HTMLMediaElement | null>(null)
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
@@ -26,6 +31,47 @@ export function MediaPlayer({ src, poster, filename, kind }: Props) {
   const [muted, setMuted] = useState(false)
   const [volume, setVolume] = useState(1)
   const [buffering, setBuffering] = useState(false)
+
+  // HLS attach: Safari natively supports application/vnd.apple.mpegurl
+  // so we just set src directly. Everyone else needs hls.js, which we
+  // dynamic-import so non-video pages don't pay the ~150KB bundle cost.
+  // On any HLS error we leave the element pointed at `src` (the raw
+  // byte stream from /api/file/raw) so playback degrades gracefully.
+  useEffect(() => {
+    const el = ref.current
+    if (!el || kind !== 'video' || !hlsSrc) return
+    const canNative = el.canPlayType('application/vnd.apple.mpegurl') !== ''
+    if (canNative) {
+      el.src = hlsSrc
+      return
+    }
+    let hls: { destroy(): void } | null = null
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { default: Hls } = await import('hls.js')
+        if (cancelled || !Hls.isSupported()) return
+        const instance = new Hls({ enableWorker: true })
+        instance.loadSource(hlsSrc)
+        instance.attachMedia(el as HTMLVideoElement)
+        instance.on(Hls.Events.ERROR, (_e, data) => {
+          // Fatal network/manifest error — fall back to the raw byte
+          // source. hls.js can recover from media errors on its own.
+          if (data?.fatal) {
+            instance.destroy()
+            el.src = src
+          }
+        })
+        hls = instance
+      } catch {
+        el.src = src
+      }
+    })()
+    return () => {
+      cancelled = true
+      if (hls) hls.destroy()
+    }
+  }, [hlsSrc, src, kind])
 
   // Wire HTMLMediaElement events to React state.
   useEffect(() => {
@@ -96,7 +142,11 @@ export function MediaPlayer({ src, poster, filename, kind }: Props) {
       {kind === 'video' ? (
         <video
           ref={ref as React.RefObject<HTMLVideoElement>}
-          src={src}
+          // When hlsSrc is provided the source is set imperatively by
+          // the HLS-attach effect above (native or via hls.js). Setting
+          // `src` here in JSX would race that and trigger a wasted
+          // initial GET against /api/file/raw.
+          src={hlsSrc ? undefined : src}
           poster={poster}
           playsInline
           preload="metadata"

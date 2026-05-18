@@ -75,7 +75,7 @@ export type WebhookConfig = {
   id: string
   url: string
   /** Bitmask of events the hook subscribes to. */
-  events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility'>
+  events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
   /** Optional shared secret — sent as `X-Reader-Signature` (HMAC-SHA256 hex). */
   secret?: string
   enabled?: boolean

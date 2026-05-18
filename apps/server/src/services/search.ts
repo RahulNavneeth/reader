@@ -4,9 +4,10 @@
  *
  * Both indices live in-memory and are invalidated on ingest.
  */
-import { listAllDocuments, streamChunks, readText } from '../stores/documents.js'
+import { listAllDocuments, streamChunks, readText, readClipEmbedding } from '../stores/documents.js'
 import { embedBatch, EmbedError } from './embed.js'
 import { userCanRead } from '../stores/documents.js'
+import { embedQuery as clipEmbedQuery, isClipEnabled } from './clipEmbed.js'
 import type { DocumentMeta } from '../types.js'
 
 type IndexedChunk = {
@@ -22,6 +23,11 @@ type Cache = {
   docs: DocumentMeta[]
   chunks: IndexedChunk[]
   fullTexts: Map<string, string>
+  /** Per-doc CLIP image embedding (L2-normalized 512-dim). Only
+   *  populated when CLIP is enabled and the doc had a clip.json
+   *  sidecar from ingest. Empty map when CLIP is off — keeps the
+   *  caller branch-free. */
+  clipByDoc: Map<string, number[]>
 }
 
 let cache: Cache | null = null
@@ -35,9 +41,19 @@ async function build(): Promise<Cache> {
   const docs = await listAllDocuments()
   const chunks: IndexedChunk[] = []
   const fullTexts = new Map<string, string>()
+  const clipByDoc = new Map<string, number[]>()
+  const clipOn = isClipEnabled()
   for (const d of docs) {
     const txt = await readText(d.id)
     if (txt) fullTexts.set(d.id, txt)
+    if (clipOn) {
+      // Cheap: clip.json is a few KB per doc and exists only for images
+      // that were ingested with CLIP_ENABLED. Missing files return
+      // null without throwing, so the loop is safe to run over the
+      // whole vault.
+      const vec = await readClipEmbedding(d.id)
+      if (vec && vec.length) clipByDoc.set(d.id, vec)
+    }
     if (!d.ingest.embedded) continue
     for await (const c of streamChunks(d.id)) {
       const emb = c.embedding && c.embedding.length > 0 ? Float32Array.from(c.embedding) : null
@@ -45,7 +61,7 @@ async function build(): Promise<Cache> {
       chunks.push({ docId: d.id, idx: c.idx, text: c.text, embedding: emb, norm })
     }
   }
-  return { builtAt: Date.now(), docs, chunks, fullTexts }
+  return { builtAt: Date.now(), docs, chunks, fullTexts, clipByDoc }
 }
 
 async function getCache(): Promise<Cache> {
@@ -142,10 +158,17 @@ export type SearchHit = {
    *  navigation when a hit comes from a shared subtree. */
   owner: string
   score: number
+  /** Per-source contributions to the fused score. Helps clients (and
+   *  agents reasoning over results) understand *why* something ranked
+   *  where it did — e.g. "ranked high because both the chunk text
+   *  AND the title matched". All components are RRF terms
+   *  (1/(k+rank)); they sum to `score`. `image` is the CLIP image-
+   *  text match score (always 0 when CLIP is disabled). */
+  scores?: { lexical: number; semantic: number; metadata: number; image: number }
   snippet: string
   page?: number
   chunkIdx?: number
-  source: 'lexical' | 'semantic' | 'hybrid'
+  source: 'lexical' | 'semantic' | 'hybrid' | 'image'
 }
 
 export async function searchKnowledge(opts: {
@@ -260,40 +283,108 @@ export async function searchKnowledge(opts: {
     // Embedding service down — fall back to lexical only.
   }
 
-  // RRF fuse (k=60). Group by docId; within a doc, prefer the best chunk snippet.
+  // CLIP image search: cosine-match the query (embedded into CLIP's
+  // shared text/image space) against every per-doc image embedding.
+  // Same SEM_MIN floor idea as the chunk semantic search — CLIP
+  // cosines for true matches sit ~0.25–0.40 on Xenova/clip-vit-base
+  // with normalized vectors; anything under 0.20 is noise.
+  const IMG_MIN_COSINE = 0.2
+  let img: Array<{ docId: string; score: number; sample: string }> = []
+  if (isClipEnabled() && c.clipByDoc.size > 0) {
+    try {
+      const qvec = await clipEmbedQuery(q)
+      if (qvec && qvec.length) {
+        for (const d of allowed) {
+          const vec = c.clipByDoc.get(d.id)
+          if (!vec || vec.length !== qvec.length) continue
+          let dot = 0
+          for (let i = 0; i < qvec.length; i++) dot += qvec[i] * vec[i]
+          // Both inputs are L2-normalized at write time, so dot ===
+          // cosine. No re-normalization here.
+          if (dot < IMG_MIN_COSINE) continue
+          img.push({ docId: d.id, score: dot, sample: d.title || d.originalFilename || '' })
+        }
+        img.sort((a, b) => b.score - a.score)
+        img = img.slice(0, limit * 4)
+      }
+    } catch {
+      // CLIP failure shouldn't sink the whole query — silently drop
+      // the image source and let lexical+semantic continue.
+    }
+  }
+
+  // RRF fuse (k=60). Group by docId; within a doc, prefer the best
+  // chunk snippet. We track per-source contributions separately so the
+  // hit can expose a `scores` breakdown — useful for clients debugging
+  // "why did this rank where it did".
   const k = 60
-  const fused = new Map<string, { score: number; sample: string; chunkIdx?: number }>()
+  type Fused = {
+    sample: string
+    chunkIdx?: number
+    lexical: number
+    semantic: number
+    metadata: number
+    image: number
+  }
+  const fused = new Map<string, Fused>()
+  const init = (sample: string, chunkIdx?: number): Fused => ({
+    sample, chunkIdx, lexical: 0, semantic: 0, metadata: 0, image: 0,
+  })
   lex.forEach((h, i) => {
-    fused.set(h.docId, { score: 1 / (k + i + 1), sample: h.sample })
+    const cur = fused.get(h.docId) ?? init(h.sample)
+    cur.lexical += 1 / (k + i + 1)
+    fused.set(h.docId, cur)
   })
   sem.forEach((h, i) => {
-    const cur = fused.get(h.docId)
-    const add = 1 / (k + i + 1)
-    if (cur) fused.set(h.docId, { score: cur.score + add, sample: h.sample, chunkIdx: h.chunkIdx })
-    else fused.set(h.docId, { score: add, sample: h.sample, chunkIdx: h.chunkIdx })
+    const cur = fused.get(h.docId) ?? init(h.sample, h.chunkIdx)
+    cur.semantic += 1 / (k + i + 1)
+    if (!cur.chunkIdx) cur.chunkIdx = h.chunkIdx
+    fused.set(h.docId, cur)
   })
-  // Metadata matches (title/tags) contribute to RRF too. They win their own
-  // bucket when neither the chunk text nor embeddings know about the query.
   meta.forEach((h, i) => {
-    const cur = fused.get(h.docId)
-    const add = 1 / (k + i + 1)
-    if (cur) fused.set(h.docId, { ...cur, score: cur.score + add })
-    else fused.set(h.docId, { score: add, sample: h.sample })
+    const cur = fused.get(h.docId) ?? init(h.sample)
+    cur.metadata += 1 / (k + i + 1)
+    fused.set(h.docId, cur)
+  })
+  img.forEach((h, i) => {
+    const cur = fused.get(h.docId) ?? init(h.sample)
+    cur.image += 1 / (k + i + 1)
+    fused.set(h.docId, cur)
   })
 
   const lexIds = new Set(lex.map((h) => h.docId))
   const semIds = new Set(sem.map((h) => h.docId))
+  const imgIds = new Set(img.map((h) => h.docId))
   const out: SearchHit[] = []
   for (const [docId, hit] of fused) {
+    const total = hit.lexical + hit.semantic + hit.metadata + hit.image
+    // Source label: 'hybrid' when both text-based sources fire;
+    // 'image' when the doc is purely a CLIP hit (no text match); else
+    // whichever single text source matched. We don't add an 'all'
+    // bucket — UX-wise 'hybrid' already signals "strong evidence".
+    const inText = lexIds.has(docId) || semIds.has(docId)
+    const inImg = imgIds.has(docId)
+    let source: SearchHit['source']
+    if (inText && lexIds.has(docId) && semIds.has(docId)) source = 'hybrid'
+    else if (semIds.has(docId)) source = 'semantic'
+    else if (lexIds.has(docId)) source = 'lexical'
+    else if (inImg) source = 'image'
+    else source = 'lexical'
     out.push({
       docId,
       path: pathById.get(docId) ?? '',
       title: titleById.get(docId) ?? docId,
       owner: ownerById.get(docId) ?? opts.user.username,
-      score: hit.score,
+      score: total,
+      scores: {
+        lexical: Number(hit.lexical.toFixed(6)),
+        semantic: Number(hit.semantic.toFixed(6)),
+        metadata: Number(hit.metadata.toFixed(6)),
+        image: Number(hit.image.toFixed(6)),
+      },
       snippet: hit.sample,
       chunkIdx: hit.chunkIdx,
-      source: lexIds.has(docId) && semIds.has(docId) ? 'hybrid' : semIds.has(docId) ? 'semantic' : 'lexical',
+      source,
     })
   }
   out.sort((a, b) => b.score - a.score)
