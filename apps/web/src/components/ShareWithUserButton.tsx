@@ -206,10 +206,24 @@ export function ShareWithUserButton({ paths }: Props) {
             ...alignStyle(resolvedAlign),
           }}
         >
+          {/* Header bar mirrors MakePublicPopover so the two access
+              affordances feel like the same component family — icon,
+              title, status pill on the right showing current state. */}
+          <div
+            className="flex items-center gap-2 px-3 h-8"
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+          >
+            <Users size={13} className="text-muted" />
+            <span className="text-[12px] font-semibold text-fg flex-1">
+              {isBulk ? `Share ${paths.length} items` : 'Share with a user'}
+            </span>
+            <span className="text-[10.5px] text-subtle">
+              {aggregated.length === 0
+                ? 'Not shared'
+                : `Shared with ${aggregated.length}`}
+            </span>
+          </div>
           <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border-soft)' }}>
-            <div className="text-[12.5px] font-medium text-fg">
-              {isBulk ? `Share ${paths.length} items with a user` : 'Share with a user'}
-            </div>
             <input
               className="input h-7 text-[12.5px]"
               placeholder="Username"

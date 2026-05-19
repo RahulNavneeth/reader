@@ -7,9 +7,10 @@ import {
   Plus,
   Users,
   AlertCircle,
-  Folder,
   Loader2,
   X,
+  FileText,
+  Play,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 
@@ -255,7 +256,7 @@ function Grid({ children }: { children: React.ReactNode }) {
   return (
     <div
       className="grid gap-3"
-      style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))' }}
+      style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))' }}
     >
       {children}
     </div>
@@ -274,36 +275,31 @@ function CollectionCard({
   return (
     <Link
       to={`/c/${c.id}`}
-      className="group block rounded-md overflow-hidden no-underline"
+      className="group block rounded-md overflow-hidden no-underline transition-colors"
       style={{
         background: 'var(--panel)',
         border: '1px solid var(--border-soft)',
       }}
     >
-      <div
-        className="w-full aspect-[16/10] flex items-center justify-center"
-        style={{ background: 'var(--bg)' }}
-      >
-        <Folder size={28} className="text-subtle" strokeWidth={1.4} />
-      </div>
-      <div className="px-3 py-2">
-        <div className="text-[13px] font-medium text-fg truncate" title={c.name}>
+      <CoverArt preview={c.preview} memberCount={c.memberCount} />
+      <div className="px-2.5 py-2">
+        <div className="text-[12.5px] font-medium text-fg truncate" title={c.name}>
           {c.name}
         </div>
-        <div className="text-[11.5px] text-subtle mt-0.5 flex items-center gap-1.5">
+        <div className="text-[11px] text-subtle mt-0.5 flex items-center gap-1.5">
           <span>
             {c.memberCount} {c.memberCount === 1 ? 'item' : 'items'}
           </span>
           {sharedFrom && (
             <>
               <span>·</span>
-              <Users size={10} />
+              <Users size={9} />
               <span className="truncate" title={`shared by ${sharedFrom}`}>
-                from {sharedFrom}
+                {sharedFrom}
               </span>
               {role === 'viewer' && (
                 <span
-                  className="ml-1 px-1 rounded text-[10px] uppercase"
+                  className="px-1 rounded text-[9px] uppercase tracking-wider"
                   style={{ background: 'var(--bg)', color: 'var(--fg-subtle)' }}
                 >
                   read
@@ -314,5 +310,130 @@ function CollectionCard({
         </div>
       </div>
     </Link>
+  )
+}
+
+/**
+ * Cover art for a collection card. Three modes:
+ *   - 4+ items: 2×2 mosaic of the first four members' thumbnails
+ *   - 1–3 items: single thumbnail filling the square
+ *   - 0 items: gradient + faint Layers glyph (visual identity that
+ *     doesn't read as "broken / empty placeholder")
+ *
+ * Square (1:1) aspect — denser cards feel more like a real album
+ * grid than the prior 16:10 letterbox.
+ */
+function CoverArt({
+  preview,
+  memberCount,
+}: {
+  preview: Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }>
+  memberCount: number
+}) {
+  if (preview.length === 0) {
+    return (
+      <div
+        className="w-full aspect-square flex items-center justify-center"
+        style={{ background: 'var(--bg)' }}
+      >
+        <Layers size={26} className="text-subtle" strokeWidth={1.4} />
+      </div>
+    )
+  }
+  if (preview.length < 4) {
+    const it = preview[0]!
+    return (
+      <div
+        className="relative w-full aspect-square overflow-hidden"
+        style={{ background: 'var(--bg)' }}
+      >
+        <CoverTile item={it} mode="single" />
+        {memberCount > 1 && (
+          <div
+            className="absolute bottom-1.5 right-1.5 px-1.5 h-5 rounded inline-flex items-center text-[10px] font-semibold"
+            style={{ background: 'rgba(0,0,0,0.65)', color: 'white' }}
+          >
+            +{memberCount - 1}
+          </div>
+        )}
+      </div>
+    )
+  }
+  return (
+    <div
+      className="grid w-full aspect-square overflow-hidden"
+      style={{
+        gridTemplateColumns: '1fr 1fr',
+        gridTemplateRows: '1fr 1fr',
+        gap: 1,
+        background: 'var(--border-soft)',
+      }}
+    >
+      {preview.slice(0, 4).map((it) => (
+        <div key={it.docId} className="relative overflow-hidden" style={{ background: 'var(--bg)' }}>
+          <CoverTile item={it} mode="mosaic" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function CoverTile({
+  item,
+  mode,
+}: {
+  item: { docId: string; path: string; kind: 'image' | 'video' | 'file' }
+  mode: 'single' | 'mosaic'
+}) {
+  if (item.kind === 'file') {
+    // Filename inferred from the path's last segment. Without it the
+    // tile reads as a blank doc icon and the user can't tell two
+    // file-kind collections apart at a glance.
+    const filename = item.path.split('/').pop() ?? item.path
+    if (mode === 'mosaic') {
+      return (
+        <div
+          className="absolute inset-0 flex items-center justify-center"
+          style={{ background: 'var(--panel)' }}
+        >
+          <FileText size={18} className="text-subtle" strokeWidth={1.4} />
+        </div>
+      )
+    }
+    // Single-tile mode: bigger icon + filename so the card has
+    // real identity. Plain neutral background — earlier attempts at
+    // a tinted gradient read as "out of place" against the rest of
+    // the app's neutral palette.
+    return (
+      <div
+        className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-3"
+        style={{ background: 'var(--bg)' }}
+      >
+        <FileText size={36} className="text-subtle" strokeWidth={1.3} />
+        <div className="text-[11.5px] text-fg text-center font-medium leading-tight line-clamp-2 break-all">
+          {filename}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <>
+      <img
+        src={api.thumbnailUrl(item.path)}
+        alt=""
+        className="absolute inset-0 w-full h-full object-cover"
+        onError={(e) => {
+          ;(e.currentTarget as HTMLImageElement).style.display = 'none'
+        }}
+      />
+      {item.kind === 'video' && (
+        <div
+          className="absolute top-1 right-1 w-4 h-4 rounded-full inline-flex items-center justify-center"
+          style={{ background: 'rgba(0,0,0,0.55)' }}
+        >
+          <Play size={8} color="white" fill="white" />
+        </div>
+      )}
+    </>
   )
 }

@@ -532,6 +532,11 @@ export const api = {
       /** Per-path failure reasons. Empty when nothing failed. */
       errors: Array<{ path: string; reason: string }>
     }>('/api/file/bulk-delete', { paths }),
+  bulkTags: (body: { paths: string[]; add?: string[]; remove?: string[] }) =>
+    post<{
+      ok: number
+      errors: Array<{ path: string; reason: string }>
+    }>('/api/file/bulk-tags', body),
 
   // trash
   trashList: () =>
@@ -840,6 +845,7 @@ export const api = {
         updatedAt: number
         role: 'owner'
         memberCount: number
+        preview: Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }>
       }>
       shared: Array<{
         id: string
@@ -851,6 +857,7 @@ export const api = {
         updatedAt: number
         role: 'editor' | 'viewer'
         memberCount: number
+        preview: Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }>
       }>
     }>('/api/collections'),
   createCollection: (body: { name: string; description?: string | null }) =>
@@ -909,11 +916,14 @@ export const api = {
     ),
   deleteCollection: (id: string) =>
     request<{ ok: true }>('DELETE', `/api/collections/${encodeURIComponent(id)}`),
-  addCollectionItems: (id: string, docIds: string[]) =>
+  addCollectionItems: (
+    id: string,
+    body: { docIds?: string[]; paths?: string[] },
+  ) =>
     post<{
       added: string[]
       skipped: Array<{ docId: string; reason: string }>
-    }>(`/api/collections/${encodeURIComponent(id)}/items`, { docIds }),
+    }>(`/api/collections/${encodeURIComponent(id)}/items`, body),
   removeCollectionItem: (id: string, docId: string) =>
     request<{ ok: true }>(
       'DELETE',

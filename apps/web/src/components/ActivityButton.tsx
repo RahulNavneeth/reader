@@ -54,14 +54,31 @@ export function ActivityButton({
       </button>
       {open && (
         <div
-          className="absolute top-full mt-1 z-50 w-[320px] max-h-[420px] overflow-y-auto p-2 rounded-md shadow-card"
+          className="absolute top-full mt-1 z-50 w-[340px] rounded-md shadow-card overflow-hidden flex flex-col"
           style={{
-            background: 'var(--panel-2)',
+            background: 'var(--panel)',
             border: '1px solid var(--border)',
+            maxHeight: 460,
             ...alignStyle(resolvedAlign),
           }}
         >
-          <ActivityPanel path={path} kind={kind} />
+          {/* Header bar — same shape as Public / Share so the toolbar's
+              popover family reads as one component. */}
+          <div
+            className="flex items-center gap-2 px-3 h-8 shrink-0"
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+          >
+            <History size={13} className="text-muted" />
+            <span className="text-[12px] font-semibold text-fg flex-1">
+              Activity
+            </span>
+            <span className="text-[10.5px] text-subtle">
+              {kind === 'folder' ? 'Folder history' : 'File history'}
+            </span>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            <ActivityPanel path={path} kind={kind} />
+          </div>
         </div>
       )}
     </div>

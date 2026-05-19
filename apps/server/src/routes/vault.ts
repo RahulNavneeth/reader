@@ -2067,6 +2067,138 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { ok, failed, errors }
   })
 
+  /**
+   * Bulk add (and/or remove) tags on a set of vault paths. Works on
+   * files AND folders uniformly — folders are tagged via folder
+   * metas, files via document metas. Set-union add / set-diff
+   * remove, so callers don't need to fetch the existing tags first.
+   *
+   * Body: { paths: string[], add?: string[], remove?: string[] }
+   * Returns: { ok: count, errors: Array<{ path, reason }> }
+   */
+  app.post('/api/file/bulk-tags', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as {
+      paths?: string[]
+      add?: string[]
+      remove?: string[]
+    }
+    if (!Array.isArray(body?.paths) || body.paths.length === 0) {
+      return reply.code(400).send({ error: 'paths[] required' })
+    }
+    const sanitize = (xs: unknown): string[] =>
+      Array.isArray(xs)
+        ? Array.from(
+            new Set(
+              xs
+                .map((t) => (typeof t === 'string' ? t.trim().toLowerCase() : ''))
+                .filter((t) => t.length > 0 && t.length <= 40),
+            ),
+          )
+        : []
+    const addList = sanitize(body.add)
+    const removeList = sanitize(body.remove)
+    if (addList.length === 0 && removeList.length === 0) {
+      return reply.code(400).send({ error: 'add[] or remove[] required' })
+    }
+
+    const docs = await listAllDocuments()
+    let ok = 0
+    const errors: Array<{ path: string; reason: string }> = []
+
+    for (const rel of body.paths) {
+      let abs: string
+      try {
+        abs = resolveVault(rel, user.username)
+      } catch (e) {
+        errors.push({ path: rel, reason: 'invalid path' })
+        req.log.warn({ err: e, path: rel }, 'bulk-tags: invalid path')
+        continue
+      }
+      const st = await stat(abs).catch(() => null)
+      if (!st) {
+        errors.push({ path: rel, reason: 'not found' })
+        continue
+      }
+      try {
+        if (st.isDirectory()) {
+          const existing = await getFolderMeta(user.username, rel)
+          const cur = new Set(existing?.tags ?? [])
+          for (const t of addList) cur.add(t)
+          for (const t of removeList) cur.delete(t)
+          const next = {
+            ...(existing ?? freshFolderMeta(user.username, rel)),
+            tags: Array.from(cur).sort(),
+            updatedAt: Date.now(),
+          }
+          await saveFolderMeta(next)
+        } else if (st.isFile()) {
+          let meta = docs.find(
+            (d) => d.storageKey === rel && d.owner === user.username,
+          )
+          if (!meta) {
+            // No doc index yet (raw file on disk). Synthesize a
+            // minimal meta the same way the single-file /api/file/tags
+            // endpoint does — but keep it simple here: just store
+            // the tags via a fresh meta so the next ingest sees them.
+            const filename = path.basename(abs)
+            meta = {
+              id: nanoid(),
+              title: filename.replace(/\.[^.]+$/, ''),
+              originalFilename: filename,
+              mime: inferMime(abs),
+              bytes: st.size,
+              sha256: '',
+              storageKey: rel,
+              owner: user.username,
+              acl: { readers: [], editors: [] },
+              tags: [],
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              ingest: { status: 'pending', embedded: false },
+            }
+          }
+          const cur = new Set(meta.tags)
+          for (const t of addList) cur.add(t)
+          for (const t of removeList) cur.delete(t)
+          await saveMeta({
+            ...meta,
+            tags: Array.from(cur).sort(),
+            updatedAt: Date.now(),
+          })
+        } else {
+          errors.push({ path: rel, reason: 'not a file or folder' })
+          continue
+        }
+        ok++
+      } catch (e) {
+        errors.push({ path: rel, reason: (e as Error).message ?? 'failed' })
+        req.log.warn({ err: e, path: rel }, 'bulk-tags: per-path failure')
+      }
+    }
+
+    invalidateSearchCache()
+    // Publish one tags event per affected path so the sidebar's
+    // tag-count badges + the /tags/<t> live view refresh. Without
+    // this, the sidebar shows stale counts after a bulk-tag until
+    // the next page refresh.
+    // Tags event signals "this path's tags changed"; receivers
+    // re-fetch instead of relying on the diff payload. Empty array
+    // is fine — bulk add/remove doesn't yield a clean per-path
+    // final-tags set without an extra read.
+    for (const rel of body.paths) {
+      publish({ type: 'tags', path: rel, tags: [] })
+    }
+    await audit({
+      actor: user.username,
+      action: 'vault.bulk-tags',
+      meta: { paths: body.paths.length, add: addList, remove: removeList, ok, errorCount: errors.length },
+    })
+    return { ok, errors }
+  })
+
   app.post('/api/folder', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!

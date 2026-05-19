@@ -62,7 +62,7 @@ export function CollectionPicker({ docId }: Props) {
           return next
         })
       } else {
-        const r = await api.addCollectionItems(cid, [docId])
+        const r = await api.addCollectionItems(cid, { docIds: [docId] })
         if (r.skipped.length > 0 && r.added.length === 0) {
           setError(r.skipped[0]?.reason ?? 'could not add')
         } else {
@@ -83,7 +83,7 @@ export function CollectionPicker({ docId }: Props) {
     setError(null)
     try {
       const r = await api.createCollection({ name })
-      await api.addCollectionItems(r.collection.id, [docId])
+      await api.addCollectionItems(r.collection.id, { docIds: [docId] })
       setNewName('')
       setCreateOpen(false)
       refresh()

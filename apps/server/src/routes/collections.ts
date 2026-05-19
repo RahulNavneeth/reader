@@ -35,16 +35,55 @@ export async function collectionsRoutes(app: FastifyInstance) {
   app.get('/api/collections', async (req, reply) => {
     if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
     const me = req.currentUser.username
-    const mine = collections.listByOwner(me).map((c) => ({
-      ...c,
-      role: 'owner' as const,
-      memberCount: collections.memberCount(c.id),
-    }))
-    const shared = collections.listSharedTo(me).map((c) => ({
-      ...c,
-      role: (c.canEdit ? 'editor' : 'viewer') as 'editor' | 'viewer',
-      memberCount: collections.memberCount(c.id),
-    }))
+
+    // For each collection, peek at up to the first 4 member docs and
+    // hand the client their {docId, path, kind} tuple so the card on
+    // /collections can paint a real mosaic cover instead of a blank
+    // folder icon. Kept to 4 because that's enough for a 2x2 mosaic
+    // and any larger N would inflate the response without changing
+    // the visual.
+    const previewFor = async (
+      cid: string,
+    ): Promise<
+      Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }>
+    > => {
+      const members = collections.listMembers(cid).slice(0, 4)
+      const out: Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }> = []
+      for (const m of members) {
+        const meta = await loadMeta(m.docId)
+        if (!meta) continue
+        const ext = meta.originalFilename.toLowerCase().match(/\.[^./\\]+$/)?.[0] ?? ''
+        const kind: 'image' | 'video' | 'file' =
+          /\.(png|jpe?g|webp|gif|avif|bmp|ico|heic|heif|tiff?|jxl)$/.test(ext)
+            ? 'image'
+            : /\.(mp4|mov|m4v|mkv|webm|avi|3gp|3gpp|mts|m2ts|mpg|mpeg|wmv|flv|ogv)$/.test(ext)
+              ? 'video'
+              : 'file'
+        out.push({ docId: meta.id, path: meta.storageKey, kind })
+      }
+      return out
+    }
+
+    const mineRaw = collections.listByOwner(me)
+    const sharedRaw = collections.listSharedTo(me)
+    // Resolve previews in parallel — each call is a couple of
+    // indexed lookups, so even 50 collections finishes in a few ms.
+    const mine = await Promise.all(
+      mineRaw.map(async (c) => ({
+        ...c,
+        role: 'owner' as const,
+        memberCount: collections.memberCount(c.id),
+        preview: await previewFor(c.id),
+      })),
+    )
+    const shared = await Promise.all(
+      sharedRaw.map(async (c) => ({
+        ...c,
+        role: (c.canEdit ? 'editor' : 'viewer') as 'editor' | 'viewer',
+        memberCount: collections.memberCount(c.id),
+        preview: await previewFor(c.id),
+      })),
+    )
     return { mine, shared }
   })
 
@@ -218,15 +257,39 @@ export async function collectionsRoutes(app: FastifyInstance) {
       if (!collections.userCanEdit(c, me, role)) {
         return reply.code(403).send({ error: 'forbidden' })
       }
-      const body = req.body as { docIds?: string[] }
-      const docIds = Array.isArray(body?.docIds) ? body!.docIds : []
-      if (docIds.length === 0) return reply.code(400).send({ error: 'docIds required' })
+      const body = req.body as { docIds?: string[]; paths?: string[] }
+      const docIdsIn = Array.isArray(body?.docIds) ? body!.docIds! : []
+      const pathsIn = Array.isArray(body?.paths) ? body!.paths! : []
+      if (docIdsIn.length === 0 && pathsIn.length === 0) {
+        return reply.code(400).send({ error: 'docIds or paths required' })
+      }
+
+      // Resolve paths → docIds against the caller's own vault. We
+      // don't follow share grants here on purpose: the bulk-select
+      // toolbar always operates on the user's current folder view,
+      // and looking up a path against the global doc index avoids
+      // cross-vault collisions when two users have a same-named file.
+      const { listAllDocuments, userCanRead } = await import(
+        '../stores/documents.js'
+      )
+      const docs = pathsIn.length > 0 ? await listAllDocuments() : []
+      const resolvedFromPaths: string[] = []
+      const pathSkipped: Array<{ docId: string; reason: string }> = []
+      for (const p of pathsIn) {
+        const meta = docs.find((d) => d.storageKey === p && d.owner === me)
+        if (!meta) {
+          pathSkipped.push({ docId: p, reason: 'not found' })
+          continue
+        }
+        resolvedFromPaths.push(meta.id)
+      }
+
+      const docIds = [...new Set([...docIdsIn, ...resolvedFromPaths])]
 
       // Only add docs the caller can actually read — otherwise an
       // attacker could probe what doc IDs exist by membership errors.
-      const { userCanRead } = await import('../stores/documents.js')
       const added: string[] = []
-      const skipped: Array<{ docId: string; reason: string }> = []
+      const skipped: Array<{ docId: string; reason: string }> = [...pathSkipped]
       for (const docId of docIds) {
         const meta = await loadMeta(docId)
         if (!meta) {

@@ -18,7 +18,6 @@ import { Map, Marker } from 'pigeon-maps'
 import { api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { copyText } from '../lib/clipboard'
-import { CollectionPicker } from './CollectionPicker'
 
 type Props = {
   /** Vault-relative path. */
@@ -247,11 +246,10 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
             </Section>
           )}
 
-          {meta?.id && (
-            <Section title="Collections">
-              <CollectionPicker docId={meta.id} />
-            </Section>
-          )}
+          {/* Collections live in the file toolbar's "Collections"
+              popover now (PathViewer → CollectionsToolbarButton).
+              Keeping a duplicate sidebar section here was redundant
+              and split the user's mental model. */}
 
           {/* Photo GPS — only renders when the image had EXIF GPS coords
               (cached as `meta.gps`). Tiny embedded OSM tile with a

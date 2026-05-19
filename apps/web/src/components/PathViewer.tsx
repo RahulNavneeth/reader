@@ -15,6 +15,7 @@ import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
+import { CollectionsToolbarButton } from './CollectionsToolbarButton'
 import { VersionsButton } from './VersionsButton'
 import { PublicButton } from './PublicButton'
 import { ShareWithUserButton } from './ShareWithUserButton'
@@ -297,6 +298,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
               owner={ownerOpt}
               onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
             />
+            {meta && <CollectionsToolbarButton docId={meta.id} />}
             <ActivityButton path={path} />
           </>
         )}

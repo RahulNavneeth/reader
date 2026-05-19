@@ -29,6 +29,8 @@ import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
 import { RevokePublicPopover } from './RevokePublicPopover'
 import { PinButton } from './PinButton'
+import { BulkCollectionsButton } from './BulkCollectionsButton'
+import { BulkTagsButton } from './BulkTagsButton'
 
 type FolderMetaShape = {
   owner: string
@@ -220,6 +222,24 @@ export function FolderGrid({
     }
     return { pinTargets: toPin, unpinTargets: toUnpin }
   }, [selectedPaths, pinnedSet])
+
+  // Selection composition — files-only vs mixed. Collections only
+  // accept file members, so the bulk "Add to collection" button
+  // disappears the moment a folder is in the selection. Mirrors the
+  // single-doc / single-folder model the collection schema enforces.
+  const { containsFolder, selectedFilePaths } = useMemo(() => {
+    if (!items) return { containsFolder: false, selectedFilePaths: [] as string[] }
+    const byPath = new Map(items.map((n) => [n.path, n]))
+    const files: string[] = []
+    let hasFolder = false
+    for (const p of selectedPaths) {
+      const n = byPath.get(p)
+      if (!n) continue
+      if (n.type === 'dir') hasFolder = true
+      else files.push(p)
+    }
+    return { containsFolder: hasFolder, selectedFilePaths: files }
+  }, [items, selectedPaths])
 
   const { privateTargets, publicTargets } = useMemo(() => {
     const priv: string[] = []
@@ -419,10 +439,24 @@ export function FolderGrid({
                 }
               />
             )}
+            {/* Bulk tags — applies to any non-empty selection
+                regardless of files-vs-folders mix. Server's
+                /api/file/bulk-tags dispatches by path kind so the
+                same tag lands in document metas for files and
+                folder metas for folders. */}
+            <BulkTagsButton paths={selectedPaths} />
             {/* Share-with-user fans out to every selected path under
                 one recipient/permission combo — no need to pick each
                 target one at a time. */}
             <ShareWithUserButton paths={selectedPaths} />
+            {/* Add-to-collection only when the selection is files
+                only. Folders can't be collection members (collections
+                are flat, file-only by design), so we hide the button
+                rather than presenting a control that would silently
+                skip half the selection. */}
+            {!containsFolder && selectedFilePaths.length > 0 && (
+              <BulkCollectionsButton paths={selectedFilePaths} />
+            )}
             {/* Pin / Unpin split — mirrors the Public/Private split below.
                 Pin(N) targets currently-unpinned items, Unpin(M) targets
                 currently-pinned items. When everything in the selection
