@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { ApiError, api, type ApiTokenInfo } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
+import { copyText } from '../lib/clipboard'
 
 /**
  * User-scoped API token management at /account/tokens. Mints + lists
@@ -121,7 +122,14 @@ export function AccountTokensPage() {
               <button
                 className="btn-ghost shrink-0"
                 onClick={async () => {
-                  await navigator.clipboard.writeText(newSecret)
+                  const ok = await copyText(newSecret)
+                  if (!ok) {
+                    setError(
+                      'Could not copy to clipboard automatically. Select the token above and copy it manually.',
+                    )
+                    return
+                  }
+                  setError(null)
                   setCopied(true)
                   setTimeout(() => setCopied(false), 1500)
                 }}

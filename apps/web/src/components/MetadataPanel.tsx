@@ -17,6 +17,7 @@ import {
 import { Map, Marker } from 'pigeon-maps'
 import { api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
+import { copyText } from '../lib/clipboard'
 
 type Props = {
   /** Vault-relative path. */
@@ -343,7 +344,8 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
                   className="btn-ghost h-6 w-6 px-0 shrink-0"
                   title="Copy"
                   onClick={async () => {
-                    await navigator.clipboard.writeText(meta.sha256)
+                    const ok = await copyText(meta.sha256)
+                    if (!ok) return
                     setShaCopied(true)
                     setTimeout(() => setShaCopied(false), 1500)
                   }}

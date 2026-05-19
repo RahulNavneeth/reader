@@ -5,10 +5,10 @@
  * anything older than RETENTION_DAYS.
  */
 import path from 'node:path'
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { nanoid } from 'nanoid'
 import { config } from '../config.js'
-import { ensureDir } from '../lib/fs.js'
+import { ensureDir, moveAcrossDevices } from '../lib/fs.js'
 
 export const RETENTION_DAYS = 30
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000
@@ -58,15 +58,20 @@ export async function moveToTrash(opts: {
   const id = nanoid()
   await mkdir(entryDir(id), { recursive: true })
   const filename = path.basename(opts.storageKey)
-  // Move file (rename is atomic on same fs; fallback to copy+unlink would need
-  // to be added if vault ever lives on a separate volume).
-  await rename(opts.vaultAbs, blobFile(id, filename))
-  // Move document meta dir if present.
+  // moveAcrossDevices uses rename (atomic, same-fs) and falls back
+  // to copy+remove on EXDEV. In docker-compose / podman-compose
+  // deployments /vault and /data are typically separate volumes,
+  // so the EXDEV path is the common case there — not the edge.
+  await moveAcrossDevices(opts.vaultAbs, blobFile(id, filename))
+  // Move document meta dir if present. Always under /data so usually
+  // same-fs as the trash dir, but we use the cross-device helper
+  // anyway so a user who bind-mounts /data/documents separately
+  // doesn't break here either.
   if (opts.docId) {
     const src = docMetaDir(opts.docId)
     const s = await stat(src).catch(() => null)
     if (s?.isDirectory()) {
-      await rename(src, path.join(entryDir(id), '_doc'))
+      await moveAcrossDevices(src, path.join(entryDir(id), '_doc'))
     }
   }
   const entry: TrashEntry = {

@@ -2,15 +2,15 @@ import type { FastifyInstance } from 'fastify'
 import { listAllDocuments } from '../stores/documents.js'
 
 /**
- * Photo timeline endpoint — chronological feed of the caller's
- * geotag-or-image media for the new /timeline UI. Returns items
- * already grouped by day, newest first, so the client doesn't have
- * to bucket on the fly.
+ * Document timeline endpoint — chronological feed of every document
+ * the caller owns, grouped by day, newest first. Originally photo-
+ * only; widened to include all files so the user has a single "what
+ * landed in my vault when" view.
  *
  *   GET /api/account/timeline?cursor=<base64>&limit=200
  *
  * Cursor pagination so a multi-year vault can load incrementally
- * instead of dumping every image into a single response.
+ * instead of dumping every doc into a single response.
  */
 const IMAGE_EXTS = new Set([
   '.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif',
@@ -48,25 +48,24 @@ export async function timelineRoutes(app: FastifyInstance) {
       }
     }
 
-    // Filter to image/video files the caller owns, sorted newest
-    // first. We dedupe by storageKey because the doc index can hold
-    // multiple records for the same path during re-ingest churn.
+    // Every doc the caller owns, newest first. Dedupe by storageKey
+    // because the doc index can briefly hold multiple records for
+    // the same path during re-ingest churn.
     const all = (await listAllDocuments()).filter((d) => d.owner === me)
     const seen = new Set<string>()
-    const media = all
+    const docs = all
       .filter((d) => {
         if (seen.has(d.storageKey)) return false
-        const e = ext(d.originalFilename)
-        if (!IMAGE_EXTS.has(e) && !VIDEO_EXTS.has(e)) return false
         seen.add(d.storageKey)
         return true
       })
       .sort((a, b) => b.createdAt - a.createdAt)
 
-    const page = media.slice(skip, skip + limit)
+    const page = docs.slice(skip, skip + limit)
 
     // Bucket by day so the client renders date headers without
-    // having to walk a flat list.
+    // having to walk a flat list. `kind` is the broad category the
+    // client uses to choose between thumbnail + file-icon rendering.
     const groups = new Map<
       string,
       Array<{
@@ -74,21 +73,27 @@ export async function timelineRoutes(app: FastifyInstance) {
         path: string
         name: string
         mime: string
-        kind: 'image' | 'video'
+        kind: 'image' | 'video' | 'file'
         createdAt: number
         bytes: number
         gps?: { lat: number; lng: number } | null
+        livePhotoPair?: string | null
       }>
     >()
     for (const d of page) {
       const key = dayKey(d.createdAt)
       const e = ext(d.originalFilename)
+      const kind: 'image' | 'video' | 'file' = VIDEO_EXTS.has(e)
+        ? 'video'
+        : IMAGE_EXTS.has(e)
+          ? 'image'
+          : 'file'
       const entry = {
         docId: d.id,
         path: d.storageKey,
         name: d.originalFilename,
         mime: d.mime,
-        kind: VIDEO_EXTS.has(e) ? ('video' as const) : ('image' as const),
+        kind,
         createdAt: d.createdAt,
         bytes: d.bytes,
         gps: d.gps ?? null,
@@ -105,10 +110,10 @@ export async function timelineRoutes(app: FastifyInstance) {
     }))
     const nextSkip = skip + page.length
     const nextCursor =
-      nextSkip < media.length
+      nextSkip < docs.length
         ? Buffer.from(JSON.stringify({ skip: nextSkip }), 'utf8').toString('base64')
         : null
 
-    return { days, nextCursor, total: media.length }
+    return { days, nextCursor, total: docs.length }
   })
 }

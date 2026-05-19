@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, Clock, AlertCircle, Play } from 'lucide-react'
+import { ArrowLeft, Clock, AlertCircle, Play, FileText } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 
 type DayGroup = Awaited<ReturnType<typeof api.accountTimeline>>['days'][number]
 
 /**
- * Photo timeline at /timeline. Chronological grid of every image +
- * video the user owns, bucketed by day with month/year headers.
+ * Document timeline at /timeline. Chronological grid of every doc
+ * the user owns — images, videos, and other files — bucketed by day.
  * Infinite scroll via IntersectionObserver — the next page loads
  * when the sentinel at the bottom of the list comes into view.
  */
@@ -142,9 +142,9 @@ export function TimelinePage() {
               style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
             >
               <Clock size={22} className="text-subtle mx-auto mb-2" />
-              <div className="text-[14px] text-fg font-medium">No photos yet</div>
+              <div className="text-[14px] text-fg font-medium">No documents yet</div>
               <div className="text-[12px] text-muted mt-1.5">
-                Upload images or videos to your vault and they'll appear here grouped by date.
+                Upload files to your vault and they'll appear here grouped by date.
               </div>
             </div>
           </div>
@@ -177,31 +177,48 @@ export function TimelinePage() {
                     }}
                     title={it.name}
                   >
-                    <img
-                      src={api.thumbnailUrl(it.path)}
-                      alt=""
-                      className="absolute inset-0 w-full h-full object-cover"
-                      onError={(e) => {
-                        ;(e.currentTarget as HTMLImageElement).style.display = 'none'
-                      }}
-                    />
-                    {it.kind === 'video' && (
+                    {it.kind === 'file' ? (
+                      // Non-media doc — no thumbnail to show; render a
+                      // generic file tile with truncated filename so the
+                      // grid stays visually uniform alongside media tiles.
                       <div
-                        className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full inline-flex items-center justify-center"
-                        style={{ background: 'rgba(0,0,0,0.55)' }}
+                        className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-2"
+                        style={{ background: 'var(--panel)' }}
                       >
-                        <Play size={10} color="white" fill="white" />
+                        <FileText size={28} className="text-subtle" strokeWidth={1.4} />
+                        <div className="text-[11px] text-fg text-center leading-tight line-clamp-3 break-all">
+                          {it.name}
+                        </div>
                       </div>
-                    )}
-                    {/* Live Photo indicator — small badge in the
-                        bottom-left so users can spot pairs at a glance. */}
-                    {it.kind === 'image' && it.livePhotoPair && (
-                      <div
-                        className="absolute bottom-1.5 left-1.5 px-1.5 h-4 rounded inline-flex items-center text-[9px] font-semibold uppercase tracking-wider"
-                        style={{ background: 'rgba(0,0,0,0.6)', color: 'white' }}
-                      >
-                        Live
-                      </div>
+                    ) : (
+                      <>
+                        <img
+                          src={api.thumbnailUrl(it.path)}
+                          alt=""
+                          className="absolute inset-0 w-full h-full object-cover"
+                          onError={(e) => {
+                            ;(e.currentTarget as HTMLImageElement).style.display = 'none'
+                          }}
+                        />
+                        {it.kind === 'video' && (
+                          <div
+                            className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full inline-flex items-center justify-center"
+                            style={{ background: 'rgba(0,0,0,0.55)' }}
+                          >
+                            <Play size={10} color="white" fill="white" />
+                          </div>
+                        )}
+                        {/* Live Photo indicator — small badge in the
+                            bottom-left so users can spot pairs at a glance. */}
+                        {it.kind === 'image' && it.livePhotoPair && (
+                          <div
+                            className="absolute bottom-1.5 left-1.5 px-1.5 h-4 rounded inline-flex items-center text-[9px] font-semibold uppercase tracking-wider"
+                            style={{ background: 'rgba(0,0,0,0.6)', color: 'white' }}
+                          >
+                            Live
+                          </div>
+                        )}
+                      </>
                     )}
                   </button>
                 ))}

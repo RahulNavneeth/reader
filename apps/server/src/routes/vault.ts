@@ -19,6 +19,7 @@ import { createReadStream } from 'node:fs'
 import { nanoid } from 'nanoid'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { config } from '../config.js'
+import { moveAcrossDevices } from '../lib/fs.js'
 import { audit } from '../stores/audit.js'
 import {
   deleteDocument,
@@ -1711,7 +1712,10 @@ export async function vaultRoutes(app: FastifyInstance) {
     const blobName = entry.filename.replace(/\.\./g, '_').replace(/[\/\\]/g, '_')
     const src = path.join(config.paths.trash, entry.id, blobName)
     try {
-      await rename(src, targetAbs)
+      // Cross-device safe: /data/trash and /vault are typically two
+      // separate bind mounts in compose deployments, so plain rename
+      // would throw EXDEV here.
+      await moveAcrossDevices(src, targetAbs)
     } catch (e: any) {
       return reply.code(500).send({ error: `restore failed: ${e?.message ?? e}` })
     }
@@ -1724,7 +1728,7 @@ export async function vaultRoutes(app: FastifyInstance) {
       const sSrc = await stat(docSrc).catch(() => null)
       const sDest = await stat(docDest).catch(() => null)
       if (sSrc?.isDirectory() && !sDest) {
-        await rename(docSrc, docDest).catch(() => null)
+        await moveAcrossDevices(docSrc, docDest).catch(() => null)
       }
     }
     await purgeTrash(entry.id)

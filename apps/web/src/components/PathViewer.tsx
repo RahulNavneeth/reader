@@ -10,6 +10,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { useConfirm } from '../lib/confirm'
+import { copyText } from '../lib/clipboard'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { TagsButton } from './TagsButton'
@@ -368,7 +369,11 @@ export function PathViewer({ path, canEdit = true }: Props) {
                       new ClipboardItem({ [blob.type || 'image/png']: blob }),
                     ])
                   } else if (text != null) {
-                    await navigator.clipboard.writeText(text)
+                    // copyText handles the modern API + a legacy
+                    // execCommand fallback for http:// or
+                    // Permissions-Policy-locked contexts.
+                    const ok = await copyText(text)
+                    if (!ok) throw new Error('clipboard write blocked by the browser')
                   }
                   setCopied(true)
                   setTimeout(() => setCopied(false), 1500)

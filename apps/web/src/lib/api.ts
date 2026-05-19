@@ -776,7 +776,7 @@ export const api = {
           path: string
           name: string
           mime: string
-          kind: 'image' | 'video'
+          kind: 'image' | 'video' | 'file'
           createdAt: number
           bytes: number
           gps?: { lat: number; lng: number } | null
