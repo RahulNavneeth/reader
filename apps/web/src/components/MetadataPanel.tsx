@@ -18,6 +18,7 @@ import { Map, Marker } from 'pigeon-maps'
 import { api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { copyText } from '../lib/clipboard'
+import { CollectionPicker } from './CollectionPicker'
 
 type Props = {
   /** Vault-relative path. */
@@ -109,8 +110,11 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
         className="fixed top-0 right-0 h-full w-full sm:w-[380px] z-[60] flex flex-col overflow-y-auto"
         style={{ background: 'var(--panel)', borderLeft: '1px solid var(--border)' }}
       >
+        {/* Header matches the App header height (h-12 = 48px) so its
+            bottom border aligns with the App header's bottom border
+            behind it. */}
         <div
-          className="h-11 px-3 flex items-center gap-2 shrink-0"
+          className="h-12 px-3 flex items-center gap-2 shrink-0"
           style={{ borderBottom: '1px solid var(--border-soft)' }}
         >
           <span className="text-[11.5px] uppercase tracking-wider font-semibold text-subtle flex-1">
@@ -240,6 +244,12 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
                   </span>
                 ))}
               </div>
+            </Section>
+          )}
+
+          {meta?.id && (
+            <Section title="Collections">
+              <CollectionPicker docId={meta.id} />
             </Section>
           )}
 

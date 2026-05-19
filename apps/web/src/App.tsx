@@ -13,6 +13,8 @@ import { AccountWebhooksPage } from './components/AccountWebhooksPage'
 import { MountBrowser } from './components/MountBrowser'
 import { MapPage } from './components/MapPage'
 import { TimelinePage } from './components/TimelinePage'
+import { CollectionsPage } from './components/CollectionsPage'
+import { CollectionDetailPage } from './components/CollectionDetailPage'
 import { NewFolderButton } from './components/NewFolderButton'
 import { TrashPage } from './components/TrashPage'
 import { SearchPalette } from './components/SearchPalette'
@@ -187,7 +189,7 @@ export default function App() {
     // Bare-path public URLs: `/` for a public vault root, `/<path>` for
     // any public file or folder. Reserved root segments are app routes
     // that can't be vault items.
-    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline'])
+    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline', 'collections', 'c'])
     const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
     const firstSeg = rawPath.split('/')[0] ?? ''
     const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
@@ -363,6 +365,8 @@ export default function App() {
           <Route path="/trash" element={<TrashPage />} />
           <Route path="/map" element={<MapPage />} />
           <Route path="/timeline" element={<TimelinePage />} />
+          <Route path="/collections" element={<CollectionsPage />} />
+          <Route path="/c/:id" element={<CollectionDetailPage />} />
           <Route path="/library/:mountId/*" element={<MountBrowser />} />
           <Route path="/library/:mountId" element={<MountBrowser />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}

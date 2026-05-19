@@ -825,6 +825,120 @@ export const api = {
   // bulk export — direct URL the user navigates to so the browser streams the download
   exportUrl: () => '/api/account/export.zip',
 
+  // ---------- Collections ----------
+  // Flat, virtual groupings of documents. A doc can be in many
+  // collections; collections can be shared with other users.
+  listCollections: () =>
+    get<{
+      mine: Array<{
+        id: string
+        owner: string
+        name: string
+        description: string | null
+        coverDocId: string | null
+        createdAt: number
+        updatedAt: number
+        role: 'owner'
+        memberCount: number
+      }>
+      shared: Array<{
+        id: string
+        owner: string
+        name: string
+        description: string | null
+        coverDocId: string | null
+        createdAt: number
+        updatedAt: number
+        role: 'editor' | 'viewer'
+        memberCount: number
+      }>
+    }>('/api/collections'),
+  createCollection: (body: { name: string; description?: string | null }) =>
+    post<{
+      collection: {
+        id: string
+        owner: string
+        name: string
+        description: string | null
+        coverDocId: string | null
+        createdAt: number
+        updatedAt: number
+      }
+    }>('/api/collections', body),
+  getCollection: (id: string) =>
+    get<{
+      collection: {
+        id: string
+        owner: string
+        name: string
+        description: string | null
+        coverDocId: string | null
+        createdAt: number
+        updatedAt: number
+        role: 'owner' | 'editor' | 'viewer'
+      }
+      items: Array<{
+        docId: string
+        path: string
+        title: string
+        mime: string
+        bytes: number
+        kind: 'image' | 'video' | 'file'
+        addedAt: number
+        position: number | null
+      }>
+      shares: Array<{
+        collectionId: string
+        recipient: string
+        canEdit: boolean
+        createdAt: number
+      }>
+    }>(`/api/collections/${encodeURIComponent(id)}`),
+  patchCollection: (
+    id: string,
+    body: { name?: string; description?: string | null; coverDocId?: string | null },
+  ) =>
+    request<{ collection: { id: string; name: string; updatedAt: number } }>(
+      'PATCH',
+      `/api/collections/${encodeURIComponent(id)}`,
+      body,
+    ),
+  deleteCollection: (id: string) =>
+    request<{ ok: true }>('DELETE', `/api/collections/${encodeURIComponent(id)}`),
+  addCollectionItems: (id: string, docIds: string[]) =>
+    post<{
+      added: string[]
+      skipped: Array<{ docId: string; reason: string }>
+    }>(`/api/collections/${encodeURIComponent(id)}/items`, { docIds }),
+  removeCollectionItem: (id: string, docId: string) =>
+    request<{ ok: true }>(
+      'DELETE',
+      `/api/collections/${encodeURIComponent(id)}/items/${encodeURIComponent(docId)}`,
+    ),
+  collectionsByDoc: (docId: string) =>
+    get<{
+      collections: Array<{
+        id: string
+        owner: string
+        name: string
+        coverDocId: string | null
+      }>
+    }>(`/api/collections/_by-doc/${encodeURIComponent(docId)}`),
+  shareCollection: (id: string, body: { recipient: string; canEdit: boolean }) =>
+    post<{
+      share: {
+        collectionId: string
+        recipient: string
+        canEdit: boolean
+        createdAt: number
+      }
+    }>(`/api/collections/${encodeURIComponent(id)}/shares`, body),
+  unshareCollection: (id: string, recipient: string) =>
+    request<{ ok: true }>(
+      'DELETE',
+      `/api/collections/${encodeURIComponent(id)}/shares/${encodeURIComponent(recipient)}`,
+    ),
+
   // external library mounts
   listExternalMounts: () =>
     get<{ mounts: Array<{ id: string; name: string; hint: string }> }>('/api/external-mounts'),
