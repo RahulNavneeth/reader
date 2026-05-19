@@ -17,6 +17,10 @@ export type Collection = {
   coverDocId: string | null
   createdAt: number
   updatedAt: number
+  public: boolean
+  publicExpiresAt: number | null
+  publicPasswordHash: string | null
+  publicSlug: string | null
 }
 
 export type CollectionMember = {
@@ -41,6 +45,10 @@ type CollectionRow = {
   cover_doc_id: string | null
   created_at: number
   updated_at: number
+  public: number
+  public_expires_at: number | null
+  public_password_hash: string | null
+  public_slug: string | null
 }
 
 function rowToCollection(r: CollectionRow): Collection {
@@ -52,6 +60,10 @@ function rowToCollection(r: CollectionRow): Collection {
     coverDocId: r.cover_doc_id,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    public: r.public === 1,
+    publicExpiresAt: r.public_expires_at,
+    publicPasswordHash: r.public_password_hash,
+    publicSlug: r.public_slug,
   }
 }
 
@@ -283,4 +295,114 @@ export function userCanView(c: Collection, username: string, role: string): bool
     )
     .get(c.id, username) as { 1: number } | undefined
   return !!row
+}
+
+// ---------------- share-cascade grants ----------------
+
+/**
+ * Bundle of doc-level read/edit access the user gets indirectly via
+ * any collection that's shared with them. Pre-fetched once per
+ * request and consulted by the per-doc read gates so a single
+ * collection share cascades to every member doc without forcing
+ * the owner to also doc-share each one.
+ *
+ * One row per doc-id: the MAX(can_edit) collapses multiple shares
+ * of the same doc into "best access wins" — if you have a read-only
+ * share on one collection and an edit share on another that both
+ * contain the same doc, you get edit.
+ *
+ * Cost: one indexed SELECT per request. With ~10 shares × ~100
+ * members each, that's 1k rows max — well within "free" territory.
+ */
+export type CollectionGrants = {
+  readableDocs: Set<string>
+  editableDocs: Set<string>
+}
+
+export function grantsForUser(username: string): CollectionGrants {
+  const rows = db()
+    .prepare(
+      `SELECT m.doc_id AS doc_id, MAX(s.can_edit) AS can_edit
+         FROM collection_members m
+         JOIN collection_shares s ON s.collection_id = m.collection_id
+        WHERE s.recipient = ?
+        GROUP BY m.doc_id`,
+    )
+    .all(username) as Array<{ doc_id: string; can_edit: number }>
+  const readableDocs = new Set<string>()
+  const editableDocs = new Set<string>()
+  for (const r of rows) {
+    readableDocs.add(r.doc_id)
+    if (r.can_edit === 1) editableDocs.add(r.doc_id)
+  }
+  return { readableDocs, editableDocs }
+}
+
+/** Identity grants — used by the route layer when there is no
+ *  authenticated user (anonymous public-collection access). */
+export function emptyGrants(): CollectionGrants {
+  return { readableDocs: new Set(), editableDocs: new Set() }
+}
+
+// ---------------- public-link helpers ----------------
+
+/**
+ * Set/unset a collection's public-link state. Caller is responsible
+ * for hashing the password (the route layer uses the same scrypt
+ * helper as document public passwords) and minting the slug.
+ */
+export function setPublic(
+  id: string,
+  opts: {
+    isPublic: boolean
+    expiresAt?: number | null
+    passwordHash?: string | null
+    slug?: string | null
+  },
+): Collection | null {
+  const c = load(id)
+  if (!c) return null
+  db()
+    .prepare(
+      `UPDATE collections
+         SET public = ?, public_expires_at = ?, public_password_hash = ?,
+             public_slug = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+    .run(
+      opts.isPublic ? 1 : 0,
+      opts.isPublic ? (opts.expiresAt ?? null) : null,
+      opts.isPublic ? (opts.passwordHash ?? null) : null,
+      opts.isPublic ? (opts.slug ?? null) : null,
+      Date.now(),
+      id,
+    )
+  return load(id)
+}
+
+export function bySlug(slug: string): Collection | null {
+  const row = db()
+    .prepare('SELECT * FROM collections WHERE public_slug = ? AND public = 1')
+    .get(slug) as CollectionRow | undefined
+  return row ? rowToCollection(row) : null
+}
+
+/** Tri-state public-gate check. Mirrors the file-level publicGate
+ *  helper in routes/vault.ts so anonymous viewers go through the
+ *  same expiry + password ceremony. */
+export function publicGate(
+  c: Collection,
+  providedPassword: string | undefined,
+  verify: (hash: string, pwd: string) => Promise<boolean> | boolean,
+): Promise<'ok' | 'password-required' | 'password-wrong' | 'expired' | 'not-public'> {
+  return (async () => {
+    if (!c.public) return 'not-public'
+    if (c.publicExpiresAt && c.publicExpiresAt < Date.now()) return 'expired'
+    if (c.publicPasswordHash) {
+      if (!providedPassword) return 'password-required'
+      const ok = await Promise.resolve(verify(c.publicPasswordHash, providedPassword))
+      return ok ? 'ok' : 'password-wrong'
+    }
+    return 'ok'
+  })()
 }

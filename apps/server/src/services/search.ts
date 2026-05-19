@@ -4,24 +4,25 @@
  *
  * Both indices live in-memory and are invalidated on ingest.
  */
-import { listAllDocuments, streamChunks, readText, readClipEmbedding } from '../stores/documents.js'
+import { listAllDocuments, readText, readClipEmbedding } from '../stores/documents.js'
 import { embedBatch, EmbedError } from './embed.js'
 import { userCanRead } from '../stores/documents.js'
 import { embedQuery as clipEmbedQuery, isClipEnabled } from './clipEmbed.js'
+import { streamEmbeddedChunks } from '../db/chunksRepo.js'
 import type { DocumentMeta } from '../types.js'
 
-type IndexedChunk = {
-  docId: string
-  idx: number
-  text: string
-  embedding: Float32Array | null
-  norm: number
-}
-
+/**
+ * Per-doc-meta + full-text cache.
+ *
+ * Previously this also held every chunk's embedding in a flat
+ * Float32Array — at 100K chunks × 768-dim × 4 bytes that's ~3 GB
+ * resident. Chunks now stream from SQLite per-query via
+ * `streamEmbeddedChunks`, so the cache stays small and only holds
+ * the per-doc text + the optional CLIP image vectors.
+ */
 type Cache = {
   builtAt: number
   docs: DocumentMeta[]
-  chunks: IndexedChunk[]
   fullTexts: Map<string, string>
   /** Per-doc CLIP image embedding (L2-normalized 512-dim). Only
    *  populated when CLIP is enabled and the doc had a clip.json
@@ -39,7 +40,6 @@ export function invalidateSearchCache(): void {
 
 async function build(): Promise<Cache> {
   const docs = await listAllDocuments()
-  const chunks: IndexedChunk[] = []
   const fullTexts = new Map<string, string>()
   const clipByDoc = new Map<string, number[]>()
   const clipOn = isClipEnabled()
@@ -47,21 +47,11 @@ async function build(): Promise<Cache> {
     const txt = await readText(d.id)
     if (txt) fullTexts.set(d.id, txt)
     if (clipOn) {
-      // Cheap: clip.json is a few KB per doc and exists only for images
-      // that were ingested with CLIP_ENABLED. Missing files return
-      // null without throwing, so the loop is safe to run over the
-      // whole vault.
       const vec = await readClipEmbedding(d.id)
       if (vec && vec.length) clipByDoc.set(d.id, vec)
     }
-    if (!d.ingest.embedded) continue
-    for await (const c of streamChunks(d.id)) {
-      const emb = c.embedding && c.embedding.length > 0 ? Float32Array.from(c.embedding) : null
-      const norm = emb ? Math.hypot(...Array.from(emb)) : 0
-      chunks.push({ docId: d.id, idx: c.idx, text: c.text, embedding: emb, norm })
-    }
   }
-  return { builtAt: Date.now(), docs, chunks, fullTexts, clipByDoc }
+  return { builtAt: Date.now(), docs, fullTexts, clipByDoc }
 }
 
 async function getCache(): Promise<Cache> {
@@ -183,7 +173,9 @@ export async function searchKnowledge(opts: {
   // Pull share-grants so chunks/files inside a shared subtree also
   // surface in semantic search results.
   const { listSharesTo } = await import('../stores/userShares.js')
+  const { grantsForUser } = await import('../db/collectionsRepo.js')
   const sharesIn = await listSharesTo(opts.user.username)
+  const collectionGrants = grantsForUser(opts.user.username)
   const shareAllows = (d: { owner: string; storageKey: string }): boolean => {
     if (d.owner === opts.user.username) return false
     const target = d.storageKey.replace(/^\/+|\/+$/g, '')
@@ -196,9 +188,13 @@ export async function searchKnowledge(opts: {
     }
     return false
   }
+  const collectionAllows = (d: { id: string }): boolean =>
+    collectionGrants.readableDocs.has(d.id)
   const allowed = c.docs.filter(
     (d) =>
-      userCanRead(d, opts.user.username, opts.user.role) || shareAllows(d),
+      userCanRead(d, opts.user.username, opts.user.role) ||
+      shareAllows(d) ||
+      collectionAllows(d),
   )
   const allowedIds = new Set(allowed.map((d) => d.id))
   const titleById = new Map(allowed.map((d) => [d.id, d.title]))
@@ -262,8 +258,11 @@ export async function searchKnowledge(opts: {
     if (qvec && qvec.length) {
       const qf = Float32Array.from(qvec)
       const qnorm = Math.hypot(...Array.from(qf))
-      for (const ch of c.chunks) {
-        if (!ch.embedding || !allowedIds.has(ch.docId)) continue
+      // Stream embedded chunks straight from SQLite for the allowed
+      // doc set. No more in-memory cache of every chunk's embedding —
+      // the row scan is bounded by allowedIds and the partial index
+      // skips chunks that never embedded.
+      for (const ch of streamEmbeddedChunks(allowedIds)) {
         const cs = cosine(ch.embedding, qf, ch.norm)
         if (cs < SEM_MIN_COSINE) continue
         // If the chunk shares no token with the query, demand a much higher
@@ -273,7 +272,12 @@ export async function searchKnowledge(opts: {
           const overlaps = queryTokens.some((t) => chunkLower.includes(t))
           if (!overlaps) continue
         }
-        sem.push({ docId: ch.docId, chunkIdx: ch.idx, score: cs * (qnorm || 1), sample: ch.text.slice(0, 280) })
+        sem.push({
+          docId: ch.docId,
+          chunkIdx: ch.idx,
+          score: cs * (qnorm || 1),
+          sample: ch.text.slice(0, 280),
+        })
       }
       sem.sort((a, b) => b.score - a.score)
       sem = sem.slice(0, limit * 4)

@@ -11,9 +11,13 @@ import {
   FileText,
   Play,
   Edit2,
+  Globe,
+  Copy,
+  Check,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
+import { copyText } from '../lib/clipboard'
 
 type Detail = Awaited<ReturnType<typeof api.getCollection>>
 
@@ -41,6 +45,10 @@ export function CollectionDetailPage() {
   const [shareRecipient, setShareRecipient] = useState('')
   const [shareCanEdit, setShareCanEdit] = useState(false)
   const [shareBusy, setShareBusy] = useState(false)
+  const [publishBusy, setPublishBusy] = useState(false)
+  const [publishPassword, setPublishPassword] = useState('')
+  const [publishExpiryDays, setPublishExpiryDays] = useState<number | ''>('')
+  const [linkCopied, setLinkCopied] = useState(false)
 
   const refresh = async () => {
     if (!id) return
@@ -134,6 +142,56 @@ export function CollectionDetailPage() {
       refresh()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
+    }
+  }
+
+  const publish = async () => {
+    if (!id) return
+    setPublishBusy(true)
+    setError(null)
+    try {
+      const expiresInSeconds =
+        typeof publishExpiryDays === 'number' && publishExpiryDays > 0
+          ? publishExpiryDays * 24 * 60 * 60
+          : null
+      await api.publishCollection(id, {
+        isPublic: true,
+        expiresInSeconds,
+        password: publishPassword || null,
+      })
+      setPublishPassword('')
+      setPublishExpiryDays('')
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setPublishBusy(false)
+    }
+  }
+
+  const unpublish = async () => {
+    if (!id) return
+    setPublishBusy(true)
+    setError(null)
+    try {
+      await api.publishCollection(id, { isPublic: false })
+      refresh()
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setPublishBusy(false)
+    }
+  }
+
+  const copyPublicLink = async () => {
+    if (!data?.collection.publicSlug) return
+    const url = `${window.location.origin}/pc/${data.collection.publicSlug}`
+    const ok = await copyText(url)
+    if (ok) {
+      setLinkCopied(true)
+      setTimeout(() => setLinkCopied(false), 1500)
+    } else {
+      setError('Could not copy link automatically — select the URL above and copy manually.')
     }
   }
 
@@ -297,6 +355,93 @@ export function CollectionDetailPage() {
               ))}
             </div>
           )}
+
+          {/* Public-link section. Owner can mint a slug-based URL
+              that anonymous viewers can paste in; optional password
+              + expiry. Compact form when private, summary row when
+              already published. */}
+          <div
+            className="mt-4 pt-3 border-t flex flex-col gap-2 max-w-[640px]"
+            style={{ borderColor: 'var(--border-soft)' }}
+          >
+            <div className="flex items-center gap-2">
+              <Globe size={12} className="text-subtle" />
+              <span className="text-[12px] font-medium text-fg">Public link</span>
+              {data.collection.public && (
+                <span
+                  className="text-[10.5px] px-1.5 h-5 rounded inline-flex items-center"
+                  style={{ background: 'var(--selected)', color: 'var(--accent)' }}
+                >
+                  on
+                </span>
+              )}
+            </div>
+            {data.collection.public && data.collection.publicSlug ? (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center gap-2">
+                  <code
+                    className="flex-1 px-2 py-1 rounded text-[11.5px] truncate"
+                    style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
+                  >
+                    {window.location.origin}/pc/{data.collection.publicSlug}
+                  </code>
+                  <button
+                    className="btn-ghost h-7"
+                    onClick={copyPublicLink}
+                    title="Copy URL"
+                  >
+                    {linkCopied ? <Check size={12} className="text-accent" /> : <Copy size={12} />}
+                    {linkCopied ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+                <div className="text-[11px] text-subtle">
+                  {data.collection.hasPassword ? 'Password-gated · ' : ''}
+                  {data.collection.publicExpiresAt
+                    ? `expires ${new Date(data.collection.publicExpiresAt).toLocaleString()}`
+                    : 'no expiry'}
+                </div>
+                <button
+                  className="btn-ghost self-start h-7"
+                  onClick={unpublish}
+                  disabled={publishBusy}
+                  style={{ color: '#BF2600' }}
+                >
+                  {publishBusy ? <Loader2 size={11} className="animate-spin" /> : <X size={11} />}
+                  Revoke
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 flex-wrap">
+                <input
+                  className="input h-7 text-[12px] w-[160px]"
+                  type="password"
+                  placeholder="Password (optional)"
+                  value={publishPassword}
+                  onChange={(e) => setPublishPassword(e.target.value)}
+                  disabled={publishBusy}
+                />
+                <input
+                  className="input h-7 text-[12px] w-[120px]"
+                  type="number"
+                  min={0}
+                  placeholder="Expiry (days)"
+                  value={publishExpiryDays}
+                  onChange={(e) =>
+                    setPublishExpiryDays(e.target.value ? Number(e.target.value) : '')
+                  }
+                  disabled={publishBusy}
+                />
+                <button
+                  className="btn-primary h-7"
+                  onClick={publish}
+                  disabled={publishBusy}
+                >
+                  {publishBusy ? <Loader2 size={11} className="animate-spin" /> : <Globe size={11} />}
+                  Publish
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

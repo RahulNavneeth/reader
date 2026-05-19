@@ -17,12 +17,13 @@
  * debugging — small enough not to matter for storage and useful when
  * something goes sideways with the DB.
  */
-import { readdir } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { config } from '../config.js'
 import { readJson } from '../lib/fs.js'
-import type { DocumentMeta } from '../types.js'
+import type { Chunk, DocumentMeta } from '../types.js'
 import { count, upsert } from './documentsRepo.js'
+import * as chunksRepo from './chunksRepo.js'
 
 export async function bootstrapDocumentsFromDisk(opts?: { silent?: boolean }): Promise<{
   imported: number
@@ -63,6 +64,72 @@ export async function bootstrapDocumentsFromDisk(opts?: { silent?: boolean }): P
   }
   if (!opts?.silent && imported > 0) {
     console.log(`[db] imported ${imported} document(s) from disk into SQLite (${skipped} skipped)`)
+  }
+  return { imported, skipped }
+}
+
+/**
+ * Mirror of bootstrapDocumentsFromDisk for the chunks table. Reads
+ * each doc's chunks.jsonl (newline-delimited Chunk records, the
+ * format chunks.ts always wrote) and replays into SQL. Idempotent:
+ * if `chunks` already has rows the function short-circuits and
+ * does nothing.
+ */
+export async function bootstrapChunksFromDisk(opts?: {
+  silent?: boolean
+}): Promise<{ imported: number; skipped: number }> {
+  if (chunksRepo.count() > 0) {
+    return { imported: 0, skipped: 0 }
+  }
+  let ids: string[]
+  try {
+    ids = await readdir(config.paths.documents)
+  } catch {
+    return { imported: 0, skipped: 0 }
+  }
+  let imported = 0
+  let skipped = 0
+  for (const id of ids) {
+    if (id.startsWith('.')) {
+      skipped++
+      continue
+    }
+    const file = path.join(config.paths.documents, id, 'chunks.jsonl')
+    let raw: string
+    try {
+      raw = await readFile(file, 'utf8')
+    } catch {
+      // chunks.jsonl missing — no embeddings to import (no-text doc
+      // or pre-ingest), counted as skip not error.
+      skipped++
+      continue
+    }
+    const chunks: Chunk[] = []
+    for (const line of raw.split('\n')) {
+      const t = line.trim()
+      if (!t) continue
+      try {
+        chunks.push(JSON.parse(t) as Chunk)
+      } catch {
+        /* malformed line — drop */
+      }
+    }
+    if (chunks.length === 0) {
+      skipped++
+      continue
+    }
+    try {
+      chunksRepo.replaceChunks(id, chunks)
+      imported++
+    } catch (e) {
+      if (!opts?.silent) {
+        console.warn(`[db] failed to import chunks ${id}:`, (e as Error).message)
+      }
+      skipped++
+    }
+  }
+  if (!opts?.silent && imported > 0) {
+    console.log(`[db] imported chunks for ${imported} document(s) into SQLite (${skipped} skipped)`)
   }
   return { imported, skipped }
 }

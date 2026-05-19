@@ -258,9 +258,27 @@ async function resolveReadContext(opts: {
 
   if (ownerHint && requester && ownerHint !== requester) {
     const grant = await findShareForPath(requester, ownerHint, rel)
-    if (!grant) return { meta: null, owner: null, sharedGrant: null }
-    const meta = docs.find((d) => d.owner === ownerHint && d.storageKey === rel) ?? null
-    return { meta, owner: ownerHint, sharedGrant: { canEdit: grant.canEdit } }
+    if (grant) {
+      const meta = docs.find((d) => d.owner === ownerHint && d.storageKey === rel) ?? null
+      return { meta, owner: ownerHint, sharedGrant: { canEdit: grant.canEdit } }
+    }
+    // No direct folder/file share — but the doc might be reachable
+    // via a collection that's shared with the requester.
+    const { grantsForUser } = await import('../db/collectionsRepo.js')
+    const cg = grantsForUser(requester)
+    if (cg.readableDocs.size > 0) {
+      const hit = docs.find(
+        (d) => d.owner === ownerHint && d.storageKey === rel && cg.readableDocs.has(d.id),
+      )
+      if (hit) {
+        return {
+          meta: hit,
+          owner: ownerHint,
+          sharedGrant: { canEdit: cg.editableDocs.has(hit.id) },
+        }
+      }
+    }
+    return { meta: null, owner: null, sharedGrant: null }
   }
 
   // Concurrent stub-creation (auto-ingest + visibility) can leave two doc
@@ -293,6 +311,26 @@ async function resolveReadContext(opts: {
       owner = s.owner
       sharedGrant = { canEdit: s.canEdit }
       return { meta: sharedMeta, owner, sharedGrant }
+    }
+
+    // Collection-cascade fallthrough: a doc reached through a shared
+    // collection can be served at its real owner's path even though
+    // the requester has no folder/path share for it. Cheaper than
+    // listSharesTo (one indexed query per request), so it lives here
+    // after the explicit-share path which short-circuits on hit.
+    const { grantsForUser } = await import('../db/collectionsRepo.js')
+    const cg = grantsForUser(requester)
+    if (cg.readableDocs.size > 0) {
+      const hit = docs.find(
+        (d) => d.storageKey === rel && cg.readableDocs.has(d.id),
+      )
+      if (hit) {
+        return {
+          meta: hit,
+          owner: hit.owner,
+          sharedGrant: { canEdit: cg.editableDocs.has(hit.id) },
+        }
+      }
     }
   }
   return { meta, owner, sharedGrant }

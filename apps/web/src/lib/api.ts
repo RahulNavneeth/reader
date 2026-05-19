@@ -876,6 +876,10 @@ export const api = {
         createdAt: number
         updatedAt: number
         role: 'owner' | 'editor' | 'viewer'
+        public: boolean
+        publicExpiresAt?: number | null
+        publicSlug?: string | null
+        hasPassword?: boolean
       }
       items: Array<{
         docId: string
@@ -938,6 +942,52 @@ export const api = {
       'DELETE',
       `/api/collections/${encodeURIComponent(id)}/shares/${encodeURIComponent(recipient)}`,
     ),
+  publishCollection: (
+    id: string,
+    body: {
+      isPublic: boolean
+      expiresInSeconds?: number | null
+      password?: string | null
+    },
+  ) =>
+    post<{
+      collection: {
+        id: string
+        public: boolean
+        publicSlug: string | null
+        publicExpiresAt: number | null
+      }
+    }>(`/api/collections/${encodeURIComponent(id)}/public`, body),
+  publicCollection: (slug: string, password?: string) =>
+    get<{
+      collection: {
+        id: string
+        name: string
+        description: string | null
+        slug: string
+        public: boolean
+        publicExpiresAt: number | null
+        hasPassword: boolean
+        createdAt: number
+        updatedAt: number
+      }
+      items: Array<{
+        docId: string
+        path: string
+        owner: string
+        title: string
+        mime: string
+        bytes: number
+        kind: 'image' | 'video' | 'file'
+        addedAt: number
+      }>
+    }>(`/api/public-collections/${encodeURIComponent(slug)}${q({ p: password })}`),
+  publicCollectionThumbnailUrl: (slug: string, docId: string, password?: string) =>
+    `/api/public-collections/${encodeURIComponent(slug)}/file/${encodeURIComponent(docId)}/thumbnail${q({ p: password })}`,
+  publicCollectionRawUrl: (slug: string, docId: string, password?: string) =>
+    `/api/public-collections/${encodeURIComponent(slug)}/file/${encodeURIComponent(docId)}/raw${q({ p: password })}`,
+  publicCollectionPreviewUrl: (slug: string, docId: string, password?: string) =>
+    `/api/public-collections/${encodeURIComponent(slug)}/file/${encodeURIComponent(docId)}/preview${q({ p: password })}`,
 
   // external library mounts
   listExternalMounts: () =>

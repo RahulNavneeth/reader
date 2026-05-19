@@ -21,10 +21,15 @@
  * session can absorb safely.
  */
 import { nanoid } from 'nanoid'
+import path from 'node:path'
+import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
 import type { FastifyInstance } from 'fastify'
 import { audit } from '../stores/audit.js'
-import { loadMeta } from '../stores/documents.js'
+import { loadMeta, readPreview, readThumbnail, readText as readDocText } from '../stores/documents.js'
 import * as collections from '../db/collectionsRepo.js'
+import { hashPassword, verifyPassword } from '../lib/sharePassword.js'
+import { resolveUserVault } from '../lib/userVault.js'
 
 export async function collectionsRoutes(app: FastifyInstance) {
   app.get('/api/collections', async (req, reply) => {
@@ -118,8 +123,29 @@ export async function collectionsRoutes(app: FastifyInstance) {
       const shares = c.owner === me || role === 'admin'
         ? collections.listShares(c.id)
         : []
+      // Owner sees the public-link state; non-owners only see the
+      // boolean public flag (so a recipient can tell a collection is
+      // shared publicly even if they can't manage the link).
+      const publicView = c.owner === me || role === 'admin'
+        ? {
+            public: c.public,
+            publicExpiresAt: c.publicExpiresAt,
+            publicSlug: c.publicSlug,
+            hasPassword: !!c.publicPasswordHash,
+          }
+        : { public: c.public }
       return {
-        collection: { ...c, role: canEdit ? (c.owner === me ? 'owner' : 'editor') : 'viewer' },
+        collection: {
+          id: c.id,
+          owner: c.owner,
+          name: c.name,
+          description: c.description,
+          coverDocId: c.coverDocId,
+          createdAt: c.createdAt,
+          updatedAt: c.updatedAt,
+          role: canEdit ? (c.owner === me ? 'owner' : 'editor') : 'viewer',
+          ...publicView,
+        },
         items,
         shares,
       }
@@ -317,6 +343,271 @@ export async function collectionsRoutes(app: FastifyInstance) {
         meta: { recipient: req.params.recipient },
       })
       return { ok: true }
+    },
+  )
+
+  // ------------- Public link -------------
+
+  /**
+   * Flip a collection's public-link state. Owner-only (or admin).
+   * Body: { isPublic: bool, expiresInSeconds?: number, password?: string }
+   * Returns the public slug + a ready-to-paste URL.
+   */
+  app.post<{ Params: { id: string } }>(
+    '/api/collections/:id/public',
+    async (req, reply) => {
+      if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+      const c = collections.load(req.params.id)
+      if (!c) return reply.code(404).send({ error: 'not found' })
+      const me = req.currentUser.username
+      const role = req.currentUser.role
+      if (c.owner !== me && role !== 'admin') {
+        return reply.code(403).send({ error: 'only the owner can publish' })
+      }
+      const body = req.body as {
+        isPublic?: boolean
+        expiresInSeconds?: number | null
+        password?: string | null
+      }
+      if (!body?.isPublic) {
+        const next = collections.setPublic(c.id, {
+          isPublic: false,
+          expiresAt: null,
+          passwordHash: null,
+          slug: null,
+        })
+        await audit({ actor: me, action: 'collection.unpublish', target: c.id })
+        return { collection: next }
+      }
+      // Re-use an existing slug across re-publishes so a previously
+      // shared link keeps working — except when the user explicitly
+      // wants a fresh URL, which they get by toggling off then on.
+      const slug = c.publicSlug ?? nanoid(10)
+      const passwordHash = body.password ? await hashPassword(body.password) : null
+      const expiresAt =
+        typeof body.expiresInSeconds === 'number' && body.expiresInSeconds > 0
+          ? Date.now() + body.expiresInSeconds * 1000
+          : null
+      const next = collections.setPublic(c.id, {
+        isPublic: true,
+        expiresAt,
+        passwordHash,
+        slug,
+      })
+      await audit({
+        actor: me,
+        action: 'collection.publish',
+        target: c.id,
+        meta: { expiresAt, hasPassword: !!passwordHash },
+      })
+      return { collection: next }
+    },
+  )
+
+  /**
+   * Anonymous public-collection read. The slug is part of the URL
+   * the user pastes; password is in the `p` query string. Returns a
+   * read-only view: collection metadata + items + (no shares).
+   */
+  app.get<{ Params: { slug: string } }>(
+    '/api/public-collections/:slug',
+    async (req, reply) => {
+      const c = collections.bySlug(req.params.slug)
+      if (!c) return reply.code(404).send({ error: 'not found' })
+      const { p } = req.query as { p?: string }
+      const gate = await collections.publicGate(c, p, verifyPassword)
+      if (gate === 'expired') return reply.code(410).send({ error: 'link expired' })
+      if (gate === 'password-required' || gate === 'password-wrong') {
+        return reply.code(401).send({
+          error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+          passwordRequired: true,
+        })
+      }
+      if (gate !== 'ok') return reply.code(404).send({ error: 'not found' })
+
+      const members = collections.listMembers(c.id)
+      const items: Array<{
+        docId: string
+        path: string
+        owner: string
+        title: string
+        mime: string
+        bytes: number
+        kind: 'image' | 'video' | 'file'
+        addedAt: number
+      }> = []
+      for (const m of members) {
+        const meta = await loadMeta(m.docId)
+        if (!meta) continue
+        const ext = meta.originalFilename.toLowerCase().match(/\.[^./\\]+$/)?.[0] ?? ''
+        const kind: 'image' | 'video' | 'file' =
+          /\.(png|jpe?g|webp|gif|avif|bmp|ico|heic|heif|tiff?|jxl)$/.test(ext)
+            ? 'image'
+            : /\.(mp4|mov|m4v|mkv|webm|avi|3gp|3gpp|mts|m2ts|mpg|mpeg|wmv|flv|ogv)$/.test(ext)
+              ? 'video'
+              : 'file'
+        items.push({
+          docId: meta.id,
+          path: meta.storageKey,
+          owner: meta.owner,
+          title: meta.title,
+          mime: meta.mime,
+          bytes: meta.bytes,
+          kind,
+          addedAt: m.addedAt,
+        })
+      }
+      // Strip sensitive fields from the response. Anonymous viewers
+      // don't see the password hash or the owner's userlist.
+      return {
+        collection: {
+          id: c.id,
+          name: c.name,
+          description: c.description,
+          slug: c.publicSlug,
+          public: true,
+          publicExpiresAt: c.publicExpiresAt,
+          hasPassword: !!c.publicPasswordHash,
+          createdAt: c.createdAt,
+          updatedAt: c.updatedAt,
+        },
+        items,
+      }
+    },
+  )
+
+  /**
+   * Anonymous read of a single member's bytes / preview / thumbnail
+   * / extracted text. Same gate dance as the listing endpoint, plus
+   * a membership check so a public-slug can only serve docs that
+   * are actually IN that collection.
+   */
+  async function gatedMember(
+    slug: string,
+    docId: string,
+    password: string | undefined,
+  ): Promise<
+    | { ok: true; meta: Awaited<ReturnType<typeof loadMeta>> }
+    | { ok: false; status: number; body: Record<string, unknown> }
+  > {
+    const c = collections.bySlug(slug)
+    if (!c) return { ok: false, status: 404, body: { error: 'not found' } }
+    const gate = await collections.publicGate(c, password, verifyPassword)
+    if (gate === 'expired')
+      return { ok: false, status: 410, body: { error: 'link expired' } }
+    if (gate === 'password-required' || gate === 'password-wrong') {
+      return {
+        ok: false,
+        status: 401,
+        body: {
+          error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+          passwordRequired: true,
+        },
+      }
+    }
+    if (gate !== 'ok')
+      return { ok: false, status: 404, body: { error: 'not found' } }
+    const members = collections.listMembers(c.id)
+    if (!members.some((m) => m.docId === docId))
+      return { ok: false, status: 404, body: { error: 'not in collection' } }
+    const meta = await loadMeta(docId)
+    if (!meta) return { ok: false, status: 404, body: { error: 'document missing' } }
+    return { ok: true, meta }
+  }
+
+  app.get<{ Params: { slug: string; docId: string } }>(
+    '/api/public-collections/:slug/file/:docId/raw',
+    async (req, reply) => {
+      const { p } = req.query as { p?: string }
+      const r = await gatedMember(req.params.slug, req.params.docId, p)
+      if (!r.ok) return reply.code(r.status).send(r.body)
+      const meta = r.meta!
+      const abs = resolveUserVault(meta.owner, meta.storageKey)
+      const s = await stat(abs).catch(() => null)
+      if (!s?.isFile()) return reply.code(404).send({ error: 'not found' })
+      const mime = meta.mime || 'application/octet-stream'
+      const disposition = `inline; filename="${path.basename(abs).replace(/"/g, '')}"`
+      // Range support for HTML5 video / audio scrubbing — same shape
+      // as the auth'd /api/file/raw handler.
+      const range = (req.headers.range || '') as string
+      const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+      if (m) {
+        const total = s.size
+        const start = m[1] ? Number(m[1]) : 0
+        const end = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1
+        if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+          return reply
+            .code(416)
+            .header('Content-Range', `bytes */${total}`)
+            .send({ error: 'range not satisfiable' })
+        }
+        return reply
+          .code(206)
+          .header('Content-Type', mime)
+          .header('Content-Length', String(end - start + 1))
+          .header('Content-Range', `bytes ${start}-${end}/${total}`)
+          .header('Accept-Ranges', 'bytes')
+          .header('Content-Disposition', disposition)
+          .send(createReadStream(abs, { start, end }))
+      }
+      return reply
+        .header('Content-Type', mime)
+        .header('Content-Length', String(s.size))
+        .header('Accept-Ranges', 'bytes')
+        .header('Content-Disposition', disposition)
+        .send(createReadStream(abs))
+    },
+  )
+
+  app.get<{ Params: { slug: string; docId: string } }>(
+    '/api/public-collections/:slug/file/:docId/thumbnail',
+    async (req, reply) => {
+      const { p } = req.query as { p?: string }
+      const r = await gatedMember(req.params.slug, req.params.docId, p)
+      if (!r.ok) return reply.code(r.status).send(r.body)
+      const buf = await readThumbnail(r.meta!.id)
+      if (!buf) return reply.code(404).send({ error: 'no thumbnail' })
+      return reply
+        .header('Content-Type', 'image/png')
+        .header('Cache-Control', 'public, max-age=3600')
+        .send(buf)
+    },
+  )
+
+  app.get<{ Params: { slug: string; docId: string } }>(
+    '/api/public-collections/:slug/file/:docId/preview',
+    async (req, reply) => {
+      const { p } = req.query as { p?: string }
+      const r = await gatedMember(req.params.slug, req.params.docId, p)
+      if (!r.ok) return reply.code(r.status).send(r.body)
+      const buf = await readPreview(r.meta!.id)
+      if (buf) {
+        return reply
+          .header('Content-Type', 'image/jpeg')
+          .header('Cache-Control', 'public, max-age=3600')
+          .send(buf)
+      }
+      // No transcoded preview — fall back to raw bytes (browser
+      // renders most formats directly).
+      const abs = resolveUserVault(r.meta!.owner, r.meta!.storageKey)
+      const s = await stat(abs).catch(() => null)
+      if (!s?.isFile()) return reply.code(404).send({ error: 'not found' })
+      return reply
+        .header('Content-Type', r.meta!.mime || 'application/octet-stream')
+        .send(createReadStream(abs))
+    },
+  )
+
+  app.get<{ Params: { slug: string; docId: string } }>(
+    '/api/public-collections/:slug/file/:docId/text',
+    async (req, reply) => {
+      const { p } = req.query as { p?: string }
+      const r = await gatedMember(req.params.slug, req.params.docId, p)
+      if (!r.ok) return reply.code(r.status).send(r.body)
+      const text = await readDocText(r.meta!.id)
+      return reply
+        .header('Content-Type', 'text/plain; charset=utf-8')
+        .send(text ?? '')
     },
   )
 }

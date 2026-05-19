@@ -7,6 +7,7 @@ import { config } from '../config.js'
 import { ensureDir, readJson, removeFile, safeFileName, writeJson } from '../lib/fs.js'
 import type { Chunk, DocumentMeta } from '../types.js'
 import * as docsRepo from '../db/documentsRepo.js'
+import * as chunksRepo from '../db/chunksRepo.js'
 
 function docDir(id: string): string {
   return path.join(config.paths.documents, safeFileName(id))
@@ -197,6 +198,10 @@ export async function readText(id: string): Promise<string | null> {
 }
 
 export async function writeChunks(id: string, chunks: Chunk[]): Promise<void> {
+  // SQL is the read-path for search. chunks.jsonl stays on disk as
+  // a per-doc backup the user can inspect / the watcher can resync
+  // from on a fresh DB.
+  chunksRepo.replaceChunks(id, chunks)
   await ensureDir(docDir(id))
   const lines = chunks.map((c) => JSON.stringify(c)).join('\n') + '\n'
   await writeFile(chunksFile(id), lines, 'utf8')

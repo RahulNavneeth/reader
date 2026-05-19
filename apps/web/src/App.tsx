@@ -15,6 +15,7 @@ import { MapPage } from './components/MapPage'
 import { TimelinePage } from './components/TimelinePage'
 import { CollectionsPage } from './components/CollectionsPage'
 import { CollectionDetailPage } from './components/CollectionDetailPage'
+import { PublicCollectionPage } from './components/PublicCollectionPage'
 import { NewFolderButton } from './components/NewFolderButton'
 import { TrashPage } from './components/TrashPage'
 import { SearchPalette } from './components/SearchPalette'
@@ -189,10 +190,20 @@ export default function App() {
     // Bare-path public URLs: `/` for a public vault root, `/<path>` for
     // any public file or folder. Reserved root segments are app routes
     // that can't be vault items.
-    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline', 'collections', 'c'])
+    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline', 'collections', 'c', 'pc'])
     const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
     const firstSeg = rawPath.split('/')[0] ?? ''
     const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
+    // Public collections viewable while signed out — bypass the auth
+    // screen entirely. The page itself negotiates password gating.
+    if (firstSeg === 'pc') {
+      return (
+        <Routes>
+          <Route path="/pc/:slug" element={<PublicCollectionPage />} />
+          <Route path="*" element={<AuthScreen onAuthed={(user) => setAuth({ status: 'authed', user })} />} />
+        </Routes>
+      )
+    }
     if (!isReserved) {
       return (
         <PublicResolver
@@ -367,6 +378,7 @@ export default function App() {
           <Route path="/timeline" element={<TimelinePage />} />
           <Route path="/collections" element={<CollectionsPage />} />
           <Route path="/c/:id" element={<CollectionDetailPage />} />
+          <Route path="/pc/:slug" element={<PublicCollectionPage />} />
           <Route path="/library/:mountId/*" element={<MountBrowser />} />
           <Route path="/library/:mountId" element={<MountBrowser />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
