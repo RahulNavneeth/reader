@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   ArrowLeft,
@@ -47,7 +48,10 @@ export function CollectionDetailPage() {
   const [shareBusy, setShareBusy] = useState(false)
   const [publishBusy, setPublishBusy] = useState(false)
   const [publishPassword, setPublishPassword] = useState('')
-  const [publishExpiryDays, setPublishExpiryDays] = useState<number | ''>('')
+  // Preset-based expiry — string so we can carry the special
+  // "never" sentinel alongside the numeric day-counts. Matches the
+  // pattern used by MakePublicPopover for per-file public links.
+  const [publishExpiry, setPublishExpiry] = useState<'1' | '7' | '30' | 'never'>('7')
   const [linkCopied, setLinkCopied] = useState(false)
 
   const refresh = async () => {
@@ -151,16 +155,14 @@ export function CollectionDetailPage() {
     setError(null)
     try {
       const expiresInSeconds =
-        typeof publishExpiryDays === 'number' && publishExpiryDays > 0
-          ? publishExpiryDays * 24 * 60 * 60
-          : null
+        publishExpiry === 'never' ? null : Number(publishExpiry) * 24 * 60 * 60
       await api.publishCollection(id, {
         isPublic: true,
         expiresInSeconds,
         password: publishPassword || null,
       })
       setPublishPassword('')
-      setPublishExpiryDays('')
+      setPublishExpiry('7')
       refresh()
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
@@ -291,158 +293,213 @@ export function CollectionDetailPage() {
         )}
       </header>
 
-      {/* Inline share strip — only the owner gets here. */}
-      {shareOpen && isOwner && data && (
+      {/* Share + Public link overlay. Centered modal portaled out
+          to document.body so a transformed ancestor doesn't clamp
+          its `position: fixed`. Two sections side-by-side in the
+          body: user-share form + recipient list on top, public-link
+          publish/copy/revoke at the bottom. */}
+      {shareOpen && isOwner && data && createPortal(
+        // Compacted: ~420px wide, smaller paddings, single
+        // continuous body (no per-section divider), Done lives in
+        // the top-right X — no separate footer row.
         <div
-          className="px-6 py-3 border-b shrink-0"
-          style={{ borderColor: 'var(--border-soft)', background: 'var(--panel)' }}
+          className="fixed inset-0 z-50 flex items-start justify-center pt-[14vh] px-4"
+          style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+          onClick={() => {
+            if (!shareBusy && !publishBusy) setShareOpen(false)
+          }}
         >
-          <div className="flex items-center gap-2 max-w-[640px]">
-            <input
-              className="input h-8 text-[13px] flex-1"
-              placeholder="Username"
-              value={shareRecipient}
-              onChange={(e) => setShareRecipient(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && addShare()}
-              disabled={shareBusy}
-            />
-            <label className="flex items-center gap-1.5 text-[12px] text-fg">
-              <input
-                type="checkbox"
-                checked={shareCanEdit}
-                onChange={(e) => setShareCanEdit(e.target.checked)}
-              />
-              Allow edit
-            </label>
-            <button
-              className="btn-primary h-8"
-              disabled={shareBusy || !shareRecipient.trim()}
-              onClick={addShare}
-            >
-              {shareBusy ? <Loader2 size={13} className="animate-spin" /> : <Users size={13} />}
-              Share
-            </button>
-          </div>
-          {data.shares.length > 0 && (
-            <div className="mt-3 flex flex-col gap-1.5 max-w-[640px]">
-              {data.shares.map((s) => (
-                <div
-                  key={s.recipient}
-                  className="flex items-center gap-2 px-2 py-1 rounded"
-                  style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
-                >
-                  <Users size={11} className="text-subtle" />
-                  <span className="text-[12.5px] text-fg flex-1">{s.recipient}</span>
-                  <span
-                    className="text-[10.5px] px-1.5 h-5 rounded inline-flex items-center"
-                    style={{
-                      background: s.canEdit ? 'var(--selected)' : 'transparent',
-                      color: s.canEdit ? 'var(--accent)' : 'var(--fg-subtle)',
-                      border: '1px solid var(--border-soft)',
-                    }}
-                  >
-                    {s.canEdit ? 'edit' : 'read-only'}
-                  </span>
-                  <button
-                    className="btn-ghost h-6 w-6 px-0"
-                    onClick={() => unshare(s.recipient)}
-                    title="Remove share"
-                    style={{ color: '#BF2600' }}
-                  >
-                    <X size={11} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Public-link section. Owner can mint a slug-based URL
-              that anonymous viewers can paste in; optional password
-              + expiry. Compact form when private, summary row when
-              already published. */}
           <div
-            className="mt-4 pt-3 border-t flex flex-col gap-2 max-w-[640px]"
-            style={{ borderColor: 'var(--border-soft)' }}
+            className="w-full max-w-[420px] rounded-lg shadow-card overflow-hidden flex flex-col"
+            style={{ background: 'var(--panel)', maxHeight: 'calc(100vh - 18vh)' }}
+            onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center gap-2">
-              <Globe size={12} className="text-subtle" />
-              <span className="text-[12px] font-medium text-fg">Public link</span>
-              {data.collection.public && (
-                <span
-                  className="text-[10.5px] px-1.5 h-5 rounded inline-flex items-center"
-                  style={{ background: 'var(--selected)', color: 'var(--accent)' }}
-                >
-                  on
-                </span>
-              )}
+            <div
+              className="flex items-center gap-2 px-3 h-10 border-b shrink-0"
+              style={{ borderColor: 'var(--border-soft)' }}
+            >
+              <Users size={13} className="text-accent" />
+              <div className="text-[12.5px] font-medium text-fg truncate">
+                Share &ldquo;{data.collection.name}&rdquo;
+              </div>
+              <div className="flex-1" />
+              <button
+                className="btn-ghost h-6 w-6 px-0"
+                onClick={() => setShareOpen(false)}
+                disabled={shareBusy || publishBusy}
+                title="Close"
+              >
+                <X size={12} />
+              </button>
             </div>
-            {data.collection.public && data.collection.publicSlug ? (
-              <div className="flex flex-col gap-1.5">
-                <div className="flex items-center gap-2">
-                  <code
-                    className="flex-1 px-2 py-1 rounded text-[11.5px] truncate"
-                    style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
-                  >
-                    {window.location.origin}/pc/{data.collection.publicSlug}
-                  </code>
+
+            <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+              {/* SECTION 1 — share with a user */}
+              <div>
+                <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1">
+                  Share with a user
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    className="input h-7 text-[12px] flex-1"
+                    placeholder="Username"
+                    value={shareRecipient}
+                    onChange={(e) => setShareRecipient(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && addShare()}
+                    disabled={shareBusy}
+                  />
                   <button
-                    className="btn-ghost h-7"
-                    onClick={copyPublicLink}
-                    title="Copy URL"
+                    className="btn-primary h-7"
+                    disabled={shareBusy || !shareRecipient.trim()}
+                    onClick={addShare}
                   >
-                    {linkCopied ? <Check size={12} className="text-accent" /> : <Copy size={12} />}
-                    {linkCopied ? 'Copied' : 'Copy'}
+                    {shareBusy ? <Loader2 size={11} className="animate-spin" /> : <Users size={11} />}
+                    Share
                   </button>
                 </div>
-                <div className="text-[11px] text-subtle">
-                  {data.collection.hasPassword ? 'Password-gated · ' : ''}
-                  {data.collection.publicExpiresAt
-                    ? `expires ${new Date(data.collection.publicExpiresAt).toLocaleString()}`
-                    : 'no expiry'}
+                <label className="mt-1.5 inline-flex items-center gap-1.5 text-[11.5px] text-fg select-none">
+                  <input
+                    type="checkbox"
+                    checked={shareCanEdit}
+                    onChange={(e) => setShareCanEdit(e.target.checked)}
+                  />
+                  Allow this user to edit
+                </label>
+                {data.shares.length > 0 && (
+                  <div className="mt-2 flex flex-col gap-1">
+                    {data.shares.map((s) => (
+                      <div
+                        key={s.recipient}
+                        className="flex items-center gap-1.5 px-1.5 py-0.5 rounded"
+                        style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
+                      >
+                        <Users size={10} className="text-subtle" />
+                        <span className="text-[11.5px] text-fg flex-1 truncate">{s.recipient}</span>
+                        <span
+                          className="text-[10px] px-1 h-4 rounded inline-flex items-center"
+                          style={{
+                            background: s.canEdit ? 'var(--selected)' : 'transparent',
+                            color: s.canEdit ? 'var(--accent)' : 'var(--fg-subtle)',
+                            border: '1px solid var(--border-soft)',
+                          }}
+                        >
+                          {s.canEdit ? 'edit' : 'read'}
+                        </span>
+                        <button
+                          className="btn-ghost h-5 w-5 px-0"
+                          onClick={() => unshare(s.recipient)}
+                          title="Remove share"
+                          style={{ color: '#BF2600' }}
+                        >
+                          <X size={10} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* SECTION 2 — public link. Same body, no big divider;
+                  just the subtitle label re-introduces the topic. */}
+              <div className="pt-2.5" style={{ borderTop: '1px solid var(--border-soft)' }}>
+                <div className="flex items-center gap-1.5 mb-1.5">
+                  <Globe size={11} className="text-subtle" />
+                  <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+                    Public link
+                  </div>
+                  {data.collection.public && (
+                    <span
+                      className="text-[10px] px-1 h-4 rounded inline-flex items-center"
+                      style={{ background: 'var(--selected)', color: 'var(--accent)' }}
+                    >
+                      on
+                    </span>
+                  )}
                 </div>
-                <button
-                  className="btn-ghost self-start h-7"
-                  onClick={unpublish}
-                  disabled={publishBusy}
-                  style={{ color: '#BF2600' }}
-                >
-                  {publishBusy ? <Loader2 size={11} className="animate-spin" /> : <X size={11} />}
-                  Revoke
-                </button>
+                {data.collection.public && data.collection.publicSlug ? (
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center gap-1.5">
+                      <code
+                        className="flex-1 px-1.5 py-1 rounded text-[11px] truncate"
+                        style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
+                      >
+                        {window.location.origin}/pc/{data.collection.publicSlug}
+                      </code>
+                      <button
+                        className="btn-ghost h-7"
+                        onClick={copyPublicLink}
+                        title="Copy URL"
+                      >
+                        {linkCopied ? <Check size={11} className="text-accent" /> : <Copy size={11} />}
+                        {linkCopied ? 'Copied' : 'Copy'}
+                      </button>
+                    </div>
+                    <div className="text-[10.5px] text-subtle">
+                      {data.collection.hasPassword ? 'Password-gated · ' : ''}
+                      {data.collection.publicExpiresAt
+                        ? `expires ${new Date(data.collection.publicExpiresAt).toLocaleDateString()}`
+                        : 'no expiry'}
+                    </div>
+                    <button
+                      className="btn-ghost self-start h-6"
+                      onClick={unpublish}
+                      disabled={publishBusy}
+                      style={{ color: '#BF2600' }}
+                    >
+                      {publishBusy ? <Loader2 size={10} className="animate-spin" /> : <X size={10} />}
+                      Revoke
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-1.5">
+                    <input
+                      className="input h-7 text-[12px]"
+                      type="password"
+                      placeholder="Password (optional)"
+                      value={publishPassword}
+                      onChange={(e) => setPublishPassword(e.target.value)}
+                      disabled={publishBusy}
+                    />
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11.5px] text-subtle">Expires</span>
+                      <select
+                        className="input h-7 text-[12px] flex-1"
+                        value={publishExpiry}
+                        onChange={(e) =>
+                          setPublishExpiry(
+                            e.target.value as '1' | '7' | '30' | 'never',
+                          )
+                        }
+                        disabled={publishBusy}
+                      >
+                        <option value="1">in 1 day</option>
+                        <option value="7">in 7 days</option>
+                        <option value="30">in 30 days</option>
+                        <option value="never">never</option>
+                      </select>
+                      <button
+                        className="btn-primary h-7"
+                        onClick={publish}
+                        disabled={publishBusy}
+                      >
+                        {publishBusy ? (
+                          <Loader2 size={10} className="animate-spin" />
+                        ) : (
+                          <Globe size={10} />
+                        )}
+                        Publish
+                      </button>
+                    </div>
+                    <div className="text-[10.5px] text-subtle">
+                      Anyone with the URL can view this collection.
+                    </div>
+                  </div>
+                )}
               </div>
-            ) : (
-              <div className="flex items-center gap-2 flex-wrap">
-                <input
-                  className="input h-7 text-[12px] w-[160px]"
-                  type="password"
-                  placeholder="Password (optional)"
-                  value={publishPassword}
-                  onChange={(e) => setPublishPassword(e.target.value)}
-                  disabled={publishBusy}
-                />
-                <input
-                  className="input h-7 text-[12px] w-[120px]"
-                  type="number"
-                  min={0}
-                  placeholder="Expiry (days)"
-                  value={publishExpiryDays}
-                  onChange={(e) =>
-                    setPublishExpiryDays(e.target.value ? Number(e.target.value) : '')
-                  }
-                  disabled={publishBusy}
-                />
-                <button
-                  className="btn-primary h-7"
-                  onClick={publish}
-                  disabled={publishBusy}
-                >
-                  {publishBusy ? <Loader2 size={11} className="animate-spin" /> : <Globe size={11} />}
-                  Publish
-                </button>
-              </div>
-            )}
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
 
       <div className="flex-1 overflow-y-auto px-6 py-6">

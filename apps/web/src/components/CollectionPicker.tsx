@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Layers, Check, Loader2, Plus } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Layers, Check, Loader2, Plus, Search } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 
 type Props = {
@@ -28,6 +28,7 @@ export function CollectionPicker({ docId }: Props) {
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
+  const [filter, setFilter] = useState('')
 
   const refresh = async () => {
     try {
@@ -110,15 +111,109 @@ export function CollectionPicker({ docId }: Props) {
           </button>
         </div>
       ) : (
-        <div className="flex flex-col gap-1">
-          {collections.map((c) => {
+        <CollectionList
+          collections={collections!}
+          containing={containing}
+          busy={busy}
+          filter={filter}
+          onFilter={setFilter}
+          onToggle={toggle}
+          createOpen={createOpen}
+          onCreateOpen={() => setCreateOpen(true)}
+          newName={newName}
+          onNewName={setNewName}
+          creating={creating}
+          onCreate={createAndAdd}
+          onCreateCancel={() => {
+            setCreateOpen(false)
+            setNewName('')
+          }}
+        />
+      )}
+      {error && (
+        <div className="text-[11px] mt-1.5" style={{ color: '#BF2600' }}>
+          {error}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Bounded-height list of the caller's collections. Adds a filter
+ * input when there are more than 5 entries, caps the scroll region
+ * at ~200 px, and keeps the "New collection" trigger pinned beneath
+ * the scroll area so it's always reachable. Important for sidebar
+ * use — a 30-collection panel shouldn't push everything else out
+ * of view.
+ */
+function CollectionList(props: {
+  collections: Array<{ id: string; name: string }>
+  containing: Set<string>
+  busy: string | null
+  filter: string
+  onFilter: (v: string) => void
+  onToggle: (id: string) => void
+  createOpen: boolean
+  onCreateOpen: () => void
+  newName: string
+  onNewName: (v: string) => void
+  creating: boolean
+  onCreate: () => void
+  onCreateCancel: () => void
+}) {
+  const {
+    collections,
+    containing,
+    busy,
+    filter,
+    onFilter,
+    onToggle,
+    createOpen,
+    onCreateOpen,
+    newName,
+    onNewName,
+    creating,
+    onCreate,
+    onCreateCancel,
+  } = props
+  const showFilter = collections.length > 5
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase()
+    if (!q) return collections
+    return collections.filter((c) => c.name.toLowerCase().includes(q))
+  }, [collections, filter])
+
+  return (
+    <div className="flex flex-col gap-1">
+      {showFilter && (
+        <div className="relative mb-0.5">
+          <Search
+            size={10}
+            className="absolute left-2 top-1/2 -translate-y-1/2 text-subtle pointer-events-none"
+          />
+          <input
+            className="input pl-6 h-6 text-[11.5px]"
+            placeholder={`Filter ${collections.length} collections…`}
+            value={filter}
+            onChange={(e) => onFilter(e.target.value)}
+          />
+        </div>
+      )}
+      <div className="flex flex-col gap-1 max-h-[200px] overflow-y-auto pr-0.5">
+        {filtered.length === 0 ? (
+          <div className="text-[11.5px] text-subtle px-2 py-1.5">
+            No matches.
+          </div>
+        ) : (
+          filtered.map((c) => {
             const inIt = containing.has(c.id)
             const isBusy = busy === c.id
             return (
               <button
                 key={c.id}
                 className="flex items-center gap-2 px-2 py-1.5 rounded text-left hover:bg-hover"
-                onClick={() => toggle(c.id)}
+                onClick={() => onToggle(c.id)}
                 disabled={isBusy}
               >
                 <span
@@ -138,46 +233,38 @@ export function CollectionPicker({ docId }: Props) {
                 <span className="text-[12px] text-fg truncate">{c.name}</span>
               </button>
             )
-          })}
-          {!createOpen ? (
-            <button
-              className="flex items-center gap-2 px-2 py-1.5 rounded text-left hover:bg-hover text-subtle text-[12px]"
-              onClick={() => setCreateOpen(true)}
-            >
-              <Plus size={11} />
-              New collection
-            </button>
-          ) : (
-            <div className="flex items-center gap-1.5 mt-1">
-              <input
-                autoFocus
-                className="input h-6 text-[12px] flex-1"
-                placeholder="Collection name"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') createAndAdd()
-                  if (e.key === 'Escape') {
-                    setCreateOpen(false)
-                    setNewName('')
-                  }
-                }}
-                disabled={creating}
-              />
-              <button
-                className="btn-primary h-6 px-2 text-[11px]"
-                onClick={createAndAdd}
-                disabled={creating || !newName.trim()}
-              >
-                {creating ? <Loader2 size={10} className="animate-spin" /> : 'Create'}
-              </button>
-            </div>
-          )}
-        </div>
-      )}
-      {error && (
-        <div className="text-[11px] mt-1.5" style={{ color: '#BF2600' }}>
-          {error}
+          })
+        )}
+      </div>
+      {!createOpen ? (
+        <button
+          className="flex items-center gap-2 px-2 py-1.5 rounded text-left hover:bg-hover text-subtle text-[12px]"
+          onClick={onCreateOpen}
+        >
+          <Plus size={11} />
+          New collection
+        </button>
+      ) : (
+        <div className="flex items-center gap-1.5 mt-1">
+          <input
+            autoFocus
+            className="input h-6 text-[12px] flex-1"
+            placeholder="Collection name"
+            value={newName}
+            onChange={(e) => onNewName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') onCreate()
+              if (e.key === 'Escape') onCreateCancel()
+            }}
+            disabled={creating}
+          />
+          <button
+            className="btn-primary h-6 px-2 text-[11px]"
+            onClick={onCreate}
+            disabled={creating || !newName.trim()}
+          >
+            {creating ? <Loader2 size={10} className="animate-spin" /> : 'Create'}
+          </button>
         </div>
       )}
     </div>

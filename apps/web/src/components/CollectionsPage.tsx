@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Link, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft,
@@ -8,6 +9,7 @@ import {
   AlertCircle,
   Folder,
   Loader2,
+  X,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 
@@ -96,45 +98,94 @@ export function CollectionsPage() {
         </button>
       </header>
 
-      {newOpen && (
+      {newOpen && createPortal(
+        // Centered overlay — same shape as New Folder / Upload.
+        // Portaled into document.body so any transformed ancestor
+        // (the App header's translate row) doesn't clamp position:
+        // fixed.
         <div
-          className="px-6 py-3 border-b shrink-0 flex items-center gap-2"
-          style={{ borderColor: 'var(--border-soft)', background: 'var(--panel)' }}
-        >
-          <input
-            className="input h-8 text-[13px] flex-1 max-w-[480px]"
-            placeholder="Collection name"
-            autoFocus
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') create()
-              if (e.key === 'Escape') {
-                setNewOpen(false)
-                setNewName('')
-              }
-            }}
-            disabled={creating}
-          />
-          <button
-            className="btn-primary h-8"
-            onClick={create}
-            disabled={creating || !newName.trim()}
-          >
-            {creating ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
-            Create
-          </button>
-          <button
-            className="btn-ghost h-8"
-            onClick={() => {
+          className="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] px-4"
+          style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+          onClick={() => {
+            if (!creating) {
               setNewOpen(false)
               setNewName('')
-            }}
-            disabled={creating}
+            }
+          }}
+        >
+          <div
+            className="w-full max-w-[480px] rounded-lg shadow-card overflow-hidden flex flex-col"
+            style={{ background: 'var(--panel)' }}
+            onClick={(e) => e.stopPropagation()}
           >
-            Cancel
-          </button>
-        </div>
+            <div
+              className="flex items-center gap-2.5 px-4 h-12 border-b shrink-0"
+              style={{ borderColor: 'var(--border-soft)' }}
+            >
+              <Layers size={15} className="text-accent" />
+              <div className="text-[13.5px] font-medium text-fg">New collection</div>
+              <div className="flex-1" />
+              <button
+                className="btn-ghost h-7 w-7 px-0"
+                onClick={() => {
+                  setNewOpen(false)
+                  setNewName('')
+                }}
+                disabled={creating}
+              >
+                <X size={13} />
+              </button>
+            </div>
+            <div className="px-4 py-4">
+              <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
+                Name
+              </div>
+              <input
+                className="input h-9 text-[13px] w-full"
+                placeholder="e.g. Best of 2026"
+                autoFocus
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') create()
+                  if (e.key === 'Escape') {
+                    setNewOpen(false)
+                    setNewName('')
+                  }
+                }}
+                disabled={creating}
+              />
+              <div className="text-[11px] text-subtle mt-2">
+                Collections are flat — you can drop any document into them from
+                the file panel later.
+              </div>
+            </div>
+            <div
+              className="flex items-center justify-end gap-2 px-4 py-3 border-t"
+              style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+            >
+              <button
+                className="btn-ghost h-7"
+                onClick={() => {
+                  setNewOpen(false)
+                  setNewName('')
+                }}
+                disabled={creating}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn-primary h-7"
+                onClick={create}
+                disabled={creating || !newName.trim()}
+              >
+                {creating ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+                Create
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       <div className="flex-1 overflow-y-auto px-6 py-6">
