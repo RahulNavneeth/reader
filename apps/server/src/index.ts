@@ -6,6 +6,8 @@ import fastifyStatic from '@fastify/static'
 import path from 'node:path'
 import { config } from './config.js'
 import { ensureDir } from './lib/fs.js'
+import { runMigrations } from './db/migrations.js'
+import { bootstrapDocumentsFromDisk } from './db/bootstrap.js'
 import authPlugin from './plugins/auth.js'
 import errorPlugin from './plugins/error.js'
 import { healthRoutes } from './routes/health.js'
@@ -60,6 +62,12 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await loadSettings()
   // The vault is the user's actual content folder; auto-create on first boot.
   await ensureDir(config.vault.root)
+
+  // SQLite migrations + one-shot import. Runs synchronously inside
+  // the boot sequence so the first request hits a populated table
+  // and not a half-migrated one. Idempotent across restarts.
+  runMigrations()
+  await bootstrapDocumentsFromDisk({ silent: !!opts.silent })
 
   const app = Fastify({
     logger: opts.silent

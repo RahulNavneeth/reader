@@ -200,7 +200,23 @@ async function handleCall(token: ApiToken, name: string, args: any) {
           text: hits.length === 0
             ? `No results for "${q}".`
             : hits
-                .map((h, i) => `${i + 1}. [${h.title}] (${h.source}, score=${h.score.toFixed(4)})\n${h.snippet}\n  doc:${h.docId}${h.chunkIdx != null ? ` chunk:${h.chunkIdx}` : ''}`)
+                .map((h, i) => {
+                  // Surface the per-source RRF contributions inline.
+                  // Was previously only in structuredContent.hits[].scores
+                  // and easy for a reader of the text output to miss.
+                  const breakdown = h.scores
+                    ? Object.entries(h.scores)
+                        .filter(([, v]) => v > 0)
+                        .map(([k, v]) => `${k}=${(v as number).toFixed(4)}`)
+                        .join(' ')
+                    : ''
+                  const header = `${i + 1}. [${h.title}] (${h.source}, score=${h.score.toFixed(4)}${
+                    breakdown ? `; ${breakdown}` : ''
+                  })`
+                  return `${header}\n${h.snippet}\n  doc:${h.docId}${
+                    h.chunkIdx != null ? ` chunk:${h.chunkIdx}` : ''
+                  }`
+                })
                 .join('\n\n'),
         },
       ],

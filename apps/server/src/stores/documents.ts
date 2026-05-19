@@ -1,11 +1,12 @@
 import path from 'node:path'
-import { readFile, writeFile, rm, readdir, stat } from 'node:fs/promises'
+import { readFile, writeFile, rm, stat } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import readline from 'node:readline'
 import crypto from 'node:crypto'
 import { config } from '../config.js'
 import { ensureDir, readJson, removeFile, safeFileName, writeJson } from '../lib/fs.js'
 import type { Chunk, DocumentMeta } from '../types.js'
+import * as docsRepo from '../db/documentsRepo.js'
 
 function docDir(id: string): string {
   return path.join(config.paths.documents, safeFileName(id))
@@ -124,76 +125,61 @@ export async function writeClipEmbedding(id: string, vector: number[]): Promise<
 // node assumption makes that unnecessary.
 const saveLocks = new Map<string, Promise<void>>()
 
-// In-memory index of all DocumentMeta keyed by id, populated lazily
-// on first `listAllDocuments()` call and maintained by saveMeta /
-// deleteDocument from there on.
+// SQLite (apps/server/src/db/*) is now the system of record for the
+// documents index. The previous in-memory Map cache is gone: a
+// `SELECT * FROM documents` is fast even at 100k rows thanks to the
+// indexes on (owner, created_at) and (owner, storage_key), and the
+// memory profile drops from ~1 GB-of-DocumentMeta-objects to just
+// the rows the current query needs.
 //
-// Why this exists: a fresh listAllDocuments() does readdir +
-// loadMeta-per-id, which is ~N disk seeks. At 10k+ docs that's
-// hundreds of ms per call, and every list/search hit reads the
-// whole index. The cache turns that into an O(1) Map read with no
-// disk traffic until something changes.
-//
-// Eventually the right answer is SQLite (this map at 100k docs ×
-// ~10KB each is 1GB of RAM); for now we get a 100× speedup without
-// adding a dep. The migration to a real KV/SQL adapter just swaps
-// the impl behind these three exported functions.
-let docIndex: Map<string, DocumentMeta> | null = null
-let indexLoad: Promise<Map<string, DocumentMeta>> | null = null
+// meta.json files are still written next to text.txt + chunks.jsonl
+// as a per-doc backup the user can `cat` for debugging — small
+// enough not to matter for storage and useful when something goes
+// sideways with the DB. Reads bypass them entirely.
 
-async function loadIndex(): Promise<Map<string, DocumentMeta>> {
-  if (docIndex) return docIndex
-  if (indexLoad) return indexLoad
-  indexLoad = (async () => {
-    const ids = await readdir(config.paths.documents).catch(() => [])
-    const m = new Map<string, DocumentMeta>()
-    for (const id of ids) {
-      if (id.startsWith('.')) continue
-      const meta = await readJson<DocumentMeta>(metaFile(id))
-      if (meta) m.set(id, meta)
-    }
-    docIndex = m
-    indexLoad = null
-    return m
-  })()
-  return indexLoad
-}
-
-/** Drop the in-memory index so the next list rebuilds from disk.
- *  Used by tests + the admin "reembed all" sweep that mutates many
- *  metas in a row. */
+/** No-op now that SQL is the source of truth. Kept exported because
+ *  several admin sweeps still call it; can be removed once those
+ *  callers are audited. */
 export function invalidateDocIndex(): void {
-  docIndex = null
-  indexLoad = null
+  /* SQL has no in-process cache to invalidate. */
 }
 
 export async function saveMeta(meta: DocumentMeta): Promise<void> {
   const id = meta.id
   const prev = saveLocks.get(id) ?? Promise.resolve()
+  // Per-doc save lock — preserves the original ordering guarantee
+  // that two concurrent saveMeta(sameId) calls apply in arrival
+  // order even when each does some async prep before the upsert.
+  // SQLite serializes writes internally too, but the lock prevents
+  // a read-modify-write losing the loser's mutation.
   const next = prev
     .catch(() => undefined)
-    .then(() => writeJson(metaFile(id), meta))
+    .then(async () => {
+      docsRepo.upsert(meta)
+      // meta.json backup — best-effort. A write failure here doesn't
+      // roll back the SQL upsert; the row in SQL is the truth.
+      await writeJson(metaFile(id), meta).catch(() => undefined)
+    })
   saveLocks.set(id, next)
   try {
     await next
-    // Update the in-memory index alongside disk so listAllDocuments
-    // reflects the change immediately. Skip if the index hasn't been
-    // built yet — first call will populate it from disk anyway.
-    if (docIndex) docIndex.set(id, meta)
   } finally {
-    // Only clear if no newer call has taken the slot since.
     if (saveLocks.get(id) === next) saveLocks.delete(id)
   }
 }
 
 export async function loadMeta(id: string): Promise<DocumentMeta | null> {
-  if (docIndex?.has(id)) return docIndex.get(id) ?? null
+  const row = docsRepo.load(id)
+  if (row) return row
+  // Fallback for the migration-in-progress window: a doc may exist
+  // on disk but not yet imported into SQL. Should only trigger
+  // between code-deploy and the bootstrap completing on first boot.
   return readJson<DocumentMeta>(metaFile(id))
 }
 
 export async function deleteDocument(id: string): Promise<void> {
+  docsRepo.remove(id)
   await rm(docDir(id), { recursive: true, force: true })
-  docIndex?.delete(id)
 }
 
 export async function writeText(id: string, text: string): Promise<void> {
@@ -271,10 +257,9 @@ export async function sweepExpiredPublic(): Promise<number> {
 }
 
 export async function listAllDocuments(): Promise<DocumentMeta[]> {
-  const idx = await loadIndex()
-  // Snapshot into an array + sort newest-first. Callers (search,
-  // listing) historically rely on this ordering.
-  return Array.from(idx.values()).sort((a, b) => b.createdAt - a.createdAt)
+  // SQL already sorts by created_at DESC via the index; no extra
+  // JS sort needed. Callers (search, listing) rely on newest-first.
+  return docsRepo.listAll()
 }
 
 export function userCanRead(meta: DocumentMeta, username: string, role: string): boolean {
