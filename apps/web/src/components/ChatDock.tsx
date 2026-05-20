@@ -768,7 +768,7 @@ function Bubble({
         className="text-[10px] uppercase tracking-wider font-semibold mb-1"
         style={{ color: isUser ? 'var(--accent)' : 'var(--fg-subtle)' }}
       >
-        {isUser ? 'You' : 'Assistant'}
+        {isUser ? 'You' : 'Reader AI'}
       </div>
       {!isUser && !isErrored && message.citations && message.citations.length > 0 && (
         <SourcesPanel
