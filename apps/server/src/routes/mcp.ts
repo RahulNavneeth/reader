@@ -32,6 +32,7 @@ import { writeFile, readdir, stat, mkdir } from 'node:fs/promises'
 import { ingestDocument } from '../services/ingest.js'
 import { nanoid } from 'nanoid'
 import { audit } from '../stores/audit.js'
+import { config } from '../config.js'
 import { addPin } from '../stores/pins.js'
 import type { ApiToken, DocumentMeta } from '../types.js'
 
@@ -113,6 +114,35 @@ const TOOLS = [
       properties: {
         path: { type: 'string', description: 'Vault-relative target path.' },
         content: { type: 'string', description: 'UTF-8 file contents.' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  {
+    name: 'upload_from_url',
+    description:
+      "Fetch a file from an http(s) URL and store it in the token-owner vault. Server-side: avoids needing to base64 a binary into JSON. SSRF-guarded (no private/loopback addresses, no redirects). Subject to the same upload size limit as multipart uploads.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Vault-relative target path. Extension determines mime.' },
+        url: { type: 'string', description: 'Public http or https URL.' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['path', 'url'],
+    },
+  },
+  {
+    name: 'upload_file',
+    description:
+      "Upload binary content directly as base64. Use when the file isn't reachable via a URL (e.g. an agent-generated image or PDF). Subject to the same upload size limit as multipart uploads.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Vault-relative target path.' },
+        content: { type: 'string', description: 'Base64-encoded file bytes.' },
+        mime: { type: 'string', description: 'Optional content-type hint; otherwise inferred from the path.' },
         tags: { type: 'array', items: { type: 'string' } },
       },
       required: ['path', 'content'],
@@ -506,6 +536,132 @@ async function handleCall(token: ApiToken, name: string, args: any) {
     })
     return {
       content: [{ type: 'text', text: `Wrote ${rel} (${content.length} chars).` }],
+      structuredContent: { document: meta },
+    }
+  }
+
+  if (name === 'upload_from_url' || name === 'upload_file') {
+    const rel = String(args?.path ?? '').replace(/^\/+|\/+$/g, '')
+    if (!rel) throw new Error('path required')
+    const tags = Array.isArray(args?.tags)
+      ? (args.tags as unknown[])
+          .filter((t): t is string => typeof t === 'string')
+          .map((t) => t.trim())
+          .filter(Boolean)
+      : []
+
+    // Pull the bytes via the tool-specific path, then run the shared
+    // post-write pipeline. Both flows share size cap + magic-byte
+    // validation so an `image/jpeg` claim with HTML bytes is caught
+    // either way.
+    let buffer: Buffer
+    let sourceMime: string | undefined
+    let sourceUrl: string | undefined
+    if (name === 'upload_from_url') {
+      const url = String(args?.url ?? '').trim()
+      if (!url) throw new Error('url required')
+      const { safeFetch } = await import('../lib/safeFetch.js')
+      const res = await safeFetch(url, {
+        maxBytes: config.ingest.maxFileBytes,
+        timeoutMs: 30_000,
+      })
+      buffer = res.buffer
+      sourceMime = res.contentType
+      sourceUrl = res.finalUrl
+    } else {
+      // upload_file — base64 in payload. JSON-RPC's transport is
+      // text-only, so anything that needs literal binary bytes must
+      // come through this path.
+      const raw = String(args?.content ?? '')
+      if (!raw) throw new Error('content required')
+      try {
+        buffer = Buffer.from(raw, 'base64')
+      } catch {
+        throw new Error('content must be valid base64')
+      }
+      if (buffer.length === 0) {
+        throw new Error('decoded content is empty (was the base64 valid?)')
+      }
+      if (buffer.length > config.ingest.maxFileBytes) {
+        throw new Error(
+          `decoded content exceeds the ${config.ingest.maxFileBytes}-byte upload cap`,
+        )
+      }
+      const declared = args?.mime
+      if (typeof declared === 'string') sourceMime = declared
+    }
+
+    // Magic-byte sanity check. uploadGuard sniffs the leading bytes
+    // and refuses if the file's actual format doesn't match the
+    // claimed extension — same protection multipart uploads get.
+    const { validateUpload } = await import('../lib/uploadGuard.js')
+    const filename = path.basename(rel)
+    const guard = await validateUpload(buffer, filename, sourceMime)
+    if (!guard.ok) {
+      throw new Error(`refusing upload: ${guard.reason}`)
+    }
+
+    await ensureUserVault(actingUser)
+    const abs = resolveUserVault(actingUser, rel)
+    await mkdir(path.dirname(abs), { recursive: true })
+    await writeFile(abs, buffer)
+
+    const now = Date.now()
+    const existing = await findDocByPath(actingUser, rel)
+    let meta: DocumentMeta
+    if (existing) {
+      meta = {
+        ...existing,
+        bytes: buffer.length,
+        sha256: sha256Of(buffer),
+        mime: guard.mime || existing.mime,
+        tags: tags.length ? tags : existing.tags,
+        updatedAt: now,
+        ingest: { status: 'pending', embedded: false },
+      }
+      await saveMeta(meta)
+    } else {
+      meta = {
+        id: nanoid(),
+        title: filename.replace(/\.[^.]+$/, ''),
+        originalFilename: filename,
+        mime: guard.mime || sourceMime || 'application/octet-stream',
+        bytes: buffer.length,
+        sha256: sha256Of(buffer),
+        storageKey: rel,
+        owner: actingUser,
+        acl: { readers: [], editors: [] },
+        publicExpiresAt: null,
+        publicPasswordHash: null,
+        tags,
+        createdAt: now,
+        updatedAt: now,
+        ingest: { status: 'pending', embedded: false },
+      }
+      await saveMeta(meta)
+    }
+    meta = await ingestDocument(meta, buffer)
+    await audit({
+      actor: actingUser,
+      action: name === 'upload_from_url' ? 'mcp.upload_from_url' : 'mcp.upload_file',
+      target: meta.id,
+      meta: {
+        path: rel,
+        bytes: buffer.length,
+        mime: meta.mime,
+        ...(sourceUrl ? { url: sourceUrl } : {}),
+      },
+    })
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            name === 'upload_from_url'
+              ? `Fetched and stored ${rel} (${buffer.length} bytes, ${meta.mime})`
+              : `Wrote ${rel} (${buffer.length} bytes, ${meta.mime})`,
+        },
+      ],
       structuredContent: { document: meta },
     }
   }

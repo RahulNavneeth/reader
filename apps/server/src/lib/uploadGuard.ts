@@ -71,22 +71,39 @@ export async function validateUpload(
     return { ok: true, mime: detected.mime }
   }
 
-  // No magic-byte signature → likely a text format. Accept only when
-  // the extension is on the textual allow-list AND the bytes don't
-  // contain nul (a quick "is this binary?" probe).
+  // No magic-byte signature → either a text format or an unrecognized
+  // binary. Use a nul-byte probe to tell them apart.
+  //
+  // Probe runs across the first 8 KB; nul means "this is binary",
+  // no nul means "this is text". Combined with the extension's
+  // expected family, we get four cases:
+  //   - text extension + no nul  → accept as text  (the .md/.txt path)
+  //   - text extension + nul     → REFUSE (claims text, looks binary)
+  //   - binary extension + nul   → accept as octet-stream
+  //                                (the .zip/.m4a-that-file-type-missed path)
+  //   - binary extension + no nul → REFUSE (claims binary, looks text —
+  //                                catches "HTML smuggled as .png")
+  //   - unknown extension        → fall through to the existing
+  //                                permissive accept; we don't have
+  //                                enough signal either way.
+  const probe = buffer.subarray(0, 8 * 1024)
+  const looksTextual = !probe.includes(0)
   if (TEXTUAL_EXTS.has(ext)) {
-    // Check the first 8KB for nul bytes — covers nearly any practical
-    // text-vs-binary heuristic without paying for a full scan.
-    const probe = buffer.subarray(0, 8 * 1024)
-    if (probe.includes(0)) {
+    if (!looksTextual) {
       return { ok: false, reason: `${ext} declared but file looks binary` }
     }
     return { ok: true, mime: claimedMime || 'application/octet-stream' }
   }
 
-  // Unknown extension AND no magic-byte signature. Accept with a
-  // generic MIME — the file is harmless to store; the viewer will
-  // just offer a download. (This is the path that .zip / .m4a etc.
-  // take when `file-type` doesn't recognize them.)
+  // Non-text extension with no magic-byte hit. If the bytes ALSO
+  // look textual, the upload is claiming a binary format with text
+  // content — refuse. Otherwise accept as octet-stream so .zip /
+  // .m4a / etc. that file-type happened to miss still go through.
+  if (ext && looksTextual) {
+    return {
+      ok: false,
+      reason: `${ext} declared but file looks like text — magic bytes don't match the expected format`,
+    }
+  }
   return { ok: true, mime: claimedMime || 'application/octet-stream' }
 }
