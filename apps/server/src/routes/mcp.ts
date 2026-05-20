@@ -572,8 +572,22 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       // upload_file — base64 in payload. JSON-RPC's transport is
       // text-only, so anything that needs literal binary bytes must
       // come through this path.
-      const raw = String(args?.content ?? '')
+      let raw = String(args?.content ?? '')
       if (!raw) throw new Error('content required')
+      // Agents (and many copy-paste flows) hand over a full data URI
+      // like `data:image/png;base64,iVBORw0...`. Strip that prefix
+      // and inherit the declared MIME when the caller didn't supply one.
+      const { parseDataUri } = await import('../lib/safeFetch.js')
+      const parsed = parseDataUri(raw)
+      if (parsed) {
+        if (!sourceMime && parsed.mime) sourceMime = parsed.mime
+        raw = parsed.data
+      }
+      // Reject obviously non-base64 input early — `Buffer.from` is
+      // permissive and would silently drop unknown chars.
+      if (!/^[A-Za-z0-9+/=\s]*$/.test(raw)) {
+        throw new Error('content must be valid base64')
+      }
       try {
         buffer = Buffer.from(raw, 'base64')
       } catch {
@@ -641,6 +655,9 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       await saveMeta(meta)
     }
     meta = await ingestDocument(meta, buffer)
+    // Strip any embedded basic-auth creds from the source URL before
+    // it lands in the audit log — passwords don't belong there.
+    const { sanitizeUrlForLog } = await import('../lib/safeFetch.js')
     await audit({
       actor: actingUser,
       action: name === 'upload_from_url' ? 'mcp.upload_from_url' : 'mcp.upload_file',
@@ -649,7 +666,7 @@ async function handleCall(token: ApiToken, name: string, args: any) {
         path: rel,
         bytes: buffer.length,
         mime: meta.mime,
-        ...(sourceUrl ? { url: sourceUrl } : {}),
+        ...(sourceUrl ? { url: sanitizeUrlForLog(sourceUrl) } : {}),
       },
     })
     return {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isPrivateIp } from './safeFetch.js'
+import { isPrivateIp, parseDataUri, sanitizeUrlForLog } from './safeFetch.js'
 
 /**
  * isPrivateIp is the SSRF gate — every public-fetch caller relies on
@@ -73,5 +73,76 @@ describe('isPrivateIp', () => {
   it('rejects unparseable input', () => {
     expect(isPrivateIp('not.an.ip')).toBe(true)
     expect(isPrivateIp('')).toBe(true)
+  })
+})
+
+/**
+ * Audit-log credential redaction. Embedded basic-auth (`user:pass@`)
+ * gets surfaced wherever the URL is rendered, so the upload audit
+ * log strips it before storing.
+ */
+describe('sanitizeUrlForLog', () => {
+  it('strips user:pass from a basic-auth URL', () => {
+    expect(sanitizeUrlForLog('https://alice:hunter2@example.com/file.png'))
+      .toBe('https://example.com/file.png')
+  })
+
+  it('strips a token-only userinfo segment', () => {
+    expect(sanitizeUrlForLog('https://token123@example.com/file.png'))
+      .toBe('https://example.com/file.png')
+  })
+
+  it('passes plain URLs through untouched (modulo URL normalisation)', () => {
+    expect(sanitizeUrlForLog('https://example.com/file.png'))
+      .toBe('https://example.com/file.png')
+  })
+
+  it('preserves query strings while stripping credentials', () => {
+    expect(sanitizeUrlForLog('https://u:p@example.com/x?k=v&token=abc'))
+      .toBe('https://example.com/x?k=v&token=abc')
+  })
+
+  it('returns a sentinel on garbage input', () => {
+    expect(sanitizeUrlForLog('not a url at all')).toBe('[invalid URL]')
+  })
+})
+
+/**
+ * Data-URI prefix stripping. upload_file is the only path that
+ * needs this — agents and copy-paste flows routinely supply the
+ * whole URI rather than the raw base64 segment.
+ */
+describe('parseDataUri', () => {
+  it('extracts MIME + payload from a standard image data URI', () => {
+    const r = parseDataUri('data:image/png;base64,iVBORw0KGgo=')
+    expect(r).toEqual({ mime: 'image/png', data: 'iVBORw0KGgo=' })
+  })
+
+  it('handles data URIs without a MIME', () => {
+    const r = parseDataUri('data:;base64,aGVsbG8=')
+    expect(r?.mime).toBeUndefined()
+    expect(r?.data).toBe('aGVsbG8=')
+  })
+
+  it('handles data URIs without ;base64', () => {
+    const r = parseDataUri('data:text/plain,hello%20world')
+    expect(r).toEqual({ mime: 'text/plain', data: 'hello%20world' })
+  })
+
+  it('tolerates parameter segments like ;charset=utf-8', () => {
+    const r = parseDataUri('data:text/plain;charset=utf-8;base64,aGVsbG8=')
+    expect(r).toEqual({ mime: 'text/plain', data: 'aGVsbG8=' })
+  })
+
+  it('returns null for raw base64 (the common case)', () => {
+    expect(parseDataUri('iVBORw0KGgoAAAANSUhEUgAA')).toBeNull()
+  })
+
+  it('returns null for empty input', () => {
+    expect(parseDataUri('')).toBeNull()
+  })
+
+  it('returns null for a string that merely starts with "data" but lacks the colon', () => {
+    expect(parseDataUri('database://localhost')).toBeNull()
   })
 })

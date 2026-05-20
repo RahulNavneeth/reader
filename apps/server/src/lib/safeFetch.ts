@@ -13,13 +13,20 @@
  *      (loopback / link-local / RFC1918 / RFC4193 ULA, IPv4-mapped
  *      IPv6 included). This catches the `evil.com` → `192.168.1.1`
  *      trick a URL-string parser alone would miss.
- *   3. Redirects disabled by default. An attacker could otherwise
+ *   3. **DNS-rebinding resistant** — we pre-resolve the hostname
+ *      once, validate the IP set, and then hand undici a dispatcher
+ *      whose `connect.lookup` returns one of those validated IPs
+ *      verbatim. Without this, an attacker-controlled DNS could
+ *      return a public IP on our check and a private one on the
+ *      fetch's resolution. The TLS handshake still uses the
+ *      original hostname for SNI + certificate validation.
+ *   4. Redirects disabled by default. An attacker could otherwise
  *      301 from a public host to an internal one. The agent
  *      should provide the canonical URL.
- *   4. Total response size capped at the configured maxBytes —
+ *   5. Total response size capped at the configured maxBytes —
  *      reading is bounded so a `Transfer-Encoding: chunked`
  *      response can't blow past the limit.
- *   5. Connect + read timeout via AbortController.
+ *   6. Connect + read timeout via AbortController.
  *
  * Returns the body buffer + the negotiated Content-Type. Throws
  * with an actionable message on any guard failure.
@@ -27,6 +34,7 @@
 import dns from 'node:dns/promises'
 import type { LookupAddress } from 'node:dns'
 import net from 'node:net'
+import { Agent, fetch as undiciFetch } from 'undici'
 
 type SafeFetchOptions = {
   /** Hard cap on response bytes. Reader refuses past this. */
@@ -36,8 +44,12 @@ type SafeFetchOptions = {
 }
 
 /** Throws on disallowed URL. Performs DNS resolution to catch a
- *  domain that points at a private IP. */
-async function assertSafeUrl(rawUrl: string): Promise<URL> {
+ *  domain that points at a private IP. Returns the parsed URL + the
+ *  validated IP set so the caller can pin the connection to one of
+ *  them (DNS-rebinding defense). */
+async function assertSafeUrl(
+  rawUrl: string,
+): Promise<{ url: URL; ips: LookupAddress[] }> {
   let url: URL
   try {
     url = new URL(rawUrl)
@@ -47,10 +59,17 @@ async function assertSafeUrl(rawUrl: string): Promise<URL> {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error(`only http and https URLs are allowed (got ${url.protocol})`)
   }
-  // Resolve. We use `lookup` so /etc/hosts + the system resolver
-  // matches what the underlying fetch would do — DNS results that
-  // mid-resolve into private IPs are caught here.
-  const hostname = url.hostname.replace(/^\[|\]$/g, '') // strip [v6]
+  // IP literal? Then we don't go through DNS at all — just check it
+  // directly. `URL` keeps brackets on IPv6 literals; strip them.
+  const hostname = url.hostname.replace(/^\[|\]$/g, '')
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) {
+      throw new Error(
+        `refusing to fetch from a private/loopback address (${hostname})`,
+      )
+    }
+    return { url, ips: [{ address: hostname, family: net.isIPv6(hostname) ? 6 : 4 }] }
+  }
   let resolved: LookupAddress[]
   try {
     resolved = await dns.lookup(hostname, { all: true })
@@ -64,7 +83,36 @@ async function assertSafeUrl(rawUrl: string): Promise<URL> {
       )
     }
   }
-  return url
+  return { url, ips: resolved }
+}
+
+/** Split a data: URI into its declared MIME (if any) and the
+ *  base64 (or url-encoded) payload. Returns `null` for anything
+ *  that isn't a data URI so the caller falls through to its
+ *  normal base64 path. Used by `upload_file` because agents
+ *  routinely hand over the full data URI rather than the raw
+ *  payload. */
+export function parseDataUri(input: string): { mime?: string; data: string } | null {
+  const m = input.match(/^data:([^;,]+)?(?:;[^,]*)?,([\s\S]*)$/)
+  if (!m) return null
+  return {
+    mime: m[1] && m[1].trim() ? m[1].trim() : undefined,
+    data: m[2],
+  }
+}
+
+/** Strip embedded credentials from a URL for logging. `https://
+ *  user:pass@host/path` → `https://host/path`. Used to keep
+ *  passwords out of the audit log. */
+export function sanitizeUrlForLog(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl)
+    u.username = ''
+    u.password = ''
+    return u.toString()
+  } catch {
+    return '[invalid URL]'
+  }
 }
 
 /** True for any IP in a loopback, link-local, private, ULA, or
@@ -105,7 +153,30 @@ export async function safeFetch(
   rawUrl: string,
   opts: SafeFetchOptions,
 ): Promise<{ buffer: Buffer; contentType: string; finalUrl: string }> {
-  const url = await assertSafeUrl(rawUrl)
+  const { url, ips } = await assertSafeUrl(rawUrl)
+
+  // Pick the first validated address. The undici Agent's `connect.lookup`
+  // hook returns it verbatim, so the actual TCP/TLS connection goes to
+  // the IP we already approved. The original hostname is still passed
+  // through for SNI + certificate validation.
+  const pinnedIp = ips[0].address
+  const pinnedFamily: 4 | 6 = ips[0].family === 6 ? 6 : 4
+  const dispatcher = new Agent({
+    connect: {
+      // `node:net`'s lookup contract is mode-dependent: with `all: true`
+      // the callback wants `[{ address, family }, ...]`, otherwise it
+      // wants `(err, address, family)`. Node's connection path uses
+      // `all: true`, but be safe for either caller.
+      lookup: (_hostname, options, callback) => {
+        const cb = callback as (...args: unknown[]) => void
+        if (options && (options as { all?: boolean }).all) {
+          cb(null, [{ address: pinnedIp, family: pinnedFamily }])
+        } else {
+          cb(null, pinnedIp, pinnedFamily)
+        }
+      },
+    },
+  })
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs)
@@ -114,10 +185,11 @@ export async function safeFetch(
     // who pierced our DNS check via a public host that 301s to a
     // private one is stopped here. Real-world download URLs are
     // almost always direct.
-    const res = await fetch(url, {
+    const res = await undiciFetch(url, {
       method: 'GET',
       redirect: 'error',
       signal: controller.signal,
+      dispatcher,
       headers: {
         // Polite UA + accept-everything so servers don't serve
         // an HTML "you need a real browser" decoy.
@@ -166,5 +238,8 @@ export async function safeFetch(
     throw e
   } finally {
     clearTimeout(timer)
+    // Close pooled sockets so the dispatcher doesn't leak for
+    // single-shot fetches.
+    void dispatcher.close().catch(() => {})
   }
 }
