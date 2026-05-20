@@ -261,6 +261,38 @@ async function findDocByPath(owner: string, storageKey: string): Promise<Documen
   )
 }
 
+/**
+ * Per-doc edit lock for the granular markdown tools. Without this,
+ * two concurrent replace_section calls would both readFile the same
+ * initial content, compute different mutations, and racing
+ * writeFile would silently overwrite each other. The lock pins the
+ * read → apply → write → saveMeta sequence to one in-flight chain
+ * per docId. Single-node only — multi-instance deploys would need
+ * a real distributed lock, but Reader is single-process today.
+ */
+const editLocks = new Map<string, Promise<void>>()
+async function withEditLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = editLocks.get(docId) ?? Promise.resolve()
+  let release!: () => void
+  const next = new Promise<void>((r) => (release = r))
+  // Chain off the previous holder. .catch shields us from a prior
+  // failure tearing down the lock; the new holder still runs.
+  editLocks.set(
+    docId,
+    prev.catch(() => undefined).then(() => next),
+  )
+  await prev.catch(() => undefined)
+  try {
+    return await fn()
+  } finally {
+    release()
+    // Drop the entry only if no one else has chained behind us so
+    // the map doesn't leak. Race-safe because Map.get returns the
+    // CURRENT tail; if our next is still the tail, no one's queued.
+    if (editLocks.get(docId) === next) editLocks.delete(docId)
+  }
+}
+
 async function handleCall(token: ApiToken, name: string, args: any) {
   // For read tools that go through ACL: use a synthetic principal that
   // matches the legacy behavior (role drives visibility). For write
@@ -542,11 +574,25 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       )
     }
 
-    // Read current content. We use the on-disk file rather than the
-    // extracted text.txt because edits must round-trip the actual
-    // file, including frontmatter / unparsed lines.
-    const abs = resolveUserVault(actingUser, meta.storageKey)
-    const buffer = await (await import('node:fs/promises')).readFile(abs)
+    // Always resolve against the doc's true owner. Using actingUser
+    // would point at the editor's vault for a cross-owner shared
+    // doc — wrong file, or worse, a phantom write under a path that
+    // doesn't exist in their namespace.
+    const abs = resolveUserVault(meta.owner, meta.storageKey)
+    const { readFile, writeFile } = await import('node:fs/promises')
+    let buffer: Buffer
+    try {
+      buffer = await readFile(abs)
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') {
+        throw new Error(`document file is missing on disk (path: ${meta.storageKey})`)
+      }
+      if (code === 'EACCES') {
+        throw new Error(`cannot read document on disk (path: ${meta.storageKey})`)
+      }
+      throw e
+    }
     const text = buffer.toString('utf8')
 
     const mdx = await import('../lib/mdx.js')
@@ -582,16 +628,32 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       }
     }
 
-    // Mutations: apply, write, re-ingest, audit.
-    let nextText: string
-    let auditAction = ''
-    let auditMeta: Record<string, unknown> = { path: meta.storageKey }
-    try {
+    // Mutations: serialize per-docId so concurrent edits don't race
+    // on the read → write window. Inside the lock we re-read the
+    // file (in case a prior holder mutated it) before applying the
+    // edit, so we never overwrite someone else's just-committed
+    // change.
+    return await withEditLock(id, async () => {
+      let currentBuffer: Buffer
+      try {
+        currentBuffer = await readFile(abs)
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code
+        if (code === 'ENOENT') {
+          throw new Error(`document file is missing on disk (path: ${meta.storageKey})`)
+        }
+        throw e
+      }
+      const currentText = currentBuffer.toString('utf8')
+
+      let nextText: string
+      let auditAction = ''
+      let auditMeta: Record<string, unknown> = { path: meta.storageKey }
       if (name === 'replace_section') {
         const heading = String(args?.heading ?? '')
         const content = String(args?.content ?? '')
         if (!heading) throw new Error('heading required')
-        nextText = mdx.replaceSection(text, heading, content)
+        nextText = mdx.replaceSection(currentText, heading, content)
         auditAction = 'mcp.replace_section'
         auditMeta = { ...auditMeta, heading, bytes: content.length }
       } else if (name === 'insert_after') {
@@ -599,54 +661,52 @@ async function handleCall(token: ApiToken, name: string, args: any) {
         const content = String(args?.content ?? '')
         if (!heading) throw new Error('heading required')
         if (!content) throw new Error('content required')
-        nextText = mdx.insertAfter(text, heading, content)
+        nextText = mdx.insertAfter(currentText, heading, content)
         auditAction = 'mcp.insert_after'
         auditMeta = { ...auditMeta, heading, bytes: content.length }
       } else if (name === 'delete_section') {
         const heading = String(args?.heading ?? '')
         if (!heading) throw new Error('heading required')
-        nextText = mdx.deleteSection(text, heading)
+        nextText = mdx.deleteSection(currentText, heading)
         auditAction = 'mcp.delete_section'
         auditMeta = { ...auditMeta, heading }
       } else if (name === 'append_text') {
         const content = String(args?.content ?? '')
         if (!content) throw new Error('content required')
-        nextText = mdx.appendText(text, content)
+        nextText = mdx.appendText(currentText, content)
         auditAction = 'mcp.append_text'
         auditMeta = { ...auditMeta, bytes: content.length }
       } else {
         // name === 'prepend_text'
         const content = String(args?.content ?? '')
         if (!content) throw new Error('content required')
-        nextText = mdx.prependText(text, content)
+        nextText = mdx.prependText(currentText, content)
         auditAction = 'mcp.prepend_text'
         auditMeta = { ...auditMeta, bytes: content.length }
       }
-    } catch (e) {
-      throw new Error((e as Error).message)
-    }
 
-    const nextBuffer = Buffer.from(nextText, 'utf8')
-    await (await import('node:fs/promises')).writeFile(abs, nextBuffer)
-    const nextMeta: DocumentMeta = {
-      ...meta,
-      bytes: nextBuffer.length,
-      sha256: sha256Of(nextBuffer),
-      updatedAt: Date.now(),
-      ingest: { status: 'pending', embedded: false },
-    }
-    await saveMeta(nextMeta)
-    const finalMeta = await ingestDocument(nextMeta, nextBuffer)
-    await audit({ actor: actingUser, action: auditAction, target: id, meta: auditMeta })
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Updated ${meta.storageKey} (${nextBuffer.length} bytes)`,
-        },
-      ],
-      structuredContent: { document: finalMeta },
-    }
+      const nextBuffer = Buffer.from(nextText, 'utf8')
+      await writeFile(abs, nextBuffer)
+      const nextMeta: DocumentMeta = {
+        ...meta,
+        bytes: nextBuffer.length,
+        sha256: sha256Of(nextBuffer),
+        updatedAt: Date.now(),
+        ingest: { status: 'pending', embedded: false },
+      }
+      await saveMeta(nextMeta)
+      const finalMeta = await ingestDocument(nextMeta, nextBuffer)
+      await audit({ actor: actingUser, action: auditAction, target: id, meta: auditMeta })
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Updated ${meta.storageKey} (${nextBuffer.length} bytes)`,
+          },
+        ],
+        structuredContent: { document: finalMeta },
+      }
+    })
   }
 
   if (name === 'pin') {

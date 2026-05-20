@@ -42,20 +42,23 @@ function findHeadings(lines: string[]): Array<{ level: number; heading: string; 
   const out: Array<{ level: number; heading: string; index: number }> = []
   let inFence = false
   let fenceMarker = ''
+  // CommonMark: closing fence must be at least as long as the open.
+  // Tracking the opening length lets us reject a 3-tick close on a
+  // 4-tick open and keep treating the inside as code.
+  let fenceOpenLen = 0
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
-    // Track fenced code block state. The opening fence can be three
-    // or more ` or ~; the closing fence must be at least as long
-    // and use the same character. Per CommonMark.
     const fenceMatch = line.match(/^([`~]{3,})/)
     if (fenceMatch) {
       const marker = fenceMatch[1]
       if (!inFence) {
         inFence = true
         fenceMarker = marker[0]
-      } else if (marker[0] === fenceMarker && marker.length >= 3) {
+        fenceOpenLen = marker.length
+      } else if (marker[0] === fenceMarker && marker.length >= fenceOpenLen) {
         inFence = false
         fenceMarker = ''
+        fenceOpenLen = 0
       }
       continue
     }
