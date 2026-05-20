@@ -11,6 +11,7 @@ import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { useConfirm } from '../lib/confirm'
 import { copyText } from '../lib/clipboard'
+import { resolveImageSrc, resolveLinkHref } from '../lib/markdownAssetResolver'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { TagsButton } from './TagsButton'
@@ -503,6 +504,50 @@ export function PathViewer({ path, canEdit = true }: Props) {
                   [rehypeAutolinkHeadings, { behavior: 'append', properties: { className: ['anchor'], 'aria-hidden': 'true', tabIndex: -1 }, content: { type: 'text', value: '#' } }],
                   rehypeHighlight,
                 ]}
+                // Custom renderers that resolve relative URLs against
+                // the doc's folder. Without these, `![](./img.jpg)`
+                // and `[link](./other.md)` produced broken paths that
+                // resolved relative to the SPA URL.
+                components={{
+                  img: ({ src, alt, ...rest }) => {
+                    const resolved = typeof src === 'string'
+                      ? resolveImageSrc(parentDir, src, callerOpts)
+                      : src
+                    return <img src={resolved as string} alt={alt} {...rest} />
+                  },
+                  a: ({ href, children, ...rest }) => {
+                    if (typeof href !== 'string') return <a {...rest}>{children}</a>
+                    const resolved = resolveLinkHref(parentDir, href, callerOpts)
+                    // External / fragment links keep default behavior.
+                    // Internal vault links navigate via the SPA — we
+                    // can't return a <Link> because react-markdown
+                    // would warn about ref forwarding; setting href
+                    // works fine since the SPA's pushState router
+                    // intercepts same-origin paths on click.
+                    if (resolved.startsWith('/') && !resolved.startsWith('//')) {
+                      return (
+                        <a
+                          href={resolved}
+                          onClick={(e) => {
+                            // Spare modifier-clicks so cmd-click opens
+                            // a new tab as expected.
+                            if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+                            e.preventDefault()
+                            navigate(resolved)
+                          }}
+                          {...rest}
+                        >
+                          {children}
+                        </a>
+                      )
+                    }
+                    return (
+                      <a href={resolved} {...rest}>
+                        {children}
+                      </a>
+                    )
+                  },
+                }}
               >
                 {text}
               </ReactMarkdown>
