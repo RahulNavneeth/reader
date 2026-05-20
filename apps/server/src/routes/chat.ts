@@ -324,9 +324,23 @@ export async function chatRoutes(app: FastifyInstance) {
       })
       send({ kind: 'done', messageId: asstId })
     } else {
-      // Streamed nothing useful — don't persist an empty assistant
-      // row, but tell the client we're done so the UI can recover.
-      send({ kind: 'done', messageId: null })
+      // Streamed nothing useful (small models occasionally return
+      // zero tokens on hard prompts). Persist a stub error turn so
+      // a user who reloaded mid-stream doesn't see a dangling YOU
+      // bubble with no explanation of what happened.
+      const stubId = nanoid()
+      appendMessage({
+        id: stubId,
+        docId,
+        userId: user.username,
+        role: 'assistant',
+        content: '',
+        citations: null,
+        memoriesUsed: null,
+        error: 'The model produced no output. Try rephrasing the question, or switch to a larger chat model in Admin → Settings → Embeddings.',
+        createdAt: regenerateOriginalCreatedAt ?? Date.now(),
+      })
+      send({ kind: 'done', messageId: stubId })
     }
     try {
       reply.raw.end()

@@ -987,6 +987,14 @@ function formatChatError(raw: string): FriendlyError {
       raw: trimmed,
     }
   }
+  // Empty output (small model returned zero tokens).
+  if (/produced no output/i.test(trimmed)) {
+    return {
+      title: 'No response from the model',
+      body: 'The model returned zero tokens for this prompt. This happens with small (<3B) local models on hard or fragmentary content. Try rephrasing the question more specifically, or switch to a larger chat model in Admin → Settings → Embeddings.',
+      raw: trimmed,
+    }
+  }
   // Timeout.
   if (/timed out|timeout/i.test(trimmed)) {
     return {
