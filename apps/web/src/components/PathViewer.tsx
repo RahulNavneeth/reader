@@ -11,7 +11,11 @@ import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { useVault } from '../lib/vault-context'
 import { useConfirm } from '../lib/confirm'
 import { copyText } from '../lib/clipboard'
-import { resolveImageSrc, resolveLinkHref } from '../lib/markdownAssetResolver'
+import {
+  parseImageSize,
+  resolveImageSrc,
+  resolveLinkHref,
+} from '../lib/markdownAssetResolver'
 import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { TagsButton } from './TagsButton'
@@ -513,7 +517,23 @@ export function PathViewer({ path, canEdit = true }: Props) {
                     const resolved = typeof src === 'string'
                       ? resolveImageSrc(parentDir, src, callerOpts)
                       : src
-                    return <img src={resolved as string} alt={alt} {...rest} />
+                    // Obsidian-style sizing: `![photo|400](url)`,
+                    // `![photo|400x300](url)`, `![photo|50%](url)`.
+                    // Apply via inline style so the user's choice
+                    // overrides the .md article CSS without needing
+                    // a separate stylesheet hook.
+                    const { alt: cleanAlt, width, height } = parseImageSize(alt)
+                    const sizeStyle: React.CSSProperties = {}
+                    if (width) sizeStyle.width = width
+                    if (height) sizeStyle.height = height
+                    return (
+                      <img
+                        src={resolved as string}
+                        alt={cleanAlt || alt}
+                        style={Object.keys(sizeStyle).length ? sizeStyle : undefined}
+                        {...rest}
+                      />
+                    )
                   },
                   a: ({ href, children, ...rest }) => {
                     if (typeof href !== 'string') return <a {...rest}>{children}</a>

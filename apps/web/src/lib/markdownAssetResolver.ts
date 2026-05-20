@@ -1,40 +1,71 @@
 /**
  * Resolve markdown asset/link URLs against the current doc's folder.
  *
- * Without this, `![photo](./photos/sunset.jpg)` inside a doc at
- * `notes/trip.md` renders broken — the browser resolves the URL
- * relative to the current page (`/notes/trip.md` → `/notes/photos/
- * sunset.jpg`) and gets a 404 because that path isn't an API route.
+ * Two responsibilities:
  *
- * We rewrite relative URLs into the vault's serving API (or into
- * SPA routes for navigable docs), preserving the cross-owner
- * `?owner=` hint so a recipient browsing a shared subtree stays in
- * their shared context.
+ * 1. **Relative → absolute (vault-root)** — `./photos/sunset.jpg`
+ *    inside a doc at `notes/trip.md` becomes `notes/photos/sunset.jpg`.
+ *    Handles `./`, plain relative, `../` walks, and `/`-prefixed
+ *    vault-root absolute paths uniformly.
+ *
+ * 2. **Encoding normalization** — markdown URLs may arrive raw
+ *    (`project abstract.png`), already percent-encoded
+ *    (`project%20abstract.png`), or somewhere in between. We
+ *    decode-then-encode so the final URL contains exactly one
+ *    canonical encoding per character — without this, `%20` was
+ *    being re-encoded to `%2520` and the browser fetched a
+ *    nonexistent path.
+ *
+ * Pass-throughs (no rewriting at all):
+ *   - explicit scheme (http://, https://, mailto:, data:, …)
+ *   - server-absolute API paths (/api/…)
+ *   - in-page fragments (#section)
  */
 
 /** Absolute URLs we should pass through unchanged. */
 function isPassThrough(url: string): boolean {
   if (!url) return true
-  // Any explicit scheme (http://, https://, mailto:, data:, etc.).
   if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return true
-  // Server-absolute API paths.
   if (url.startsWith('/api/')) return true
-  // Pure in-page anchors (rehype-slug handles these).
   if (url.startsWith('#')) return true
   return false
 }
 
-/** Compute the vault-relative path for an asset referenced from a
- *  markdown document at `parentDir`. Handles `./`, plain relative,
- *  `../` walks, and `/` as a vault-root absolute. */
+/**
+ * Decode-then-encode a single path segment.
+ *
+ * The caller's URL might already contain percent-encoded bytes
+ * (`project%20abstract.png`). A naive `encodeURIComponent` would
+ * re-encode the `%` and produce `project%2520abstract.png`. We
+ * decode first to normalize to raw chars, then encode once.
+ *
+ * `decodeURIComponent` throws on malformed sequences (e.g. `%ZZ`).
+ * In that rare case we treat the input as already-raw and only
+ * encode — which is the same behavior the user would expect.
+ */
+function encodeSegment(seg: string): string {
+  let raw = seg
+  try {
+    raw = decodeURIComponent(seg)
+  } catch {
+    /* not a valid encoded sequence — treat as literal */
+  }
+  return encodeURIComponent(raw)
+}
+
+/** Vault-root-relative form of a path. Handles `./`, plain
+ *  relative, `../` walks, and `/`-prefixed absolutes. The output
+ *  is suitable for storage / lookup (NOT yet URL-encoded). */
 export function resolveRelative(parentDir: string, href: string): string {
   if (!href) return href
-  // Vault-root absolute — `/foo.jpg` resolves to `foo.jpg`.
+  // `/foo.jpg` is already vault-root absolute — strip the slash and
+  // return as-is. The intent of the user was "absolute path inside
+  // the vault, ignore parentDir".
   if (href.startsWith('/')) {
-    return href.replace(/^\/+/, '').split(/[#?]/)[0]
+    return href.replace(/^\/+/, '')
   }
   const base = parentDir.split('/').filter(Boolean)
-  // Strip query + fragment for path resolution; we re-append below.
+  // Strip query + fragment so they're re-appended verbatim at the end.
   const [pathPart, ...rest] = href.split(/([#?].*)/)
   const trailing = rest.join('')
   const segments = pathPart.split('/').filter(Boolean)
@@ -64,6 +95,12 @@ function appendCaller(
   return base.includes('?') ? `${base}&${q}` : `${base}?${q}`
 }
 
+/** Build the query-param-safe encoding of a vault path (folders
+ *  preserved as `/` separators, each segment normalized). */
+function encodeVaultPath(rel: string): string {
+  return rel.split('/').map(encodeSegment).join('/')
+}
+
 /** Resolve `<img src>` — always points at the raw byte stream. */
 export function resolveImageSrc(
   parentDir: string,
@@ -74,8 +111,43 @@ export function resolveImageSrc(
   const rel = resolveRelative(parentDir, src)
   // Strip a fragment if any — meaningless for an image.
   const cleanRel = rel.split('#')[0]
-  const url = `/api/file/raw?path=${encodeURIComponent(cleanRel)}`
+  const url = `/api/file/raw?path=${encodeVaultPath(cleanRel)}`
   return appendCaller(url, callerOpts)
+}
+
+/**
+ * Pull an Obsidian-style size hint out of an image's alt text.
+ *
+ *   `![photo|400](photo.jpg)`     → width 400 px
+ *   `![photo|400x300](photo.jpg)` → 400×300 px
+ *   `![photo|50%](photo.jpg)`     → width 50%
+ *
+ * Returns the size as plain CSS values (`px` appended when a bare
+ * number is given) and the cleaned alt text. If alt has no pipe,
+ * the original alt is returned and size fields are undefined.
+ */
+export function parseImageSize(
+  altRaw: string | undefined | null,
+): { alt: string; width?: string; height?: string } {
+  const alt = (altRaw ?? '').trim()
+  const pipe = alt.lastIndexOf('|')
+  if (pipe < 0) return { alt }
+  const sizeRaw = alt.slice(pipe + 1).trim()
+  const cleanAlt = alt.slice(0, pipe).trim()
+  // Matches "400", "400px", "50%", "400x300", "400px x 300px", etc.
+  const match = sizeRaw.match(
+    /^(\d+(?:\.\d+)?)(px|%|em|rem|vh|vw)?(?:\s*[x×]\s*(\d+(?:\.\d+)?)(px|%|em|rem|vh|vw)?)?$/i,
+  )
+  if (!match) return { alt }
+  const toCss = (n: string | undefined, unit: string | undefined): string | undefined => {
+    if (!n) return undefined
+    return `${n}${unit ?? 'px'}`
+  }
+  return {
+    alt: cleanAlt,
+    width: toCss(match[1], match[2]),
+    height: toCss(match[3], match[4]),
+  }
 }
 
 /** Resolve `<a href>` — routes back through the SPA so internal
@@ -88,10 +160,10 @@ export function resolveLinkHref(
 ): string {
   if (isPassThrough(href)) return href
   const rel = resolveRelative(parentDir, href)
-  // Split off fragment so we can route the path through React Router
-  // and reattach the anchor for in-doc jumps.
+  // Split off fragment so the path can route through React Router
+  // while the anchor still navigates to the heading.
   const [pathPart, hashPart = ''] = rel.split('#', 2)
-  const encoded = pathPart.split('/').map(encodeURIComponent).join('/')
+  const encoded = encodeVaultPath(pathPart)
   const qs = callerOpts?.owner
     ? `?owner=${encodeURIComponent(callerOpts.owner)}`
     : ''

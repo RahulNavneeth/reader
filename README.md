@@ -143,6 +143,91 @@ vim and Reader picks up the changes via a filesystem watcher.
 
 ---
 
+## Authoring markdown
+
+The markdown renderer is GitHub-flavored (`remark-gfm`) with two
+Reader-specific extensions: relative paths and Obsidian-style image
+sizing.
+
+### Linking files
+
+Inside a markdown document you can reference other vault files
+using normal relative paths. The renderer resolves them against the
+document's parent folder.
+
+```md
+<!-- inside notes/trip.md -->
+
+![sunset](./photos/sunset.jpg)
+[itinerary](./itinerary.md)
+[parent map](../map.geojson)
+```
+
+Resolves to:
+
+- `notes/photos/sunset.jpg`
+- `notes/itinerary.md`
+- `map.geojson`
+
+Behavior:
+
+- **`./foo` / `foo`** — sibling, resolved against the doc's folder.
+- **`../foo`** — parent traversal (multiple `../` supported).
+- **`/foo`** — vault-root absolute (ignores the doc's folder).
+- **`http://`, `https://`, `mailto:`, `data:`** — passed through
+  unchanged.
+- **`#section`** — in-page anchor, passed through (drives the
+  outline jumps).
+
+Images render through `/api/file/raw?path=…`; internal document
+links navigate via the SPA so the file viewer takes over. If you're
+browsing a shared subtree (`?owner=alice`), that hint is carried
+through every rewritten URL so you stay in the shared context.
+
+### Filenames with spaces
+
+A space terminates the URL in standard markdown syntax. Use one of:
+
+```md
+![photo](./project%20abstract.png)     <!-- percent-encoded -->
+![photo](<./project abstract.png>)     <!-- angle-bracket-wrapped -->
+```
+
+The renderer normalizes both into a single canonical encoding —
+you can mix-and-match without worrying about double-encoding.
+
+### Image sizing
+
+Obsidian-compatible pipe syntax in the alt text:
+
+```md
+![photo|400](./trip.jpg)        <!-- width 400 px -->
+![photo|400x300](./trip.jpg)    <!-- 400×300 px -->
+![photo|50%](./trip.jpg)        <!-- 50% of container width -->
+![photo|20em x 15em](./trip.jpg)
+```
+
+Supported units: bare number (`px` assumed), `px`, `%`, `em`, `rem`,
+`vh`, `vw`. The `x` separator can also be `×` (the multiplication
+sign).
+
+Anything after the last `|` that isn't a parseable size is treated
+as part of the alt text, so a real pipe inside alt text doesn't
+accidentally trigger sizing.
+
+The cleaned alt (text before the `|`) is what screen readers
+announce — the size hint is dropped from the accessibility tree.
+
+### What's NOT supported (yet)
+
+- Pandoc-style attribute syntax (`![alt](url){width=400px}`) — use
+  the pipe form instead.
+- Wikilinks (`[[other-doc]]`) — Obsidian's bracket syntax doesn't
+  render in CommonMark. Use the standard `[label](./other.md)` form.
+- Transclusion / inline rendering of one doc inside another.
+
+---
+
 ## Backup
 
 Reader has no database. Two directories carry all state.
