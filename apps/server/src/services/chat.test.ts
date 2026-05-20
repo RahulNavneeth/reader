@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { retrieveAnchorSections, matchDocsByName, flattenMarkdownTables } from './chat.js'
+import {
+  retrieveAnchorSections,
+  matchDocsByName,
+  flattenMarkdownTables,
+  formatSourceHint,
+} from './chat.js'
 import type { DocumentMeta } from '../types.js'
 
 /**
@@ -191,5 +196,85 @@ Tail prose.`
     const md = `| A | B | C |\n| - | - | - |\n| 1 | 2 | 3 |`
     const r = flattenMarkdownTables(md)
     expect(r).toContain('A: 1. B: 2. C: 3')
+  })
+})
+
+/**
+ * MIME-aware framing for the system prompt. Each source format
+ * needs a one-line hint so the model knows it's looking at OCR'd
+ * image text vs. extracted PDF text vs. a transcript, etc.
+ */
+describe('formatSourceHint', () => {
+  const make = (overrides: Partial<DocumentMeta>): DocumentMeta => ({
+    id: 'd',
+    title: 't',
+    originalFilename: 'f',
+    mime: 'text/plain',
+    bytes: 0,
+    sha256: '',
+    storageKey: 'f',
+    owner: 'alice',
+    acl: { readers: [], editors: [] },
+    publicExpiresAt: null,
+    publicPasswordHash: null,
+    tags: [],
+    createdAt: 0,
+    updatedAt: 0,
+    ingest: { status: 'ready', embedded: true },
+    ...overrides,
+  })
+
+  it('returns null for markdown', () => {
+    expect(formatSourceHint(make({ mime: 'text/markdown', originalFilename: 'note.md' }))).toBeNull()
+  })
+
+  it('returns null for plain text', () => {
+    expect(formatSourceHint(make({ mime: 'text/plain', originalFilename: 'log.txt' }))).toBeNull()
+  })
+
+  it('flags images as OCR-extracted', () => {
+    const r = formatSourceHint(make({ mime: 'image/heic', originalFilename: 'IMG_8163.heic' }))
+    expect(r).toMatch(/image/i)
+    expect(r).toMatch(/OCR/i)
+  })
+
+  it('flags PDFs with the layout-flattening caveat', () => {
+    const r = formatSourceHint(make({ mime: 'application/pdf', originalFilename: 'paper.pdf' }))
+    expect(r).toMatch(/PDF/)
+    expect(r).toMatch(/layout/i)
+  })
+
+  it('flags audio + video transcripts distinctly', () => {
+    expect(formatSourceHint(make({ mime: 'audio/mpeg', originalFilename: 'a.mp3' }))).toMatch(/audio/i)
+    expect(formatSourceHint(make({ mime: 'video/mp4', originalFilename: 'v.mp4' }))).toMatch(/video/i)
+  })
+
+  it('flags CSV/TSV with the header-row hint', () => {
+    expect(formatSourceHint(make({ mime: 'text/csv', originalFilename: 'data.csv' }))).toMatch(/CSV/)
+    expect(formatSourceHint(make({ originalFilename: 'data.tsv', mime: 'application/octet-stream' }))).toMatch(/TSV/)
+  })
+
+  it('flags spreadsheets', () => {
+    const r = formatSourceHint(make({
+      mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      originalFilename: 'book.xlsx',
+    }))
+    expect(r).toMatch(/spreadsheet/i)
+  })
+
+  it('flags JSON', () => {
+    expect(formatSourceHint(make({ mime: 'application/json', originalFilename: 'data.json' }))).toMatch(/JSON/)
+  })
+
+  it('flags .docx', () => {
+    const r = formatSourceHint(make({
+      mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      originalFilename: 'doc.docx',
+    }))
+    expect(r).toMatch(/Word/)
+  })
+
+  it('flags HTML', () => {
+    expect(formatSourceHint(make({ mime: 'text/html', originalFilename: 'page.html' }))).toMatch(/HTML/)
   })
 })

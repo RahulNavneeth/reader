@@ -15,6 +15,7 @@
  * providers is one function: implement another `streamFromOllama`
  * twin and pick by config.
  */
+import path from 'node:path'
 import { config } from '../config.js'
 import { embedBatch, EmbedError } from './embed.js'
 import { streamEmbeddedChunks } from '../db/chunksRepo.js'
@@ -431,6 +432,52 @@ async function retrieveRagChunks(
  *      | ---     | ---     |
  *      | cell    | cell    |
  *  Anything else falls through untouched. */
+/** Generate a one-line hint telling the model what kind of source
+ *  the document body came from. Small models otherwise treat OCR'd
+ *  image text, extracted PDF text, transcripts, and markdown all
+ *  the same — leading to "this document describes a list of
+ *  sections" type confabulations on a log screenshot.
+ *
+ *  Returns null for markdown / plain text where no hint is needed
+ *  (the model's default assumption is text-like). */
+export function formatSourceHint(meta: DocumentMeta): string | null {
+  const mime = (meta.mime || '').toLowerCase()
+  const ext = (path.extname(meta.originalFilename || '') || '').toLowerCase()
+
+  if (mime.startsWith('image/')) {
+    return `This document is an image file (${ext || mime}). The text below was extracted from the image via OCR — it may contain fragmentary text, broken line wraps from the original layout, and stray characters. Treat lines as best-effort transcription. Describe what the image shows, not its file format.`
+  }
+  if (mime === 'application/pdf' || ext === '.pdf') {
+    return `This document is a PDF. The text below is extracted from the PDF — page layout (columns, tables, headers/footers) has been flattened into a single text stream, so content from adjacent regions may interleave.`
+  }
+  if (mime.startsWith('video/')) {
+    return `This document is a video file. The text below is a transcript of the spoken audio.`
+  }
+  if (mime.startsWith('audio/')) {
+    return `This document is an audio file. The text below is a transcript of the audio.`
+  }
+  if (ext === '.csv' || ext === '.tsv' || mime === 'text/csv' || mime === 'text/tab-separated-values') {
+    return `This document is a ${ext === '.tsv' ? 'TSV' : 'CSV'} file. The text below is rows of cells; the first row is typically the header.`
+  }
+  if (
+    ext === '.xlsx' || ext === '.xls' ||
+    mime.includes('spreadsheet') || mime.includes('excel')
+  ) {
+    return `This document is a spreadsheet. The text below is cell values extracted from one or more sheets, flattened into text — content from different sheets may run together without clear boundaries.`
+  }
+  if (ext === '.json' || mime === 'application/json') {
+    return `This document is JSON. The text below is the JSON content; key/value structure matters.`
+  }
+  if (ext === '.docx' || mime.includes('wordprocessingml') || mime.includes('msword')) {
+    return `This document is a Word document. The text below is extracted prose — basic paragraph structure preserved, formatting flattened.`
+  }
+  if (mime.startsWith('text/html') || ext === '.html' || ext === '.htm') {
+    return `This document is HTML. The text below is the rendered text content — tags stripped, structure preserved as best-effort paragraphs.`
+  }
+  // Markdown, plain text, code files — no hint; the body speaks for itself.
+  return null
+}
+
 export function flattenMarkdownTables(text: string): string {
   const lines = text.split('\n')
   const out: string[] = []
@@ -572,6 +619,16 @@ export function buildOllamaMessages(
   const systemParts: string[] = [
     `You are Reader AI — a document-grounded assistant inside the user's personal vault. You answer ONLY from the supplied material.`,
   ]
+
+  // MIME-aware framing — tells the model whether the body is OCR'd
+  // image text, extracted PDF text, a transcript, a spreadsheet
+  // dump, etc. Without this, small models treat fragmented OCR
+  // like prose and produce "this document describes a list of
+  // sections…" type confabulations.
+  const sourceHint = formatSourceHint(ctx.anchor)
+  if (sourceHint) {
+    systemParts.push('', `<source_format>`, sourceHint, `</source_format>`)
+  }
 
   // Primary sections — the most important material when section
   // match fires. Render with explicit "## ANSWER FROM THESE
