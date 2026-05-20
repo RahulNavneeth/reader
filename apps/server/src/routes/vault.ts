@@ -167,7 +167,7 @@ function redactPublicMeta(meta: DocumentMeta): DocumentMeta {
 /** Stricter redaction for callers that aren't the owner — drops the ACL,
  *  internal id, sha256, and password hash so a public-link viewer can't
  *  enumerate who else has access or fingerprint the bytes. Used for
- *  anonymous + cross-owner read responses on /api/file/meta. */
+ *  anonymous read responses on /api/file/meta. */
 function redactForPublicViewer(meta: DocumentMeta): Partial<DocumentMeta> {
   const {
     publicPasswordHash,
@@ -180,6 +180,20 @@ function redactForPublicViewer(meta: DocumentMeta): Partial<DocumentMeta> {
   void acl
   void sha256
   void id
+  return { ...rest, publicPasswordHash: null }
+}
+
+/** Middle tier: authenticated cross-owner viewer with an explicit
+ *  share grant. They already have ACL'd read access, so exposing the
+ *  internal id is fine (and required for client-side features like
+ *  AI chat that POST to /api/chat/:docId/stream). We still strip
+ *  ACL + sha256 because those would let them enumerate other
+ *  recipients / fingerprint the bytes. */
+function redactForShareRecipient(meta: DocumentMeta): Partial<DocumentMeta> {
+  const { publicPasswordHash, acl, sha256, ...rest } = meta
+  void publicPasswordHash
+  void acl
+  void sha256
   return { ...rest, publicPasswordHash: null }
 }
 
@@ -2323,10 +2337,19 @@ export async function vaultRoutes(app: FastifyInstance) {
       // anonymous viewers get the stricter redaction so we don't leak
       // ACL members, the sha256, or internal id alongside the public
       // share. (Password hash is always stripped.)
+      // Three viewer tiers:
+      //   owner          → full meta (only password hash stripped)
+      //   share recipient → keep id (needed for chat / mcp /
+      //                     anything that POSTs against /api/.../:docId),
+      //                     strip ACL + sha256
+      //   public link    → strict — strip id, ACL, sha256
       const isOwner = !!requester && meta.owner === requester
+      const isShareRecipient = !!ctx.sharedGrant
       const safe = isOwner
         ? redactPublicMeta(meta)
-        : (redactForPublicViewer(meta) as DocumentMeta)
+        : isShareRecipient
+          ? (redactForShareRecipient(meta) as DocumentMeta)
+          : (redactForPublicViewer(meta) as DocumentMeta)
       if (meta.public) {
         const gate = publicGate(meta, publicPassword)
         if (gate === 'password-required' || gate === 'password-wrong') {
