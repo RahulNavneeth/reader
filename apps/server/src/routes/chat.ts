@@ -266,6 +266,10 @@ export async function chatRoutes(app: FastifyInstance) {
 
     let assembled = ''
     let finished = false
+    // Captured from Ollama's `done` line. `'length'` means the
+    // num_predict cap fired and the answer is truncated mid-
+    // sentence — we surface that to the user explicitly.
+    let doneReason: string | undefined
     try {
       const messages = buildOllamaMessages(ctx, history, content)
       for await (const ev of streamOllamaChat(messages, ac.signal)) {
@@ -274,6 +278,7 @@ export async function chatRoutes(app: FastifyInstance) {
           send({ kind: 'token', token: ev.token })
         } else {
           finished = true
+          doneReason = ev.reason
         }
       }
     } catch (e) {
@@ -307,6 +312,13 @@ export async function chatRoutes(app: FastifyInstance) {
 
     clearTimeout(hardTimeout)
     if (finished && assembled.length > 0) {
+      // Ollama hit the num_predict token cap mid-sentence. Mark
+      // the persisted answer so the user sees "answer was cut off
+      // — click Regenerate or raise the cap" rather than a baffling
+      // sentence trailing into nothing.
+      if (doneReason === 'length') {
+        assembled += '\n\n*— Answer was cut off at the token limit. Click **Regenerate** for a fresh attempt, or ask a more specific follow-up to get the rest.*'
+      }
       const asstId = nanoid()
       appendMessage({
         id: asstId,

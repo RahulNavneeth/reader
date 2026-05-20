@@ -734,7 +734,10 @@ export function buildOllamaMessages(
     `4. REFUSAL TRIGGERS — Reply with exactly "${refusal}" ONLY for: (a) actual greetings or acknowledgements — literal phrases like "hi", "hello", "hey", "thanks", "how are you", "good morning", "ok", "cool" — or (b) questions that explicitly name a subject unrelated to documents (e.g. "what's the weather", "who are you", "tell me about Roman history"). Do NOT refuse on vague but document-adjacent queries like "explain", "explain in detail", "summarize", "elaborate", "tell me more", "what is this", "what does this say" — those refer to the current document, treat them as "do X to this document" and use the supplied material to answer.`,
     `5. Never invent facts, numbers, names, dates, links, or quotes.`,
     `5a. RESPECT MEMORY — If <permanent_facts> or <doc_facts> are present, those user-supplied preferences apply to your answer (e.g. currency, units, term expansions, terseness). If <known_mistakes> are present, do NOT repeat those mistakes — use the "Correct:" guidance.`,
-    `5b. EACH QUESTION IS INDEPENDENT — Prior assistant turns in the conversation history are background context only. Do NOT carry over content, examples, or framing from a previous answer unless the user explicitly references that prior turn (e.g. "the answer above", "as you said earlier"). If the new question is about a different section or topic, treat it as if there were no prior conversation.`,
+    `5b. FOLLOW-UPS vs TOPIC SHIFTS — Distinguish between two cases:`,
+    `    (a) VAGUE FOLLOW-UP — the user's new question has no specific anchor noun and reads like an expansion request: "explain in detail", "why?", "how?", "more", "elaborate", "expand on that", "go deeper", "what do you mean", "really?", "huh". When there's a recent assistant turn in history, these refer to THAT turn — expand on it, add detail, clarify. Do NOT restart from the whole document.`,
+    `    (b) TOPIC SHIFT — the user's new question names a different concept / section / entity than the previous turn ("now tell me about X", "compare with Y", "what about the Caveats section"). These are independent — do NOT carry over content from prior turns; pull fresh material from <primary_sections>.`,
+    `    Default when uncertain: treat short anchorless queries as (a) follow-ups, treat queries with a clear new noun as (b) topic shifts.`,
     `6. STRUCTURE LONG ANSWERS — For lookup questions ("what is X"), 1–2 sentences is fine. For ANY of: "explain", "describe", "how does X work", "how is X tied to Y", "compare", "what's the reasoning behind X" — you MUST produce a multi-paragraph answer with markdown structure:`,
     `   - a one-line summary at the top (no heading)`,
     `   - then ## section headings for each distinct point`,
@@ -784,10 +787,17 @@ export function buildOllamaMessages(
     `Reader AI: ${refusal}`,
     `</example_off_topic>`,
     ``,
-    `<example_vague_but_doc_adjacent>`,
-    `User: explain in detail`,
-    `Reader AI: <a real answer summarising this document's content, drawn from primary_sections / document. NOT a refusal — "explain in detail" means "explain THIS document in detail".>`,
-    `</example_vague_but_doc_adjacent>`,
+    `<example_vague_followup>`,
+    `User (turn 1): what does this document say`,
+    `Reader AI (turn 1): <one-line summary of what the document covers>`,
+    `User (turn 2): explain in detail`,
+    `Reader AI (turn 2): <EXPAND on turn 1's answer — go deeper on what was just summarised. Do NOT restart from "this document covers …" as if turn 1 didn't happen.>`,
+    `</example_vague_followup>`,
+    ``,
+    `<example_vague_no_prior_turn>`,
+    `User (turn 1): explain in detail`,
+    `Reader AI (turn 1): <a complete multi-section answer about the supplied document. No prior turn to expand, so synthesise from primary_sections / document.>`,
+    `</example_vague_no_prior_turn>`,
     ``,
     `<example_not_in_doc>`,
     `User: who is the prime minister of france?`,
@@ -823,7 +833,11 @@ export function buildOllamaMessages(
 export async function* streamOllamaChat(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   signal?: AbortSignal,
-): AsyncGenerator<{ kind: 'token'; token: string } | { kind: 'done' }, void, void> {
+): AsyncGenerator<
+  { kind: 'token'; token: string } | { kind: 'done'; reason?: string },
+  void,
+  void
+> {
   if (!config.ollama.enabled) {
     throw new ChatError('Ollama is disabled — set OLLAMA_ENABLED=true and pull a chat model')
   }
@@ -839,9 +853,12 @@ export async function* streamOllamaChat(
         messages,
         stream: true,
         options: {
-          // Conservative ceiling so the local model doesn't spin
-          // forever on a runaway answer. The UI will indicate cutoff.
-          num_predict: 1024,
+          // Ceiling on generation tokens. 1536 is enough headroom
+          // for "explain in detail" style long-form answers without
+          // letting a runaway model spin forever. When the cap
+          // fires Ollama sends `done_reason: 'length'` and we
+          // append a truncation marker before persisting.
+          num_predict: 1536,
           // Mid-range sampling. We need enough variance for the
           // model to break out of its "explain aggressive
           // portfolio in 4 prose paragraphs" attractor and pick
@@ -881,7 +898,16 @@ export async function* streamOllamaChat(
       const line = buf.slice(0, nl).trim()
       buf = buf.slice(nl + 1)
       if (line) {
-        let obj: { message?: { content?: string }; done?: boolean; error?: string }
+        let obj: {
+          message?: { content?: string }
+          done?: boolean
+          // Ollama reports why the stream ended. We care about
+          // 'length' specifically — the token cap (`num_predict`)
+          // fired and the answer is truncated mid-sentence. UI
+          // shows a clear marker so the user knows.
+          done_reason?: string
+          error?: string
+        }
         try {
           obj = JSON.parse(line)
         } catch {
@@ -891,7 +917,7 @@ export async function* streamOllamaChat(
         const tok = obj.message?.content
         if (tok) yield { kind: 'token', token: tok }
         if (obj.done) {
-          yield { kind: 'done' }
+          yield { kind: 'done', reason: obj.done_reason }
           return
         }
       }
