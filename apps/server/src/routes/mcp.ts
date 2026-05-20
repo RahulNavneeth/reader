@@ -131,6 +131,94 @@ const TOOLS = [
     },
   },
   {
+    name: 'get_outline',
+    description:
+      "Return a markdown document's heading tree as a flat list ({level, heading, slug, line}). Cheap structural overview before targeted edits — no need to fetch the full document just to know what sections exist.",
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Document id.' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'get_section',
+    description:
+      "Return the body text under a specific heading in a markdown document. Heading text is matched case-sensitively; the section runs until the next sibling-or-ancestor heading (so a section includes its sub-sections).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        heading: { type: 'string', description: 'Exact heading text (no leading #).' },
+      },
+      required: ['id', 'heading'],
+    },
+  },
+  {
+    name: 'replace_section',
+    description:
+      "Replace the body under a heading with new content. The heading line itself is preserved. Use this instead of full-overwrite upload_text when you only need to change one section.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        heading: { type: 'string', description: 'Exact heading text (no leading #).' },
+        content: { type: 'string', description: 'New body text. Do not include the heading line.' },
+      },
+      required: ['id', 'heading', 'content'],
+    },
+  },
+  {
+    name: 'insert_after',
+    description:
+      "Insert content immediately after the matched section (after its body and any nested sub-sections). Useful for adding a new sibling section.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        heading: { type: 'string', description: 'Exact heading text to anchor against.' },
+        content: { type: 'string', description: 'Content to insert (typically starts with a `## New Heading` line).' },
+      },
+      required: ['id', 'heading', 'content'],
+    },
+  },
+  {
+    name: 'delete_section',
+    description:
+      "Remove a heading and its body (including nested sub-sections). Use carefully — this is destructive.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        heading: { type: 'string', description: 'Exact heading text.' },
+      },
+      required: ['id', 'heading'],
+    },
+  },
+  {
+    name: 'append_text',
+    description: 'Append content to the end of a markdown document.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        content: { type: 'string' },
+      },
+      required: ['id', 'content'],
+    },
+  },
+  {
+    name: 'prepend_text',
+    description: 'Prepend content to the start of a markdown document.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        content: { type: 'string' },
+      },
+      required: ['id', 'content'],
+    },
+  },
+  {
     name: 'pin',
     description: 'Pin a file or folder in the token user\'s sidebar.',
     inputSchema: {
@@ -396,6 +484,168 @@ async function handleCall(token: ApiToken, name: string, args: any) {
     return {
       content: [{ type: 'text', text: `Tags set: ${next.tags.join(', ') || '(none)'}` }],
       structuredContent: { document: next },
+    }
+  }
+
+  // -------- Granular markdown edits --------
+  //
+  // All eight tools share the same authz + persistence skeleton:
+  //   1. Load meta by id, check edit grant.
+  //   2. Resolve the doc's on-disk path and read its current text.
+  //   3. Apply the structural transformation (lib/mdx.ts).
+  //   4. Write the new text back to disk, save meta, re-ingest, audit.
+  //
+  // Read-only variants (`get_outline`, `get_section`) skip steps 3-4
+  // and don't audit.
+  //
+  // Heading matching is case-sensitive exact-match by design — fuzzy
+  // matching here would surprise agents in subtle ways. If multiple
+  // headings have the same text, the first is used; callers should
+  // disambiguate by adding context to the heading text.
+
+  if (
+    name === 'get_outline' ||
+    name === 'get_section' ||
+    name === 'replace_section' ||
+    name === 'insert_after' ||
+    name === 'delete_section' ||
+    name === 'append_text' ||
+    name === 'prepend_text'
+  ) {
+    const id = String(args?.id ?? '')
+    if (!id) throw new Error('id required')
+    const meta = await loadMeta(id)
+    if (!meta) throw new Error('document not found')
+
+    // get_* are read-only: only read ACL needed. The other five are
+    // mutations and require edit grant.
+    const isRead = name === 'get_outline' || name === 'get_section'
+    if (isRead) {
+      const { userCanRead } = await import('../stores/documents.js')
+      if (!userCanRead(meta, actingUser, token.role)) throw new Error('forbidden')
+    } else {
+      if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    }
+
+    // Heuristic: granular edits only make sense for markdown-ish
+    // documents. Refuse on binary mimes so an agent doesn't acci-
+    // dentally corrupt a PDF by trying to insert a section.
+    const mime = (meta.mime || '').toLowerCase()
+    const isMarkdownish =
+      mime.startsWith('text/') ||
+      mime.includes('markdown') ||
+      mime === 'application/json' ||
+      /\.(md|markdown|mdx|txt)$/i.test(meta.originalFilename)
+    if (!isMarkdownish) {
+      throw new Error(
+        `granular edits require a text/markdown document (this one is ${mime || 'unknown'})`,
+      )
+    }
+
+    // Read current content. We use the on-disk file rather than the
+    // extracted text.txt because edits must round-trip the actual
+    // file, including frontmatter / unparsed lines.
+    const abs = resolveUserVault(actingUser, meta.storageKey)
+    const buffer = await (await import('node:fs/promises')).readFile(abs)
+    const text = buffer.toString('utf8')
+
+    const mdx = await import('../lib/mdx.js')
+
+    if (name === 'get_outline') {
+      const out = mdx.outlineForTool(text)
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              out.length === 0
+                ? '(no headings)'
+                : out
+                    .map(
+                      (h) =>
+                        `${'  '.repeat(Math.max(0, h.level - 1))}${'#'.repeat(h.level)} ${h.heading}  (line ${h.line})`,
+                    )
+                    .join('\n'),
+          },
+        ],
+        structuredContent: { outline: out },
+      }
+    }
+    if (name === 'get_section') {
+      const heading = String(args?.heading ?? '')
+      if (!heading) throw new Error('heading required')
+      const body = mdx.getSection(text, heading)
+      if (body == null) throw new Error(`heading not found: "${heading}"`)
+      return {
+        content: [{ type: 'text', text: body }],
+        structuredContent: { heading, body },
+      }
+    }
+
+    // Mutations: apply, write, re-ingest, audit.
+    let nextText: string
+    let auditAction = ''
+    let auditMeta: Record<string, unknown> = { path: meta.storageKey }
+    try {
+      if (name === 'replace_section') {
+        const heading = String(args?.heading ?? '')
+        const content = String(args?.content ?? '')
+        if (!heading) throw new Error('heading required')
+        nextText = mdx.replaceSection(text, heading, content)
+        auditAction = 'mcp.replace_section'
+        auditMeta = { ...auditMeta, heading, bytes: content.length }
+      } else if (name === 'insert_after') {
+        const heading = String(args?.heading ?? '')
+        const content = String(args?.content ?? '')
+        if (!heading) throw new Error('heading required')
+        if (!content) throw new Error('content required')
+        nextText = mdx.insertAfter(text, heading, content)
+        auditAction = 'mcp.insert_after'
+        auditMeta = { ...auditMeta, heading, bytes: content.length }
+      } else if (name === 'delete_section') {
+        const heading = String(args?.heading ?? '')
+        if (!heading) throw new Error('heading required')
+        nextText = mdx.deleteSection(text, heading)
+        auditAction = 'mcp.delete_section'
+        auditMeta = { ...auditMeta, heading }
+      } else if (name === 'append_text') {
+        const content = String(args?.content ?? '')
+        if (!content) throw new Error('content required')
+        nextText = mdx.appendText(text, content)
+        auditAction = 'mcp.append_text'
+        auditMeta = { ...auditMeta, bytes: content.length }
+      } else {
+        // name === 'prepend_text'
+        const content = String(args?.content ?? '')
+        if (!content) throw new Error('content required')
+        nextText = mdx.prependText(text, content)
+        auditAction = 'mcp.prepend_text'
+        auditMeta = { ...auditMeta, bytes: content.length }
+      }
+    } catch (e) {
+      throw new Error((e as Error).message)
+    }
+
+    const nextBuffer = Buffer.from(nextText, 'utf8')
+    await (await import('node:fs/promises')).writeFile(abs, nextBuffer)
+    const nextMeta: DocumentMeta = {
+      ...meta,
+      bytes: nextBuffer.length,
+      sha256: sha256Of(nextBuffer),
+      updatedAt: Date.now(),
+      ingest: { status: 'pending', embedded: false },
+    }
+    await saveMeta(nextMeta)
+    const finalMeta = await ingestDocument(nextMeta, nextBuffer)
+    await audit({ actor: actingUser, action: auditAction, target: id, meta: auditMeta })
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Updated ${meta.storageKey} (${nextBuffer.length} bytes)`,
+        },
+      ],
+      structuredContent: { document: finalMeta },
     }
   }
 
