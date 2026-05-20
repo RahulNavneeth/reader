@@ -6,6 +6,7 @@ import type { FastifyInstance } from 'fastify'
 import { buildApp } from './index.js'
 import { config } from './config.js'
 import { clearSettingsCache } from './stores/settings.js'
+import { db } from './db/sqlite.js'
 
 // Integration test plays through the whole HTTP stack via
 // fastify.inject so no real port is bound. Each describe block gets
@@ -186,6 +187,282 @@ describe('integration: rate limit', () => {
       }
     }
     expect(saw429).toBe(true)
+  })
+})
+
+describe('integration: admin settings PATCH', () => {
+  it('persists ollama.chatModel + chatEnabled (regression: Zod schema was stripping them)', async () => {
+    // Sign up an admin (first user gets admin role by virtue of the
+    // bootstrap path; we already created `alice` above, but that's
+    // in a different describe block with its own beforeAll. Reuse
+    // the live `app` and sign up a fresh user — they get editor by
+    // default. We need admin, so use the admin-bootstrap path
+    // instead by promoting via a separate route would be too much
+    // setup. Easier: this test depends on the same `app` instance
+    // and the first signed-up user is alice (admin from the auth
+    // describe above), but cookie state isn't shared across tests.
+    // Sign in as alice using the password set up earlier.
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    const cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+    expect(cookie).toBeTruthy()
+
+    const r = await app.inject({
+      method: 'PATCH',
+      url: '/api/admin/settings',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { ollama: { chatEnabled: false, chatModel: 'qwen2.5:0.5b-instruct' } },
+    })
+    expect(r.statusCode).toBe(200)
+
+    const sys = await app.inject({
+      method: 'GET',
+      url: '/api/admin/system',
+      headers: { cookie },
+    })
+    expect(sys.statusCode).toBe(200)
+    const body = sys.json()
+    expect(body.ollama.chatEnabled).toBe(false)
+    expect(body.ollama.chatModel).toBe('qwen2.5:0.5b-instruct')
+
+    // Restore so it doesn't leak into the chat-endpoints block.
+    await app.inject({
+      method: 'PATCH',
+      url: '/api/admin/settings',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { ollama: { chatEnabled: true } },
+    })
+  })
+})
+
+describe('integration: chat endpoints', () => {
+  let cookie = ''
+
+  it('signs up a user and gets a session', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/auth/signup',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'chatuser', password: 'correct-horse-battery' },
+    })
+    expect(r.statusCode).toBe(200)
+    cookie = setCookieValue(r.headers['set-cookie']) ?? ''
+    expect(cookie).toBeTruthy()
+  })
+
+  it('rejects unauthenticated chat history reads', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/chat/anydoc/messages',
+    })
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('returns an empty thread for a doc with no prior chat', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/chat/missing-doc/messages',
+      headers: { cookie },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().messages).toEqual([])
+  })
+
+  it('rejects a POST stream with empty content (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/chat/some-doc/stream',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { content: '' },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toMatch(/content required/i)
+  })
+
+  it('rejects a POST stream with a wildly oversized message (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/chat/some-doc/stream',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { content: 'x'.repeat(5000) },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toMatch(/too long/i)
+  })
+
+  it('rejects a POST stream against a missing doc (400 from assembleContext)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/chat/missing-doc/stream',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { content: 'hello?' },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toMatch(/document not found/i)
+  })
+
+  it('clears chat history (DELETE) without complaint when thread is empty', async () => {
+    const r = await app.inject({
+      method: 'DELETE',
+      url: '/api/chat/missing-doc',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().cleared).toBe(0)
+  })
+})
+
+describe('integration: AI memories', () => {
+  let cookie = ''
+
+  it('signs up + logs in', async () => {
+    // Reuse the existing alice; signup would 409 since the auth-flow
+    // describe block above already registered her. Just log in.
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(r.statusCode).toBe(200)
+    cookie = setCookieValue(r.headers['set-cookie']) ?? ''
+    expect(cookie).toBeTruthy()
+  })
+
+  it('rejects /api/ai-memories without auth', async () => {
+    const r = await app.inject({ method: 'GET', url: '/api/ai-memories' })
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('POST + GET roundtrips a permanent memory', async () => {
+    const add = await app.inject({
+      method: 'POST',
+      url: '/api/ai-memories',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { fact: 'currency is ₹' },
+    })
+    expect(add.statusCode).toBe(200)
+    const list = await app.inject({ method: 'GET', url: '/api/ai-memories', headers: { cookie } })
+    expect(list.statusCode).toBe(200)
+    const facts = list.json().memories.map((m: { fact: string }) => m.fact)
+    expect(facts).toContain('currency is ₹')
+  })
+
+  it('rejects an empty fact (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/ai-memories',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { fact: '   ' },
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('DELETE removes the memory and 404s on the next try', async () => {
+    const add = await app.inject({
+      method: 'POST',
+      url: '/api/ai-memories',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { fact: 'temporary fact' },
+    })
+    const id = add.json().memory.id
+    const del = await app.inject({
+      method: 'DELETE',
+      url: `/api/ai-memories/${id}`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(del.statusCode).toBe(200)
+    const del2 = await app.inject({
+      method: 'DELETE',
+      url: `/api/ai-memories/${id}`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(del2.statusCode).toBe(404)
+  })
+
+  it('rejects feedback without question/correction', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/chat/anydoc/feedback',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { correction: '' },
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('accepts a complete feedback note', async () => {
+    // chat_error_notes has an FK on doc_id → documents(id), so we
+    // need a real doc row to feedback against. Insert directly
+    // instead of going through the upload pipeline (which would
+    // pull in the whole ingest stack into this test).
+    const docId = 'feedback-stub-doc'
+    const now = Date.now()
+    db()
+      .prepare(
+        `INSERT INTO documents
+           (id, owner, storage_key, title, original_filename, mime, bytes, sha256, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, '', ?, ?)`,
+      )
+      .run(docId, 'alice', 'stub.md', 'Stub', 'stub.md', 'text/markdown', now, now)
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/chat/${docId}/feedback`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { question: 'what is X?', correction: 'X is actually Y', wrongAnswer: 'X is Z' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().note.correction).toBe('X is actually Y')
+  })
+})
+
+describe('integration: slash commands', () => {
+  it('parses /remember + persists the fact', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    const cmd = parseSlashCommand('/remember currency is ₹')
+    expect(cmd).toEqual({ kind: 'remember', fact: 'currency is ₹' })
+  })
+
+  it('parses /remember-here with multi-word arg', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    const cmd = parseSlashCommand('/remember-here PPFCF = Parag Parikh Flexi Cap Fund')
+    expect(cmd).toEqual({ kind: 'remember-here', fact: 'PPFCF = Parag Parikh Flexi Cap Fund' })
+  })
+
+  it('parses bare /memories', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    expect(parseSlashCommand('/memories')).toEqual({ kind: 'memories' })
+  })
+
+  it('parses /forget with substring', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    expect(parseSlashCommand('/forget currency')).toEqual({ kind: 'forget', needle: 'currency' })
+  })
+
+  it('returns null for non-commands', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    expect(parseSlashCommand('hi there')).toBeNull()
+    expect(parseSlashCommand('explain scenario b')).toBeNull()
+  })
+
+  it('returns null for /remember with no argument (falls through to LLM)', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    expect(parseSlashCommand('/remember')).toBeNull()
+    expect(parseSlashCommand('/remember   ')).toBeNull()
+  })
+
+  it('returns null for unknown slash verbs', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    expect(parseSlashCommand('/help me')).toBeNull()
+  })
+
+  it('tolerates leading whitespace', async () => {
+    const { parseSlashCommand } = await import('./routes/chat.js')
+    expect(parseSlashCommand('  \n /remember currency is ₹')).toEqual({ kind: 'remember', fact: 'currency is ₹' })
   })
 })
 

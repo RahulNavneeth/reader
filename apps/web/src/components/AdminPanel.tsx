@@ -460,6 +460,8 @@ function EmbeddingsPanel() {
   const [enabled, setEnabled] = useState<boolean>(true)
   const [baseUrl, setBaseUrl] = useState('')
   const [embedModel, setEmbedModel] = useState('')
+  const [chatEnabled, setChatEnabled] = useState<boolean>(true)
+  const [chatModel, setChatModel] = useState('')
   const [chunkChars, setChunkChars] = useState<number | ''>('')
   const [chunkOverlap, setChunkOverlap] = useState<number | ''>('')
   const [saving, setSaving] = useState(false)
@@ -474,6 +476,8 @@ function EmbeddingsPanel() {
       setEnabled(r.ollama.enabled)
       setBaseUrl(r.ollama.baseUrl)
       setEmbedModel(r.ollama.embedModel)
+      setChatEnabled(r.ollama.chatEnabled)
+      setChatModel(r.ollama.chatModel)
       setChunkChars(r.ingest.chunkChars)
       setChunkOverlap(r.ingest.chunkOverlap)
     } catch (e) {
@@ -497,7 +501,13 @@ function EmbeddingsPanel() {
     setMsg(null)
     try {
       await api.adminPatchSettings({
-        ollama: { enabled, baseUrl: baseUrl.trim(), embedModel: embedModel.trim() },
+        ollama: {
+          enabled,
+          baseUrl: baseUrl.trim(),
+          embedModel: embedModel.trim(),
+          chatEnabled,
+          chatModel: chatModel.trim(),
+        },
         ingest: {
           chunkChars: typeof chunkChars === 'number' ? chunkChars : undefined,
           chunkOverlap: typeof chunkOverlap === 'number' ? chunkOverlap : undefined,
@@ -569,6 +579,46 @@ function EmbeddingsPanel() {
               placeholder="nomic-embed-text"
               value={embedModel}
               onChange={(e) => setEmbedModel(e.target.value)}
+            />
+          )}
+        </FieldRow>
+
+        {/* Per-document AI chat. Toggleable independently of
+            embeddings so an admin can search-only by turning chat
+            off (or while picking the right chat model). */}
+        <div className="flex items-center gap-3 mt-4 pt-4" style={{ borderTop: '1px solid var(--border-soft)' }}>
+          <Toggle checked={chatEnabled} onChange={() => setChatEnabled((v) => !v)} disabled={saving} />
+          <div className="flex-1 text-[12.5px]">
+            <div className="font-medium text-fg">AI chat per document</div>
+            <div className="text-muted mt-0.5">
+              Per-doc chat dock that uses the model below for generation. Requires Ollama to be reachable.
+            </div>
+          </div>
+        </div>
+        <FieldRow label="Chat model">
+          {availableModels.length > 0 ? (
+            <select
+              className="input"
+              value={chatModel}
+              onChange={(e) => setChatModel(e.target.value)}
+              disabled={!chatEnabled}
+            >
+              {!availableModels.includes(chatModel) && chatModel && (
+                <option value={chatModel}>{chatModel} (not installed)</option>
+              )}
+              {availableModels.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className="input"
+              placeholder="qwen2.5:7b-instruct"
+              value={chatModel}
+              onChange={(e) => setChatModel(e.target.value)}
+              disabled={!chatEnabled}
             />
           )}
         </FieldRow>

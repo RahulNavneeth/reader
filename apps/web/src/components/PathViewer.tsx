@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -27,6 +27,8 @@ import { ShareWithUserButton } from './ShareWithUserButton'
 import { CsvTable } from './CsvTable'
 import { JsonView } from './JsonView'
 import { MetadataPanel } from './MetadataPanel'
+import { ChatDock } from './ChatDock'
+import { SelectionPopover } from './SelectionPopover'
 import { PinButton } from './PinButton'
 import { MediaPlayer } from './MediaPlayer'
 
@@ -56,6 +58,12 @@ export function PathViewer({ path, canEdit = true }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [indexing, setIndexing] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
+  const [chatOpen, setChatOpen] = useState(false)
+  // Pending chat message coming from outside ChatDock (e.g. the
+  // selection-popover "Explain with Reader AI" button). Consumed
+  // by ChatDock via prop + useEffect, then cleared by the
+  // onPendingConsumed callback.
+  const [pendingChatMessage, setPendingChatMessage] = useState<string | null>(null)
 
   useEffect(() => {
     const i = path.lastIndexOf('/')
@@ -451,7 +459,8 @@ export function PathViewer({ path, canEdit = true }: Props) {
       </header>
 
       <div className="flex-1 overflow-hidden flex">
-       <div ref={contentRef} className="flex-1 overflow-y-auto">
+       <div className="flex-1 relative min-w-0">
+        <div ref={contentRef} className="h-full overflow-y-auto">
         {error && (
           <div className="px-10 py-10 text-muted">
             <div className="flex items-center gap-2 text-fg font-semibold mb-1">
@@ -634,15 +643,65 @@ export function PathViewer({ path, canEdit = true }: Props) {
             </div>
           </div>
         )}
+
+        </div>
+        {/* Floating Chat button — sits in the bottom-right of the doc
+            pane (above the doc, not inside its scroll), opens the
+            sidebar. Hidden when the sidebar is already open. */}
+        {!chatOpen && meta && (
+          <button
+            className="absolute bottom-5 right-5 z-30 h-11 w-11 rounded-full inline-flex items-center justify-center transition-transform hover:scale-105"
+            style={{
+              background: 'var(--accent)',
+              color: 'white',
+              boxShadow: '0 8px 20px rgba(15, 23, 42, 0.18)',
+            }}
+            onClick={() => setChatOpen(true)}
+            title="Ask Reader AI about this document"
+            aria-label="Open Reader AI"
+          >
+            <MessageCircle size={18} />
+          </button>
+        )}
+        {/* Selection-driven "Explain with Reader AI" popover.
+            Scoped to the doc content scroller via contentRef so
+            selections in the chat sidebar / outline don't trigger
+            it. The handler opens the chat and queues the selection
+            as a pending message — ChatDock consumes it and auto-
+            sends "Explain this: …" once mounted. */}
+        {meta && (
+          <SelectionPopover
+            containerRef={contentRef}
+            onExplain={(text) => {
+              // Cap to ~3500 chars to leave room for the prefix
+              // inside the server's 4000-char content limit.
+              const trimmed = text.length > 3500 ? text.slice(0, 3500) + '…' : text
+              setPendingChatMessage(`Explain this: "${trimmed}"`)
+              setChatOpen(true)
+            }}
+          />
+        )}
        </div>
 
+       {/* AI chat sidebar — placed BEFORE the outline rail so it sits
+           adjacent to the content. The natural reading flow is left
+           → right; the active "ask" surface belongs next to the doc,
+           not pushed past navigation chrome. */}
+       {chatOpen && meta && (
+         <ChatDock
+           meta={meta}
+           onClose={() => setChatOpen(false)}
+           pendingMessage={pendingChatMessage}
+           onPendingConsumed={() => setPendingChatMessage(null)}
+         />
+       )}
        {showOutline && (
          <aside
            className="w-[240px] shrink-0 border-l overflow-y-auto"
            style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
          >
            <div
-             className="sticky top-0 px-3 py-2.5 border-b text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex items-center gap-1.5"
+             className="sticky top-0 h-10 px-3 border-b text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex items-center gap-1.5"
              style={{ background: 'var(--panel-2)', borderColor: 'var(--border-soft)' }}
            >
              <List size={11} /> Outline

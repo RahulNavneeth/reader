@@ -112,6 +112,8 @@ export type WorkspaceSettings = {
     enabled?: boolean
     baseUrl?: string
     embedModel?: string
+    chatEnabled?: boolean
+    chatModel?: string
   }
   storage?: {
     backend?: 'local' | 's3'
@@ -150,7 +152,7 @@ export type SystemInfo = {
   /** Back-compat: same as ingest.maxFileBytes */
   maxFileBytes: number
   ingest: { maxFileBytes: number; chunkChars: number; chunkOverlap: number }
-  ollama: { enabled: boolean; baseUrl: string; embedModel: string; available: boolean }
+  ollama: { enabled: boolean; baseUrl: string; embedModel: string; chatEnabled: boolean; chatModel: string; available: boolean }
   storage: {
     backend: 'local' | 's3'
     s3: {
@@ -205,12 +207,18 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
   // a CORS preflight, which our origin allowlist blocks). Cheap to
   // always send.
   const headers: Record<string, string> = { 'X-Requested-With': 'fetch' }
-  if (body) headers['Content-Type'] = 'application/json'
+  const isMutating = method !== 'GET' && method !== 'HEAD'
+  // Fastify (with multipart registered) returns 415 on a mutating
+  // request that arrives with Content-Length: 0 and no Content-Type.
+  // Always send a JSON envelope for mutating verbs — an empty `{}`
+  // body when the caller didn't provide one keeps the JSON parser
+  // happy without changing route semantics.
+  if (isMutating) headers['Content-Type'] = 'application/json'
   const res = await fetch(url, {
     method,
     credentials: 'include',
     headers,
-    body: body ? JSON.stringify(body) : undefined,
+    body: isMutating ? JSON.stringify(body ?? {}) : undefined,
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
@@ -1041,4 +1049,161 @@ export const api = {
       if (!r.ok) throw new ApiError(r.status, `HTTP ${r.status}`)
       return r.json() as Promise<{ ok: true }>
     }),
+
+  // chat — per-document AI chat
+  chatHistory: (docId: string) =>
+    get<{ messages: ChatMessageDTO[] }>(`/api/chat/${encodeURIComponent(docId)}/messages`),
+  chatClear: (docId: string) =>
+    request<{ cleared: number }>('DELETE', `/api/chat/${encodeURIComponent(docId)}`),
+
+  // Reader AI memories
+  listUserMemories: () =>
+    get<{ memories: UserMemoryDTO[] }>('/api/ai-memories'),
+  addUserMemory: (fact: string) =>
+    post<{ memory: UserMemoryDTO }>('/api/ai-memories', { fact }),
+  deleteUserMemory: (id: string) =>
+    request<{ ok: true }>('DELETE', `/api/ai-memories/${encodeURIComponent(id)}`),
+  listDocMemories: (docId: string) =>
+    get<{ memories: DocMemoryDTO[] }>(`/api/chat/${encodeURIComponent(docId)}/ai-memories`),
+  addDocMemory: (docId: string, fact: string) =>
+    post<{ memory: DocMemoryDTO }>(`/api/chat/${encodeURIComponent(docId)}/ai-memories`, { fact }),
+  deleteDocMemory: (docId: string, id: string) =>
+    request<{ ok: true }>('DELETE', `/api/chat/${encodeURIComponent(docId)}/ai-memories/${encodeURIComponent(id)}`),
+  submitChatFeedback: (
+    docId: string,
+    body: { question: string; correction: string; wrongAnswer?: string; messageId?: string },
+  ) =>
+    post<{ note: { id: string; docId: string; question: string; correction: string } }>(
+      `/api/chat/${encodeURIComponent(docId)}/feedback`,
+      body,
+    ),
+}
+
+export type UserMemoryDTO = {
+  id: string
+  userId: string
+  fact: string
+  source: 'user_command' | 'auto_extracted'
+  usedCount: number
+  createdAt: number
+}
+
+export type DocMemoryDTO = {
+  id: string
+  docId: string
+  userId: string
+  fact: string
+  createdAt: number
+}
+
+export type ChatCitationDTO = {
+  docId: string
+  chunkIdx: number
+  score: number
+  /** Doc title at citation time. Older rows may lack this. */
+  docTitle?: string
+  /** Vault-relative path of the cited doc. Used to open it on click. */
+  docPath?: string
+  /** Snippet of the chunk text the model received as context. */
+  text?: string
+  /** True when this citation came from the OPEN doc; false/undefined
+   *  for vault chunks from other docs. */
+  primary?: boolean
+}
+export type MemoryUsedDTO = {
+  kind: 'user' | 'doc' | 'mistake'
+  id: string
+  preview: string
+}
+
+export type ChatMessageDTO = {
+  id: string
+  docId: string
+  userId: string
+  role: 'user' | 'assistant'
+  content: string
+  citations: ChatCitationDTO[] | null
+  /** Memories surfaced into the prompt when this assistant turn was
+   *  generated. Drives the "Used memory: …" footer. */
+  memoriesUsed?: MemoryUsedDTO[] | null
+  /** Non-null when this assistant turn represents a failure (model
+   *  not installed, daemon down, etc.). UI renders via the friendly
+   *  error formatter instead of the markdown pipeline. */
+  error?: string | null
+  createdAt: number
+}
+
+/** Server-Sent Events from POST /api/chat/:docId/stream. Decoded
+ *  inline by ChatPanel — kept here next to the type that produced
+ *  them so the wire contract is colocated. */
+export type ChatStreamEvent =
+  | { kind: 'meta'; citations: ChatCitationDTO[]; memoriesUsed?: MemoryUsedDTO[] }
+  | { kind: 'token'; token: string }
+  | { kind: 'done'; messageId: string | null }
+  | { kind: 'error'; error: string }
+
+/**
+ * Open a chat stream against /api/chat/:docId/stream.
+ *
+ * EventSource doesn't support POST, so we use fetch + ReadableStream
+ * and parse SSE manually. The signal lets the caller cancel mid-stream.
+ *
+ * `opts.regenerateOf` is the id of an assistant turn being replaced —
+ * server skips persisting a new user turn AND deletes that stale
+ * assistant row so a regenerate produces (Q, A') not (Q, Q, A').
+ */
+export async function chatStream(
+  docId: string,
+  content: string,
+  onEvent: (e: ChatStreamEvent) => void,
+  signal: AbortSignal,
+  opts?: { regenerateOf?: string },
+): Promise<void> {
+  const body: { content: string; regenerateOf?: string } = { content }
+  if (opts?.regenerateOf) body.regenerateOf = opts.regenerateOf
+  const res = await fetch(`/api/chat/${encodeURIComponent(docId)}/stream`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'fetch',
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new ApiError(res.status, data?.error || `HTTP ${res.status}`, data || {})
+  }
+  if (!res.body) throw new ApiError(0, 'empty SSE body')
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    // SSE frames are separated by blank lines.
+    let sep = buf.indexOf('\n\n')
+    while (sep >= 0) {
+      const frame = buf.slice(0, sep)
+      buf = buf.slice(sep + 2)
+      // Each frame may have multiple `data:` lines; we only emit
+      // one event per frame in this protocol.
+      const dataLine = frame
+        .split('\n')
+        .find((l) => l.startsWith('data:'))
+      if (dataLine) {
+        const payload = dataLine.slice(5).trim()
+        if (payload) {
+          try {
+            onEvent(JSON.parse(payload) as ChatStreamEvent)
+          } catch {
+            /* malformed frame — drop it; the stream will continue */
+          }
+        }
+      }
+      sep = buf.indexOf('\n\n')
+    }
+  }
 }

@@ -108,6 +108,19 @@ export const config = {
   ollama: {
     baseUrl: envStr('OLLAMA_BASE_URL', 'http://localhost:11434'),
     embedModel: envStr('OLLAMA_EMBED_MODEL', 'nomic-embed-text'),
+    // Chat completion model. Used by the per-document AI chat endpoint;
+    // independent of `embedModel` so you can pair a small/fast embedder
+    // with a beefier generation model. `qwen2.5:7b-instruct` is the
+    // best quality-per-RAM default at 7B-class; pull it with
+    // `ollama pull qwen2.5:7b-instruct`. Override via OLLAMA_CHAT_MODEL.
+    chatModel: envStr('OLLAMA_CHAT_MODEL', 'qwen2.5:7b-instruct'),
+    // Whether the chat endpoints are reachable at all. Independent of
+    // `enabled` (which gates embeddings) so an admin can have search
+    // working but turn off chat — e.g. while picking / pulling a chat
+    // model, or to disable on instances that don't want any LLM
+    // generation. Defaults true since it's gated downstream by the
+    // chat model being installed anyway. Env: CHAT_ENABLED.
+    chatEnabled: envBool('CHAT_ENABLED', true),
     enabled: envBool('OLLAMA_ENABLED', true),
   },
   /**

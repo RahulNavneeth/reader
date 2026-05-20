@@ -27,6 +27,8 @@ import { feedRoutes } from './routes/feed.js'
 import { timelineRoutes } from './routes/timeline.js'
 import { collectionsRoutes } from './routes/collections.js'
 import { externalMountsRoutes } from './routes/externalMounts.js'
+import { chatRoutes } from './routes/chat.js'
+import { aiMemoriesRoutes } from './routes/aiMemories.js'
 import { sweepExpired } from './stores/sessions.js'
 import { sweepExpiredPublic } from './stores/documents.js'
 import { sweepExpiredPublicFolders } from './stores/folderMetas.js'
@@ -249,6 +251,8 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await app.register(feedRoutes)
   await app.register(timelineRoutes)
   await app.register(collectionsRoutes)
+  await app.register(chatRoutes)
+  await app.register(aiMemoriesRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
   // SPA fallback rewrites unknown paths to index.html so React Router-style

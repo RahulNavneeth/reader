@@ -21,6 +21,12 @@ export type WorkspaceSettings = {
     enabled?: boolean
     baseUrl?: string
     embedModel?: string
+    /** Toggle for the per-document AI chat feature. Disabling hides
+     *  the dock in the UI and returns 503 from /api/chat/*. */
+    chatEnabled?: boolean
+    /** Ollama chat-completion model name (e.g. "qwen2.5:7b-instruct").
+     *  Admin-picked at runtime; falls back to OLLAMA_CHAT_MODEL env. */
+    chatModel?: string
   }
   storage?: {
     backend?: 'local' | 's3'
@@ -123,6 +129,8 @@ function applyOverrides(s: WorkspaceSettings): void {
   config.ollama.enabled = s.ollama?.enabled ?? ENV.ollama.enabled
   config.ollama.baseUrl = s.ollama?.baseUrl?.trim() || ENV.ollama.baseUrl
   config.ollama.embedModel = s.ollama?.embedModel?.trim() || ENV.ollama.embedModel
+  config.ollama.chatEnabled = s.ollama?.chatEnabled ?? ENV.ollama.chatEnabled
+  config.ollama.chatModel = s.ollama?.chatModel?.trim() || ENV.ollama.chatModel
 
   config.storage.backend = s.storage?.backend ?? ENV.storage.backend
   config.storage.s3.endpoint = s.storage?.s3?.endpoint ?? ENV.storage.s3.endpoint

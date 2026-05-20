@@ -157,6 +157,8 @@ export async function adminRoutes(app: FastifyInstance) {
             enabled: z.boolean().optional(),
             baseUrl: z.string().optional(),
             embedModel: z.string().optional(),
+            chatEnabled: z.boolean().optional(),
+            chatModel: z.string().optional(),
           })
           .optional(),
         storage: z
@@ -445,6 +447,8 @@ export async function adminRoutes(app: FastifyInstance) {
         enabled: config.ollama.enabled,
         baseUrl: config.ollama.baseUrl,
         embedModel: config.ollama.embedModel,
+        chatEnabled: config.ollama.chatEnabled,
+        chatModel: config.ollama.chatModel,
         available: ollamaUp,
       },
       storage: {
