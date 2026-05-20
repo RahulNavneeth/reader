@@ -187,26 +187,68 @@ export function appendText(text: string, content: string): string {
 }
 
 /** Prepend content to the start of the document. Inserts a blank
- *  line between the new content and the existing one. */
+ *  line between the new content and the existing one.
+ *
+ *  YAML-frontmatter aware: if the document opens with a `---`
+ *  fence and closes the fence later, content is prepended AFTER
+ *  the closing `---`, not at line 0. Otherwise an agent prepending
+ *  a status block would push the frontmatter down and break Pages,
+ *  Jekyll, Astro, etc. consumers. */
 export function prependText(text: string, content: string): string {
+  const fmEnd = frontmatterEnd(text)
   let head = content
   if (!head.endsWith('\n')) head += '\n'
   if (!head.endsWith('\n\n')) head += '\n'
-  return head + text
+  if (fmEnd < 0) return head + text
+  // Split the doc at the line after the closing `---` and inject
+  // the new content there, preserving the frontmatter block intact.
+  const lines = text.split('\n')
+  const before = lines.slice(0, fmEnd + 1).join('\n')
+  const after = lines.slice(fmEnd + 1).join('\n')
+  // Ensure a blank line between frontmatter and the new content.
+  const separator = after.startsWith('\n') ? '' : '\n'
+  return before + '\n' + separator + head + after
+}
+
+/** Returns the 0-based line index of the closing `---` of a YAML
+ *  frontmatter block, or -1 if the doc doesn't open with one.
+ *
+ *  CommonMark doesn't define frontmatter, but the convention is
+ *  near-universal: line 0 is `---`, a closing `---` appears within
+ *  the first ~50 lines. We're permissive about the open marker
+ *  (allow `+++` too for TOML-style) and require an exact match for
+ *  the close. */
+function frontmatterEnd(text: string): number {
+  const lines = text.split('\n')
+  if (lines.length === 0) return -1
+  const first = lines[0].trim()
+  if (first !== '---' && first !== '+++') return -1
+  for (let i = 1; i < Math.min(lines.length, 100); i++) {
+    if (lines[i].trim() === first) return i
+  }
+  return -1
 }
 
 /** Flat outline view for the MCP get_outline tool. Heading slugs
  *  match rehype-slug's algorithm closely enough that an agent can
- *  build `#anchor` URLs from them. */
+ *  build `#anchor` URLs from them — including the `-1`, `-2`, …
+ *  suffixes when multiple headings produce the same base slug. */
 export function outlineForTool(
   text: string,
 ): Array<{ level: number; heading: string; slug: string; line: number }> {
-  return outline(text).map((s) => ({
-    level: s.level,
-    heading: s.heading,
-    slug: slugify(s.heading),
-    line: s.startLine + 1, // 1-indexed for human-friendliness
-  }))
+  const seen = new Map<string, number>()
+  return outline(text).map((s) => {
+    const base = slugify(s.heading)
+    const count = seen.get(base) ?? 0
+    seen.set(base, count + 1)
+    const slug = count === 0 ? base : `${base}-${count}`
+    return {
+      level: s.level,
+      heading: s.heading,
+      slug,
+      line: s.startLine + 1, // 1-indexed for human-friendliness
+    }
+  })
 }
 
 /** GitHub-style slugify: lowercase, replace non-alphanumerics with

@@ -139,6 +139,37 @@ export function* streamEmbeddedChunks(
   }
 }
 
+/** Fetch one chunk by `(docId, idx)`. Returns `null` when the row
+ *  doesn't exist — the caller decides whether that's an error
+ *  (mcp `get_chunk` translates it into a structured message). */
+export function getChunk(docId: string, idx: number): Chunk | null {
+  const row = db()
+    .prepare(
+      'SELECT idx, text, embedding, embed_dim FROM chunks WHERE doc_id = ? AND idx = ?',
+    )
+    .get(docId, idx) as
+    | { idx: number; text: string; embedding: Buffer | null; embed_dim: number | null }
+    | undefined
+  if (!row) return null
+  const f = decodeEmbedding(row.embedding, row.embed_dim)
+  return {
+    idx: row.idx,
+    text: row.text,
+    embedding: f ? Array.from(f) : [],
+  }
+}
+
+/** Number of chunks indexed for a doc. Powers `get_chunk`'s
+ *  "out of range" error so the agent gets a hint of how big the
+ *  doc is. */
+export function chunkCount(docId: string): number {
+  return (
+    db()
+      .prepare('SELECT COUNT(*) AS n FROM chunks WHERE doc_id = ?')
+      .get(docId) as { n: number }
+  ).n
+}
+
 export function count(): number {
   return (db().prepare('SELECT COUNT(*) AS n FROM chunks').get() as { n: number }).n
 }

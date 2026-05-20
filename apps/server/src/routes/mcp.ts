@@ -154,6 +154,19 @@ const TOOLS = [
     },
   },
   {
+    name: 'get_chunk',
+    description:
+      "Return one chunk's text by index. Chunks are the ingest-time splits search_knowledge ranks against; pair this with search_knowledge results (whose `chunkIdx` you can pass back here) to read the exact passage that matched.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        idx: { type: 'number', description: 'Zero-based chunk index.' },
+      },
+      required: ['id', 'idx'],
+    },
+  },
+  {
     name: 'replace_section',
     description:
       "Replace the body under a heading with new content. The heading line itself is preserved. Use this instead of full-overwrite upload_text when you only need to change one section.",
@@ -534,6 +547,31 @@ async function handleCall(token: ApiToken, name: string, args: any) {
   // matching here would surprise agents in subtle ways. If multiple
   // headings have the same text, the first is used; callers should
   // disambiguate by adding context to the heading text.
+
+  if (name === 'get_chunk') {
+    const id = String(args?.id ?? '')
+    const idx = Number(args?.idx)
+    if (!id) throw new Error('id required')
+    if (!Number.isInteger(idx) || idx < 0) throw new Error('idx must be a non-negative integer')
+    const meta = await loadMeta(id)
+    if (!meta) throw new Error('document not found')
+    const { userCanRead } = await import('../stores/documents.js')
+    if (!userCanRead(meta, actingUser, token.role)) throw new Error('forbidden')
+    const { getChunk, chunkCount } = await import('../db/chunksRepo.js')
+    const chunk = getChunk(id, idx)
+    if (!chunk) {
+      const total = chunkCount(id)
+      throw new Error(
+        total === 0
+          ? `document has no chunks yet (ingest may still be running)`
+          : `chunk index out of range (got ${idx}, document has ${total} chunk${total === 1 ? '' : 's'} 0..${total - 1})`,
+      )
+    }
+    return {
+      content: [{ type: 'text', text: chunk.text }],
+      structuredContent: { idx: chunk.idx, text: chunk.text },
+    }
+  }
 
   if (
     name === 'get_outline' ||
