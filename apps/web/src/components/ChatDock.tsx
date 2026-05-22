@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
-import { Send, Trash2, Square, X, Sparkles, FileText, ChevronDown, ChevronRight, Loader2, AlertCircle, Copy, Check, RefreshCw, ThumbsDown, Brain } from 'lucide-react'
+import { Send, Trash2, Square, X, Sparkles, FileText, ChevronDown, ChevronRight, Loader2, AlertCircle, Copy, Check, RefreshCw, ThumbsDown, Brain, Quote, BookText, List, Search as SearchIcon, FileEdit, MessageSquare, Plus, Eye } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -10,10 +10,15 @@ import {
   chatStream,
   type ChatMessageDTO,
   type ChatCitationDTO,
+  type ChatThreadDTO,
   type DocumentMeta,
   type MemoryUsedDTO,
+  type ToolTraceEntryDTO,
 } from '../lib/api'
-import { useConfirm } from '../lib/confirm'
+import { useConfirm, usePrompt } from '../lib/confirm'
+import { ProposedEditCard } from './ProposedEditCard'
+import { ReasoningTrace } from './ReasoningTrace'
+import { MentionMenu, type MentionDoc } from './MentionMenu'
 
 type Props = {
   meta: DocumentMeta | null
@@ -27,6 +32,17 @@ type Props = {
    *  can clear its state. */
   pendingMessage?: string | null
   onPendingConsumed?: () => void
+  /** External trigger from the "Reply with Reader AI" popover
+   *  action. Unlike pendingMessage this is NOT auto-sent — it
+   *  becomes a quote chip above the composer and the user types
+   *  their freeform question against it. Cleared via
+   *  onPendingQuoteConsumed once ChatDock takes ownership. */
+  pendingQuote?: string | null
+  onPendingQuoteConsumed?: () => void
+  /** Called after the user successfully Applies a proposed edit
+   *  on a chat turn, so the parent doc viewer can refetch its
+   *  body + meta and reflect the new content without a reload. */
+  onDocEdited?: () => void
 }
 
 /**
@@ -48,15 +64,58 @@ type Props = {
 const INITIAL_WINDOW = 50
 const WINDOW_STEP = 50
 
-export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: Props) {
+export function ChatDock({
+  meta,
+  onClose,
+  pendingMessage,
+  onPendingConsumed,
+  pendingQuote,
+  onPendingQuoteConsumed,
+  onDocEdited,
+}: Props) {
   const navigate = useNavigate()
   const confirmDialog = useConfirm()
+  const promptDialog = usePrompt()
+  /** Threads available for this (doc, user). The dropdown menu in
+   *  the header lists these by most-recent-activity. */
+  const [threads, setThreads] = useState<ChatThreadDTO[]>([])
+  /** Currently visible thread. Null until the initial threads load
+   *  picks one (or creates a fresh one for empty docs). All chat
+   *  messages displayed are scoped to this id. */
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null)
+  const [threadMenuOpen, setThreadMenuOpen] = useState(false)
+  /** Ref to the header chevron button. Passed to ThreadMenu so its
+   *  close-on-outside-click handler excludes this button — otherwise
+   *  clicking the trigger fires the document listener (close) and
+   *  immediately the trigger's onClick (open again), causing a
+   *  visible flicker. */
+  const threadTriggerRef = useRef<HTMLButtonElement | null>(null)
   const [messages, setMessages] = useState<ChatMessageDTO[]>([])
   const [draft, setDraft] = useState('')
+  /** Quoted excerpt from a "Reply with Reader AI" click — sits as
+   *  a chip above the composer. On send it's prepended to the
+   *  outgoing message as a single-line blockquote so the model
+   *  sees: > "<excerpt>"\n\n<user question>. Cleared after send
+   *  or via the chip's dismiss button. */
+  const [quote, setQuote] = useState<string | null>(null)
+  /** Docs the user has @-mentioned. Forced into the agent's context
+   *  for the next turn alongside the anchor doc. Cleared after send,
+   *  or via the chip's × button. */
+  const [attachedDocs, setAttachedDocs] = useState<MentionDoc[]>([])
+  /** When non-null, the user is mid-mention. Holds the partial query
+   *  (text after the most recent unclosed `@`) and the textarea
+   *  index where the `@` sits — used to remove the token after the
+   *  user picks a doc. */
+  const [mentionState, setMentionState] = useState<{ query: string; atIndex: number } | null>(null)
   const [streaming, setStreaming] = useState(false)
   const [streamText, setStreamText] = useState('')
   const [streamCitations, setStreamCitations] = useState<ChatCitationDTO[]>([])
   const [streamMemoriesUsed, setStreamMemoriesUsed] = useState<MemoryUsedDTO[]>([])
+  /** Agent tool-call trace for the in-flight stream. Persisted onto
+   *  the assistant turn at the end so the rendered bubble carries
+   *  the same "Reasoning" accordion once the message lands in
+   *  history. */
+  const [streamToolTrace, setStreamToolTrace] = useState<ToolTraceEntryDTO[]>([])
   const [streamPhase, setStreamPhase] = useState<'retrieving' | 'generating' | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [windowSize, setWindowSize] = useState(INITIAL_WINDOW)
@@ -86,25 +145,71 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
    *  would otherwise POST the same message to the server twice and
    *  persist a duplicate user turn. */
   const consumedRef = useRef<string | null>(null)
+  /** Messages the user clicked send on WHILE a stream was already
+   *  running. Drained by the in-flight stream's `done` handler so
+   *  the user can keep typing follow-ups without waiting. */
+  const pendingSendsRef = useRef<string[]>([])
+  /** Snapshot of the composer state at the moment the active
+   *  stream's question was sent. Lets handleStop restore the
+   *  question (raw text + quote + @-attachments) into the composer
+   *  so the user can edit and retry without retyping. Cleared
+   *  when the stream completes successfully. */
+  const lastSentRef = useRef<{
+    rawDraft: string
+    quote: string | null
+    attachedDocs: MentionDoc[]
+  } | null>(null)
 
-  // Load history when the doc changes. If the last turn is a
-  // user turn with no following assistant reply AND it was sent
-  // recently, a background generation is probably in flight on
-  // the server (the user navigated away mid-stream). Poll for the
-  // assistant turn to land — matching Notion AI's "you can leave
-  // and come back" behavior.
+  // Reset per-doc state when the doc changes. Critical that this
+  // ONLY runs on meta.id change — the polling effect below also
+  // depends on activeThreadId, and if we reset here on every
+  // activeThreadId change we'd nuke the just-set thread back to
+  // null in a loop, ending up on the empty state after a
+  // successful generation.
   useEffect(() => {
-    if (!meta) return
-    let cancelled = false
     setError(null)
     setWindowSize(INITIAL_WINDOW)
     setHistoryLoaded(false)
-    // Doc changed → previous doc's consumed token is no longer
-    // relevant; clear so a new pendingMessage for this doc can fire.
+    setActiveThreadId(null)
+    setThreads([])
+    setThreadMenuOpen(false)
     consumedRef.current = null
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meta?.id])
+
+  // Load history when the doc changes OR the active thread changes.
+  // If the last turn is a user turn with no following assistant
+  // reply AND it was sent recently, a background generation is
+  // probably in flight on the server (the user navigated away
+  // mid-stream). Poll for the assistant turn to land — matching
+  // Notion AI's "you can leave and come back" behavior.
+  useEffect(() => {
+    if (!meta) return
+    let cancelled = false
 
     const poll = async (markLoaded: boolean) => {
-      const r = await api.chatHistory(meta.id).catch(() => null)
+      // First call after mount: load the thread list so the header
+      // dropdown is populated and we know which thread to default
+      // to (most-recently-active). Subsequent polls reuse the
+      // already-resolved activeThreadId.
+      const tlist = await api.listChatThreads(meta.id).catch(() => null)
+      if (cancelled) return false
+      if (tlist) setThreads(tlist.threads)
+      // Pick a thread to load messages from. If we already chose
+      // one earlier (user switched threads), respect that. Otherwise
+      // default to most-recent or null when there are none yet.
+      let targetThreadId = activeThreadId
+      if (!targetThreadId) {
+        targetThreadId = tlist && tlist.threads.length > 0 ? tlist.threads[0].id : null
+        if (targetThreadId) setActiveThreadId(targetThreadId)
+      }
+      // No thread = no messages to fetch yet.
+      if (!targetThreadId) {
+        setMessages([])
+        if (markLoaded) setHistoryLoaded(true)
+        return false
+      }
+      const r = await api.chatHistory(meta.id, targetThreadId).catch(() => null)
       if (cancelled || !r) return false
       setMessages(r.messages)
       if (markLoaded) setHistoryLoaded(true)
@@ -135,7 +240,8 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
       cancelled = true
       if (timer) clearTimeout(timer)
     }
-  }, [meta?.id])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [meta?.id, activeThreadId])
 
   useEffect(() => {
     if (!threadEndRef.current) return
@@ -157,7 +263,10 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
     const el = inputRef.current
     if (!el) return
     el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 140)}px`
+    // Floor is the min-h-[44px] baseline (~2 visible rows). Ceiling
+    // bumped from 140 → 200 so longer drafts breathe without
+    // forcing the user to scroll inside a cramped textarea.
+    el.style.height = `${Math.max(44, Math.min(el.scrollHeight, 200))}px`
   }, [draft])
 
   // Consume externally-pushed messages (e.g. the selection popover's
@@ -180,6 +289,18 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingMessage, meta?.id, historyLoaded])
 
+  // Consume an externally-pushed quote (e.g. the selection popover's
+  // "Reply with Reader AI" button). Quotes are NOT auto-sent — they
+  // park above the composer until the user types their question and
+  // hits send. We focus the textarea so the user can type immediately.
+  useEffect(() => {
+    if (!pendingQuote || !meta) return
+    setQuote(pendingQuote)
+    onPendingQuoteConsumed?.()
+    setTimeout(() => inputRef.current?.focus(), 0)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingQuote, meta?.id])
+
   const visibleMessages = useMemo(() => {
     if (messages.length <= windowSize) return messages
     return messages.slice(messages.length - windowSize)
@@ -196,13 +317,52 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
     // explicitText lets external callers (selection popover, etc.)
     // bypass the controlled draft input. When omitted, falls back
     // to whatever the user has typed.
-    const text = (explicitText ?? draft).trim()
-    if (!text || streaming || !indexedOk) return
+    const userText = (explicitText ?? draft).trim()
+    if (!userText || !indexedOk) return
+    // Already streaming → queue the new message and clear the
+    // draft. The done-handler for the in-flight stream drains the
+    // queue when it completes (or aborts cleanly). Lets the user
+    // keep typing follow-ups without waiting.
+    if (streaming) {
+      pendingSendsRef.current.push(userText)
+      setDraft('')
+      setQuote(null)
+      setMentionState(null)
+      return
+    }
+    // If the user clicked "Reply" on a selection, prepend the quote
+    // as a blockquote line so the model sees the excerpt as context.
+    // The server's selection-isolation regex (`> "…"`) treats this
+    // as a fresh topic and strips history. Quote always uses the
+    // original selection — don't include it when an explicit string
+    // was passed in (those come from buttons that already encode
+    // their own context, e.g. "Explain this: …").
+    const text =
+      !explicitText && quote
+        ? `> "${quote.replace(/"/g, '\\"')}"\n\n${userText}`
+        : userText
+    // Snapshot composer state BEFORE clearing — so handleStop can
+    // restore the question (raw text + quote + attached docs)
+    // into the composer if the user aborts mid-stream. We capture
+    // the freeform draft (not the wrapped `> "…"` form) because
+    // the restoration path resets the quote chip separately.
+    lastSentRef.current = {
+      rawDraft: explicitText ?? userText,
+      quote: !explicitText ? quote : null,
+      attachedDocs: [...attachedDocs],
+    }
     setDraft('')
+    setQuote(null)
+    // Snapshot attached docs for this turn, then clear so the next
+    // turn starts fresh. The IDs flow through chatStream's opts.
+    const turnAttachedDocIds = attachedDocs.map((d) => d.docId)
+    setAttachedDocs([])
+    setMentionState(null)
     setError(null)
     setStreamText('')
     setStreamCitations([])
     setStreamMemoriesUsed([])
+    setStreamToolTrace([])
     setStreamPhase('retrieving')
     setMessages((cur) => [
       ...cur,
@@ -228,10 +388,30 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
           if (e.kind === 'meta') {
             // Server has finished retrieval and is now feeding the
             // model. Surface the chunks it pulled so the user can
-            // inspect what context the answer is grounded in.
+            // inspect what context the answer is grounded in. Also
+            // capture the threadId — important for brand-new chats
+            // where the client didn't know the threadId before the
+            // stream started; without this the cancel endpoint
+            // would have no thread to abort.
             setStreamCitations(e.citations)
             setStreamMemoriesUsed(e.memoriesUsed ?? [])
+            if (e.threadId) setActiveThreadId((cur) => cur ?? e.threadId!)
             setStreamPhase('generating')
+          } else if (e.kind === 'tool_call_start') {
+            setStreamToolTrace((cur) => [
+              ...cur,
+              { id: e.id, name: e.name, args: e.args },
+            ])
+          } else if (e.kind === 'tool_call_result') {
+            setStreamToolTrace((cur) =>
+              cur.map((t) => (t.id === e.id ? { ...t, ok: e.ok, summary: e.summary } : t)),
+            )
+          } else if (e.kind === 'thinking_text') {
+            // Surfaced for completeness but not rendered as a chip
+            // — the tool trace already captures the agent's
+            // reasoning shape. Kept here so the event isn't
+            // silently dropped (useful for future debug surfacing).
+            void e.text
           } else if (e.kind === 'token') {
             accumulated += e.token
             setStreamText(accumulated)
@@ -243,25 +423,35 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
             // (persisted turn + transient banner).
             setError(e.error)
             api
-              .chatHistory(meta.id)
+              .chatHistory(meta.id, activeThreadId ?? undefined)
               .then((r) => {
                 setMessages(r.messages)
                 setError(null)
               })
               .catch(() => {/* keep local state */})
           } else if (e.kind === 'done') {
+            // Stream succeeded — drop the restoration snapshot so a
+            // later Stop doesn't replay a stale question.
+            lastSentRef.current = null
             // Reload history FIRST, then clear streaming state. If
             // we cleared eagerly, there's a render-frame window
             // where neither `streamText` nor `messages` holds the
             // assistant turn, and the answer briefly vanishes.
             api
-              .chatHistory(meta.id)
+              .chatHistory(meta.id, activeThreadId ?? undefined)
               .then((r) => {
                 setMessages(r.messages)
                 setStreamText('')
                 setStreamCitations([])
                 setStreamMemoriesUsed([])
+                setStreamToolTrace([])
                 setStreamPhase(null)
+                // The server may have created a thread if we had none —
+                // refresh the thread list and adopt it.
+                if (r.threadId && r.threadId !== activeThreadId) {
+                  setActiveThreadId(r.threadId)
+                }
+                api.listChatThreads(meta.id).then((t) => setThreads(t.threads)).catch(() => {/**/})
               })
               .catch(() => {
                 // History fetch failed — clear stream state anyway
@@ -270,11 +460,16 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
                 setStreamText('')
                 setStreamCitations([])
                 setStreamMemoriesUsed([])
+                setStreamToolTrace([])
                 setStreamPhase(null)
               })
           }
         },
         ac.signal,
+        {
+          ...(activeThreadId ? { threadId: activeThreadId } : null),
+          ...(turnAttachedDocIds.length > 0 ? { attachedDocs: turnAttachedDocIds } : null),
+        },
       )
     } catch (e) {
       if ((e as Error)?.name !== 'AbortError') {
@@ -283,11 +478,57 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
     } finally {
       setStreaming(false)
       abortRef.current = null
+      // Drain any messages the user queued while this stream was
+      // in flight. Fire the next send on a microtask so React has
+      // a chance to flush setStreaming(false) — otherwise the
+      // recursive call would see streaming=true and re-queue.
+      if (pendingSendsRef.current.length > 0) {
+        const next = pendingSendsRef.current.shift()!
+        setTimeout(() => { void handleSend(next) }, 0)
+      }
     }
   }
 
   const handleStop = () => {
+    // Tell the server to mark this stream as user-cancelled +
+    // delete the user turn that triggered it. Then abort the
+    // local fetch. Order matters — calling cancel first ensures
+    // the server's flag is set before the route's catch fires.
+    if (meta && activeThreadId) {
+      void api.cancelChatStream(meta.id, activeThreadId).catch(() => {/**/})
+    }
     abortRef.current?.abort()
+    // Drop the optimistic user turn locally so the bubble vanishes
+    // alongside the aborted answer (matches the server-side delete).
+    setMessages((cur) => {
+      // Drop the most-recent user turn (the one whose stream we
+      // just cancelled). It always sits at the end of the list at
+      // the moment Stop is clicked.
+      for (let i = cur.length - 1; i >= 0; i--) {
+        if (cur[i].role === 'user') {
+          return [...cur.slice(0, i), ...cur.slice(i + 1)]
+        }
+      }
+      return cur
+    })
+    // Restore the stopped question into the composer so the user
+    // can edit + retry without retyping. Only restore when the
+    // composer is empty / clean — if the user has already started
+    // typing a follow-up (or queued one), we don't clobber it.
+    const snap = lastSentRef.current
+    const composerIsClean =
+      !draft.trim() && !quote && attachedDocs.length === 0 && pendingSendsRef.current.length === 0
+    if (snap && composerIsClean) {
+      setDraft(snap.rawDraft)
+      setQuote(snap.quote)
+      setAttachedDocs(snap.attachedDocs)
+      setTimeout(() => inputRef.current?.focus(), 0)
+    }
+    lastSentRef.current = null
+    // Also drain any queued follow-ups — the user explicitly hit
+    // Stop, so the safest behaviour is to clear the queue rather
+    // than fire the next message into a freshly-empty thread.
+    pendingSendsRef.current = []
     // Aborts cancel the in-flight regen — drop the anchor so the
     // inline streaming bubble (which has nothing more to fill) hides.
     setRegenAnchorUserId(null)
@@ -298,6 +539,49 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
    *  drops the stale assistant row and doesn't persist a new user
    *  turn, so the thread stays `(Q, A')` rather than growing into
    *  `(Q, Q, A')`. */
+  /** Lift a previous user question back into the composer so the
+   *  user can edit it and resend. Deletes the old user turn + its
+   *  paired assistant turn from the server so the chat history
+   *  doesn't accumulate stale Q+A pairs every time the user edits.
+   *  The composer's textarea gets focused at the end. */
+  const handleEditQuestion = async (userMsgId: string) => {
+    if (streaming || !meta) return
+    const idx = messages.findIndex((m) => m.id === userMsgId)
+    if (idx < 0) return
+    const userMsg = messages[idx]
+    if (userMsg.role !== 'user') return
+    // The assistant turn that followed (if any). Edit drops both.
+    const assistantAfter = messages[idx + 1]?.role === 'assistant' ? messages[idx + 1] : null
+    // Re-fill the composer with the original content. If the
+    // message was a Reply-quote (`> "…"` prefix), restore the
+    // quote chip + the freeform question separately.
+    const replyMatch = userMsg.content.match(/^\s*>\s*"([^]*?)"\s*\n+([^]*)$/)
+    if (replyMatch) {
+      setQuote(replyMatch[1])
+      setDraft(replyMatch[2].trim())
+    } else {
+      setQuote(null)
+      setDraft(userMsg.content)
+    }
+    // Optimistically drop the pair locally so the UI updates
+    // immediately. Server delete + history refresh confirms.
+    setMessages((cur) => cur.filter((m) => {
+      if (m.id === userMsg.id) return false
+      if (assistantAfter && m.id === assistantAfter.id) return false
+      return true
+    }))
+    try {
+      await api.deleteChatMessage(meta.id, userMsg.id)
+      if (assistantAfter) {
+        await api.deleteChatMessage(meta.id, assistantAfter.id).catch(() => {/**/})
+      }
+    } catch {
+      /* if server delete fails, the next history refresh will
+       * surface the rows again — UX is recoverable. */
+    }
+    setTimeout(() => inputRef.current?.focus(), 0)
+  }
+
   const handleRegenerate = (assistantId: string) => {
     if (streaming || !indexedOk) return
     const idx = messages.findIndex((m) => m.id === assistantId)
@@ -315,6 +599,7 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
     setStreamText('')
     setStreamCitations([])
     setStreamMemoriesUsed([])
+    setStreamToolTrace([])
     setStreamPhase('retrieving')
     setStreaming(true)
     const ac = new AbortController()
@@ -327,12 +612,23 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
             setStreamCitations(e.citations)
             setStreamMemoriesUsed(e.memoriesUsed ?? [])
             setStreamPhase('generating')
+          } else if (e.kind === 'tool_call_start') {
+            setStreamToolTrace((cur) => [
+              ...cur,
+              { id: e.id, name: e.name, args: e.args },
+            ])
+          } else if (e.kind === 'tool_call_result') {
+            setStreamToolTrace((cur) =>
+              cur.map((t) => (t.id === e.id ? { ...t, ok: e.ok, summary: e.summary } : t)),
+            )
+          } else if (e.kind === 'thinking_text') {
+            void e.text
           } else if (e.kind === 'token') {
             accumulated += e.token
             setStreamText(accumulated)
           } else if (e.kind === 'error') {
             setError(e.error)
-            api.chatHistory(meta.id).then((r) => {
+            api.chatHistory(meta.id, activeThreadId ?? undefined).then((r) => {
               setMessages(r.messages)
               setError(null)
               // Clear regen anchor only after history loads so the
@@ -344,12 +640,13 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
             })
           } else if (e.kind === 'done') {
             api
-              .chatHistory(meta.id)
+              .chatHistory(meta.id, activeThreadId ?? undefined)
               .then((r) => {
                 setMessages(r.messages)
                 setStreamText('')
                 setStreamCitations([])
                 setStreamMemoriesUsed([])
+                setStreamToolTrace([])
                 setStreamPhase(null)
                 setRegenAnchorUserId(null)
               })
@@ -357,11 +654,12 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
                 setStreamText('')
                 setStreamCitations([])
                 setStreamMemoriesUsed([])
+                setStreamToolTrace([])
                 setStreamPhase(null)
                 setRegenAnchorUserId(null)
               })
           }
-        }, ac.signal, { regenerateOf: assistantId })
+        }, ac.signal, { regenerateOf: assistantId, threadId: activeThreadId ?? undefined })
       } catch (e) {
         if ((e as Error)?.name !== 'AbortError') {
           setError((e as Error)?.message ?? 'chat failed')
@@ -379,20 +677,38 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
     })()
   }
 
-  const handleClear = async () => {
-    const ok = await confirmDialog({
-      title: 'Clear chat history?',
-      message: `All messages with Reader AI in "${filename}" will be deleted. This can't be undone.`,
-      confirmLabel: 'Clear',
-      cancelLabel: 'Keep',
-      destructive: true,
-    })
-    if (!ok) return
-    await api.chatClear(meta.id).catch(() => null)
-    setMessages([])
-    setStreamText('')
-    setStreamCitations([])
-    setError(null)
+  const currentThread = activeThreadId
+    ? threads.find((t) => t.id === activeThreadId) ?? null
+    : null
+
+  /** Spawn a fresh thread and switch to it.
+   *
+   *  Anti-spam: if the active thread already has zero messages
+   *  (it's a "New chat" the user hasn't typed into yet), we don't
+   *  create another one — we just focus the composer. Otherwise
+   *  hammering the New-chat button would accumulate empty rows
+   *  in the dropdown. */
+  const handleNewThread = async () => {
+    if (!meta) return
+    if (activeThreadId && messages.length === 0) {
+      setTimeout(() => inputRef.current?.focus(), 0)
+      return
+    }
+    try {
+      const r = await api.createChatThread(meta.id)
+      setThreads((cur) => [r.thread, ...cur.filter((t) => t.id !== r.thread.id)])
+      setActiveThreadId(r.thread.id)
+      setMessages([])
+      setStreamText('')
+      setStreamCitations([])
+      setStreamMemoriesUsed([])
+      setStreamToolTrace([])
+      setStreamPhase(null)
+      setError(null)
+      setTimeout(() => inputRef.current?.focus(), 0)
+    } catch {
+      /* swallow — user can retry */
+    }
   }
 
   /** Submit a thumbs-down correction to the failure log. The
@@ -401,6 +717,19 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
    *  avoids repeating the mistake. Errors are swallowed silently
    *  by the bubble's local state — UX-wise the worst case is the
    *  "Saving…" indicator never flips, which is enough signal. */
+  /** Refresh history from the server. Called after Apply / Discard
+   *  on a proposed edit so the persisted state (editAppliedAt,
+   *  pendingEdit cleared) flows back into the rendered messages. */
+  const reloadHistory = async () => {
+    if (!meta) return
+    try {
+      const r = await api.chatHistory(meta.id, activeThreadId ?? undefined)
+      setMessages(r.messages)
+    } catch {
+      /* keep optimistic local state on transient failure */
+    }
+  }
+
   const handleFeedback = async (note: {
     messageId: string
     question: string
@@ -426,13 +755,13 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
       style={showDividerAbove ? { borderColor: 'var(--border-soft)' } : undefined}
     >
       <div
-        className="text-[10px] uppercase tracking-wider font-semibold mb-1"
+        className="text-[10px] uppercase tracking-wider font-semibold mb-1.5"
         style={{ color: 'var(--fg-subtle)' }}
       >
         Reader AI
       </div>
       {streaming && streamPhase && (
-        <div className="mb-3">
+        <div className="mb-1.5">
           <PhaseIndicator
             phase={streamPhase}
             sourceCount={distinctSourceCount(streamCitations)}
@@ -450,6 +779,9 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
       )}
       {streamMemoriesUsed.length > 0 && (
         <UsedMemoryFooter memories={streamMemoriesUsed} className="mb-3" />
+      )}
+      {streamToolTrace.length > 0 && (
+        <ReasoningTrace entries={streamToolTrace} streaming={streaming} />
       )}
       {streamText && (
         <div className="chat-md mt-2">
@@ -476,29 +808,41 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
 
   return (
     <aside
-      className="w-[380px] shrink-0 border-l flex flex-col"
-      style={{ borderColor: 'var(--border-soft)', background: 'var(--panel)' }}
+      className="w-[380px] shrink-0 border-l flex flex-col relative"
+      style={{ borderColor: 'var(--border-soft)', background: 'var(--bg)' }}
     >
-      {/* Header height pinned to h-10 so it lines up exactly with
-          the Outline aside's header when both rails are open. */}
+      {/* Header height pinned to h-11 so the h-7 trigger button
+          has 8px of vertical air top + bottom, matching the px-2
+          side gaps. The Outline aside's header uses the same h-11
+          so both rails align when open. */}
       <div
-        className="sticky top-0 h-10 px-3 border-b flex items-center gap-2 shrink-0"
-        style={{ background: 'var(--panel-2)', borderColor: 'var(--border-soft)' }}
+        className="sticky top-0 z-30 h-11 px-2 border-b flex items-center gap-1 shrink-0 relative"
+        style={{ background: 'var(--bg)', borderColor: 'var(--border-soft)' }}
       >
-        <Sparkles size={11} className="text-accent shrink-0" />
-        <span className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex-1 truncate">
-          Ask about {filename}
-        </span>
-        {hasHistory && (
-          <button
-            className="btn-ghost h-6 w-6 px-0"
-            onClick={handleClear}
-            title="Clear chat history for this document"
-            aria-label="Clear"
-          >
-            <Trash2 size={11} />
-          </button>
-        )}
+        {/* Thread switcher dropdown. Click opens a popover listing
+            every thread for this (doc, user) plus a "New chat"
+            row at the top. Mirrors Notion AI's "New AI chat ▾". */}
+        <button
+          ref={threadTriggerRef}
+          type="button"
+          onClick={() => setThreadMenuOpen((v) => !v)}
+          className="flex-1 min-w-0 h-7 px-3 inline-flex items-center gap-2 rounded transition-colors hover:bg-[var(--hover)]"
+          aria-expanded={threadMenuOpen}
+        >
+          <Sparkles size={11} className="text-accent shrink-0" />
+          <span className="flex-1 min-w-0 truncate text-[12.5px] font-semibold text-fg text-left">
+            {currentThread?.title ?? (hasHistory ? 'Conversation' : 'New chat')}
+          </span>
+          <ChevronDown size={11} className="text-subtle shrink-0" />
+        </button>
+        <button
+          className="btn-ghost h-6 w-6 px-0"
+          onClick={handleNewThread}
+          title="New chat"
+          aria-label="New chat"
+        >
+          <Sparkles size={11} />
+        </button>
         <button
           className="btn-ghost h-6 w-6 px-0"
           onClick={onClose}
@@ -507,43 +851,134 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
         >
           <X size={12} />
         </button>
+        {threadMenuOpen && (
+          <ThreadMenu
+            threads={threads}
+            activeId={activeThreadId}
+            triggerRef={threadTriggerRef}
+            onPick={(id) => {
+              setThreadMenuOpen(false)
+              if (id !== activeThreadId) {
+                setActiveThreadId(id)
+              }
+            }}
+            onCreate={() => {
+              setThreadMenuOpen(false)
+              handleNewThread()
+            }}
+            onRename={async (id, current) => {
+              const next = await promptDialog({
+                title: 'Rename chat',
+                placeholder: 'Chat name',
+                defaultValue: current,
+                confirmLabel: 'Rename',
+              })
+              const trimmed = next?.trim()
+              if (!trimmed || trimmed === current) return
+              try {
+                if (!meta) return
+                await api.renameChatThread(meta.id, id, trimmed)
+                const r = await api.listChatThreads(meta.id)
+                setThreads(r.threads)
+              } catch {/* swallow — user can retry */}
+            }}
+            onDelete={async (id) => {
+              if (!meta) return
+              const ok = await confirmDialog({
+                title: 'Delete chat',
+                message: 'Delete this chat and all its messages? This cannot be undone.',
+                destructive: true,
+              })
+              if (!ok) return
+              try {
+                await api.deleteChatThread(meta.id, id)
+                const r = await api.listChatThreads(meta.id)
+                setThreads(r.threads)
+                if (id === activeThreadId) {
+                  // Switch to the most-recent remaining thread or
+                  // null (lets the empty-state render).
+                  setActiveThreadId(r.threads[0]?.id ?? null)
+                  setMessages([])
+                }
+              } catch {/* swallow */}
+            }}
+            onClose={() => setThreadMenuOpen(false)}
+          />
+        )}
       </div>
 
-      <div className="flex-1 overflow-y-auto text-[13px]">
-        {!hasHistory && !streamText && !resuming && !streaming && (
-          // Centered empty state — vertically + horizontally
-          // anchored to the pane so the user lands on something
-          // welcoming instead of a dense top-aligned paragraph.
-          <div className="h-full flex flex-col items-center justify-center px-6 text-center">
-            <div
-              className="h-10 w-10 rounded-full inline-flex items-center justify-center mb-3"
-              style={{ background: 'var(--selected)', color: 'var(--accent)' }}
-            >
-              <Sparkles size={18} />
+      <div
+        className="flex-1 text-[13px]"
+        style={{ overflowY: threadMenuOpen ? 'hidden' : 'auto' }}
+      >
+        {historyLoaded && !hasHistory && !streamText && !resuming && !streaming && (
+          // Empty state — Notion-AI style. Bottom-anchored content
+          // block with a brief intro and a stack of clickable
+          // starter prompts. The composer is right below so the
+          // suggestions sit visually attached to it, inviting the
+          // user to either pick one or just start typing.
+          <div className="h-full flex flex-col justify-end px-4 pb-3">
+            <div className="flex flex-col items-start gap-3">
+              <div
+                className="h-9 w-9 rounded-full inline-flex items-center justify-center"
+                style={{ background: 'var(--selected)', color: 'var(--accent)' }}
+              >
+                <Sparkles size={16} />
+              </div>
+              {indexedOk ? (
+                <>
+                  <div>
+                    <div className="font-semibold text-fg text-[15px] leading-tight">
+                      Reader AI
+                    </div>
+                    <div className="text-[12.5px] text-subtle mt-0.5 leading-snug">
+                      Here are a few things I can do, or ask me anything.
+                    </div>
+                  </div>
+                  <div className="w-full flex flex-col gap-0.5 mt-1">
+                    <StarterPrompt
+                      icon={<BookText size={13} />}
+                      label="Summarize this document"
+                      onClick={() => handleSend('Summarize this document.')}
+                    />
+                    <StarterPrompt
+                      icon={<List size={13} />}
+                      label="Show the outline"
+                      onClick={() => handleSend('List the sections in this document.')}
+                    />
+                    <StarterPrompt
+                      icon={<SearchIcon size={13} />}
+                      label="Find a topic"
+                      onClick={() => {
+                        setDraft('Find the part about ')
+                        setTimeout(() => inputRef.current?.focus(), 0)
+                      }}
+                    />
+                    <StarterPrompt
+                      icon={<FileEdit size={13} />}
+                      label="Rewrite a section"
+                      onClick={() => {
+                        setDraft('Rewrite the ')
+                        setTimeout(() => inputRef.current?.focus(), 0)
+                      }}
+                    />
+                  </div>
+                </>
+              ) : (
+                <div>
+                  <div className="font-semibold text-fg text-[15px] leading-tight">
+                    Not indexed yet
+                  </div>
+                  <div className="text-[12.5px] text-subtle mt-0.5 leading-snug">
+                    Run <span className="font-medium text-fg">Index</span> from the toolbar so Reader AI can read this document.
+                  </div>
+                </div>
+              )}
             </div>
-            {indexedOk ? (
-              <>
-                <div className="font-semibold text-fg text-[14px]">
-                  Ask about {filename}
-                </div>
-                <div className="text-[12px] text-subtle mt-1 leading-relaxed max-w-[280px]">
-                  Reader AI answers from this document and related chunks in your vault.
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="font-semibold text-fg text-[14px]">
-                  This document isn't indexed yet
-                </div>
-                <div className="text-[12px] text-subtle mt-1 leading-relaxed max-w-[280px]">
-                  Run <span className="font-medium text-fg">Index</span> from the toolbar so Reader AI can read it.
-                </div>
-              </>
-            )}
           </div>
         )}
         {(hasHistory || streamText || streaming || resuming) && (
-        <div className="px-3 py-3" style={{ borderColor: 'var(--border-soft)' }}>
+        <div className="px-3 pt-1.5 pb-3" style={{ borderColor: 'var(--border-soft)' }}>
           {hiddenCount > 0 && (
             <div className="flex justify-center pb-2">
               <button
@@ -589,9 +1024,14 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
                 message={m}
                 showDividerAbove={showDivider}
                 precedingQuestion={precedingQuestion}
+                docId={meta.id}
                 onCitation={openCitation}
                 onRegenerate={handleRegenerate}
+                onEditQuestion={handleEditQuestion}
+                suppressHoverActions={false}
                 onFeedback={handleFeedback}
+                onEditChanged={reloadHistory}
+                onDocApplied={onDocEdited}
                 canRegenerate={!streaming}
               />
               {showStreamingInline && renderStreamingBubble(false)}
@@ -644,36 +1084,172 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
       {indexedOk && (
       <div
         className="shrink-0 px-3 py-2.5 relative"
-        style={{ borderTop: '1px solid var(--border-soft)', background: 'var(--panel-2)' }}
+        style={{ background: 'var(--bg)' }}
       >
         {/* Slash-command suggestions — popped above the composer
             when the draft starts with `/`. Click to accept the
             verb + a trailing space so the user can type the arg. */}
         <SlashMenu draft={draft} onAccept={(verb) => setDraft(verb + ' ')} />
+        {mentionState && (
+          <MentionMenu
+            query={mentionState.query}
+            attachedIds={attachedDocs.map((d) => d.docId)}
+            excludeDocId={meta.id}
+            onPick={(doc) => {
+              // Replace the user's `@<partial>` token with the full
+              // resolved mention (`@<filename>`) so the placement of
+              // the reference stays visible in the question text.
+              // Result reads like "Also check @document.md if you
+              // don't understand @document_2.md" — the model sees
+              // where each attached doc applies.
+              const at = mentionState.atIndex
+              const before = draft.slice(0, at)
+              const afterAt = draft.slice(at + 1)
+              const tokenEndRel = afterAt.search(/\s|$/)
+              const tokenEnd = at + 1 + (tokenEndRel === -1 ? afterAt.length : tokenEndRel)
+              const after = draft.slice(tokenEnd)
+              // Use the doc's filename as the mention label. Strip
+              // any trailing extension for compactness? No — keep
+              // the extension; matches how the chip renders.
+              const mentionLabel = `@${doc.name}`
+              // Always append a space after the mention so the user
+              // can keep typing immediately — even at end-of-input.
+              // Skip only when the next character is already
+              // whitespace (avoid double spaces in the middle of a
+              // sentence).
+              const trailingSpace = /^\s/.test(after) ? '' : ' '
+              setDraft(before + mentionLabel + trailingSpace + after)
+              setAttachedDocs((cur) =>
+                cur.some((d) => d.docId === doc.docId) ? cur : [...cur, doc],
+              )
+              setMentionState(null)
+              // Move the caret to just after the inserted mention +
+              // any trailing space we added.
+              setTimeout(() => {
+                const el = inputRef.current
+                if (!el) return
+                el.focus()
+                const caret = (before + mentionLabel + trailingSpace).length
+                el.setSelectionRange(caret, caret)
+              }, 0)
+            }}
+            onClose={() => setMentionState(null)}
+          />
+        )}
         <div
-          className="rounded-lg flex items-end gap-2 px-2.5 py-1.5"
+          className="rounded-lg"
           style={{
-            background: 'var(--bg)',
+            background: 'var(--panel-2)',
             border: '1px solid var(--border)',
           }}
         >
+          {/* Reply quote — when the user clicks "Reply" on a
+              selection, the excerpt parks here as a slim attached
+              row above the textarea. Single-line, italic, muted —
+              visually subordinate to the question the user is about
+              to type. Dismissable via X. */}
+          {quote && (
+            <div
+              className="flex items-center gap-1.5 px-2.5 py-1 text-[11.5px]"
+              style={{
+                borderBottom: '1px solid var(--border-soft)',
+                color: 'var(--fg-subtle)',
+              }}
+            >
+              <Quote size={10} className="shrink-0" />
+              <span
+                className="flex-1 min-w-0 truncate italic"
+                title={quote}
+              >
+                {quote}
+              </span>
+              <button
+                type="button"
+                className="shrink-0 h-4 w-4 inline-flex items-center justify-center rounded hover:bg-[var(--selected)]"
+                onClick={() => setQuote(null)}
+                aria-label="Remove quote"
+                title="Remove quote"
+              >
+                <X size={10} />
+              </button>
+            </div>
+          )}
+          {/* Mention chips row — the auto-attached anchor doc plus
+              any docs the user has @-mentioned. Anchor doc has no
+              dismiss; user-attached docs show an × on hover. Type
+              `@` in the textarea below to add more. */}
+          {indexedOk && (
+            <div className="px-2.5 pt-1.5 flex flex-wrap items-center gap-1">
+              <MentionChip
+                label={filename}
+                kind="anchor"
+                title={`Chat is grounded in ${filename}`}
+              />
+              {attachedDocs.map((d) => (
+                <MentionChip
+                  key={d.docId}
+                  label={d.name}
+                  kind="attached"
+                  title={d.path}
+                  onRemove={() => setAttachedDocs((cur) => cur.filter((x) => x.docId !== d.docId))}
+                />
+              ))}
+            </div>
+          )}
+          <div className="flex items-end gap-2 px-2.5 py-2">
           <textarea
             ref={inputRef}
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value
+              setDraft(next)
+              // Detect an unclosed `@token` — find the latest `@`
+              // preceded by whitespace or start-of-input, then take
+              // everything between it and the caret as the query.
+              // Closing the mention happens when the user types a
+              // space, deletes the `@`, or picks/escapes.
+              const caret = e.target.selectionStart ?? next.length
+              const upToCaret = next.slice(0, caret)
+              const atIndex = upToCaret.lastIndexOf('@')
+              if (atIndex === -1) {
+                setMentionState(null)
+                return
+              }
+              const charBefore = atIndex === 0 ? '' : upToCaret[atIndex - 1]
+              const isWordBoundary = atIndex === 0 || /\s/.test(charBefore)
+              const token = upToCaret.slice(atIndex + 1)
+              if (!isWordBoundary || /\s/.test(token)) {
+                setMentionState(null)
+                return
+              }
+              setMentionState({ query: token, atIndex })
+            }}
             onKeyDown={(e) => {
+              // When the mention popover is open, route Enter +
+              // arrow keys to it instead of sending the chat or
+              // moving the textarea caret. Without this gate React's
+              // synthetic onKeyDown fires before the document-level
+              // listener MentionMenu added, so Enter would send the
+              // message instead of picking the highlighted doc.
+              if (mentionState) {
+                if (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape') {
+                  // MentionMenu owns these keys while open.
+                  return
+                }
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault()
                 handleSend()
               }
             }}
-            placeholder={indexedOk ? `Ask about ${filename}  (try /remember)` : `Index ${filename} to enable chat`}
-            rows={1}
-            className="flex-1 resize-none bg-transparent outline-none text-[13px] leading-snug py-1"
+            placeholder={indexedOk ? `Ask Reader AI` : `Index ${filename} to enable chat`}
+            rows={2}
+            className="flex-1 resize-none bg-transparent outline-none text-[13px] leading-relaxed py-1 min-h-[44px]"
             style={{ color: 'var(--fg)' }}
-            disabled={!indexedOk || streaming}
+            disabled={!indexedOk}
           />
-          {streaming ? (
+          {streaming && !draft.trim() ? (
+            // Streaming AND nothing typed → Stop button.
             <button
               className="h-7 w-7 inline-flex items-center justify-center rounded-md"
               style={{ background: 'var(--selected)', color: 'var(--accent)' }}
@@ -682,6 +1258,19 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
               aria-label="Stop"
             >
               <Square size={11} />
+            </button>
+          ) : streaming ? (
+            // Streaming + user typed something → Queue button. The
+            // send handler detects `streaming` and pushes onto
+            // pendingSendsRef instead of starting a new request.
+            <button
+              className="h-7 w-7 inline-flex items-center justify-center rounded-md transition-opacity"
+              style={{ background: 'var(--accent)', color: 'white' }}
+              onClick={() => handleSend()}
+              title="Queue (send when current finishes)"
+              aria-label="Queue"
+            >
+              <Send size={11} />
             </button>
           ) : (
             <button
@@ -698,8 +1287,27 @@ export function ChatDock({ meta, onClose, pendingMessage, onPendingConsumed }: P
               <Send size={11} />
             </button>
           )}
+          </div>
         </div>
       </div>
+      )}
+      {/* Scrim overlay shown while the thread-switcher dropdown is
+          open. Lives at aside-level (not inside the scroll container)
+          so it covers the full chat area below the header — including
+          the composer — and doesn't get clipped by scroll bounds.
+          z-25 sits below the header's z-30 stacking context, so the
+          dropdown (z-50 inside the header) stays sharp on top. */}
+      {threadMenuOpen && (
+        <div
+          className="absolute left-0 right-0 bottom-0"
+          style={{
+            top: '44px',
+            background: 'rgba(0, 0, 0, 0.35)',
+            zIndex: 25,
+          }}
+          onClick={() => setThreadMenuOpen(false)}
+          aria-hidden="true"
+        />
       )}
     </aside>
   )
@@ -709,9 +1317,14 @@ function Bubble({
   message,
   showDividerAbove,
   precedingQuestion,
+  docId,
   onCitation,
   onRegenerate,
   onFeedback,
+  onEditChanged,
+  onDocApplied,
+  onEditQuestion,
+  suppressHoverActions,
   canRegenerate,
 }: {
   message: ChatMessageDTO
@@ -721,9 +1334,28 @@ function Bubble({
    *  failure log needs to know what the user asked, not just what
    *  the assistant got wrong. */
   precedingQuestion?: string
+  /** Doc id this thread is anchored on — needed by proposed-edit
+   *  cards so they can call the apply/discard endpoints. */
+  docId: string
   onCitation: (c: ChatCitationDTO) => void
   onRegenerate: (assistantId: string) => void
   onFeedback?: (note: { messageId: string; question: string; wrongAnswer: string; correction: string }) => Promise<void>
+  /** Called after Apply or Discard succeeds — parent refreshes
+   *  history so the persisted state flows back through props. */
+  onEditChanged?: () => void
+  /** Called specifically after Apply succeeds (NOT Discard) so the
+   *  parent doc viewer can refetch the doc body + meta and reflect
+   *  the new content without a reload. */
+  onDocApplied?: () => void
+  /** Called when the user clicks Edit on a USER turn. The parent
+   *  drops the old user+assistant pair, re-fills the composer
+   *  with the user's content, and focuses the textarea. */
+  onEditQuestion?: (userMsgId: string) => void
+  /** When true, hide all hover-revealed actions (Edit, Copy,
+   *  Regenerate, Wrong). Set while an overlay popover (thread
+   *  menu, slash menu, etc.) is open so the chips underneath
+   *  don't fade in/out as the overlay covers them. */
+  suppressHoverActions?: boolean
   canRegenerate: boolean
 }) {
   const [copied, setCopied] = useState(false)
@@ -765,7 +1397,7 @@ function Bubble({
       style={showDividerAbove ? { borderColor: 'var(--border-soft)' } : undefined}
     >
       <div
-        className="text-[10px] uppercase tracking-wider font-semibold mb-1"
+        className="text-[10px] uppercase tracking-wider font-semibold mb-1.5"
         style={{ color: isUser ? 'var(--accent)' : 'var(--fg-subtle)' }}
       >
         {isUser ? 'You' : 'Reader AI'}
@@ -775,6 +1407,9 @@ function Bubble({
           citations={message.citations}
           onCitation={onCitation}
         />
+      )}
+      {!isUser && !isErrored && message.toolTrace && message.toolTrace.length > 0 && (
+        <ReasoningTrace entries={message.toolTrace} />
       )}
       {isErrored ? (
         <ChatError raw={message.error as string} />
@@ -787,7 +1422,59 @@ function Bubble({
             // User question rendered in semibold + slightly larger
             // so it visually leads the turn — the AI reply below is
             // the body, the question is the headline.
-            <div className="whitespace-pre-wrap font-semibold text-[14px]">{message.content}</div>
+            //
+            // When the message came from the Reply popover it starts
+            // with a `> "…"` blockquote followed by the user's
+            // question. Render the two as a single composed unit —
+            // a thin accent-left quote tile glued to the question
+            // below — instead of two disconnected text blocks.
+            (() => {
+              const m = message.content.match(/^\s*>\s*"([^]*?)"\s*\n+([^]*)$/)
+              if (m) {
+                const [, quoted, question] = m
+                return (
+                  <div
+                    className="rounded-lg"
+                    style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}
+                  >
+                    <div
+                      className="flex items-start gap-1.5 px-2.5 py-1.5 text-[11.5px] leading-snug"
+                      style={{
+                        borderBottom: '1px solid var(--border-soft)',
+                        color: 'var(--fg-subtle)',
+                      }}
+                    >
+                      <Quote size={10} className="shrink-0 mt-0.5" />
+                      <span className="flex-1 min-w-0 italic break-words">
+                        {quoted}
+                      </span>
+                    </div>
+                    <div
+                      className="px-2.5 py-1.5 whitespace-pre-wrap font-semibold text-[14px]"
+                      style={{ color: 'var(--fg)' }}
+                    >
+                      {question.trim()}
+                    </div>
+                  </div>
+                )
+              }
+              // Plain user question (no Reply quote). Wrap in the
+              // same rounded gray tile as the quote+question
+              // composite so every user turn — quoted or not —
+              // reads as a defined card, not floating text.
+              return (
+                <div
+                  className="rounded-lg px-2.5 py-1.5 whitespace-pre-wrap font-semibold text-[14px]"
+                  style={{
+                    background: 'var(--panel-2)',
+                    border: '1px solid var(--border)',
+                    color: 'var(--fg)',
+                  }}
+                >
+                  {message.content}
+                </div>
+              )
+            })()
           ) : (
             <div className="chat-md">
               <ReactMarkdown
@@ -803,10 +1490,47 @@ function Bubble({
       {!isUser && !isErrored && message.memoriesUsed && message.memoriesUsed.length > 0 && (
         <UsedMemoryFooter memories={message.memoriesUsed} className="mt-1.5" />
       )}
+      {/* Edit-this-question affordance on user turns. Click pulls
+          the content back into the composer + drops the old Q+A
+          pair so the resend appears as a fresh turn at the bottom.
+          Only shown for non-streaming, non-error user turns. */}
+      {isUser && canRegenerate && !suppressHoverActions && message.id && !message.id.startsWith('local-') && onEditQuestion && (
+        <div className="mt-1 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            className="btn-ghost h-5 px-1.5 text-[10.5px]"
+            onClick={() => onEditQuestion(message.id)}
+            title="Edit and resend"
+          >
+            <FileEdit size={9} className="-mb-px" />
+            Edit
+          </button>
+        </div>
+      )}
+      {/* Proposed-edit cards. One per <proposed_edit> the model
+          emitted in this turn. Each renders its own pending /
+          applied / discarded / conflict state independently. */}
+      {!isUser && !isErrored && message.pendingEdit && message.pendingEdit.length > 0 && (
+        <div className="mt-1">
+          {message.pendingEdit.map((edit, i) => (
+            <ProposedEditCard
+              key={`${message.id}:${i}`}
+              docId={docId}
+              messageId={message.id}
+              edit={edit}
+              appliedAt={message.editAppliedAt}
+              onApplied={() => {
+                onEditChanged?.()
+                onDocApplied?.()
+              }}
+              onDiscarded={onEditChanged}
+            />
+          ))}
+        </div>
+      )}
       {/* Notion-AI-style row actions on the assistant's reply.
           Only shows on hover to keep the thread visually quiet,
           and only when the turn has real content (not on errors). */}
-      {!isUser && !isErrored && message.content && (
+      {!isUser && !isErrored && message.content && !suppressHoverActions && (
         <div className="mt-1.5 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
             className="btn-ghost h-5 px-1.5 text-[10.5px]"
@@ -904,10 +1628,247 @@ function Bubble({
  *  the SourcesPanel groups them. Keeps "Found N sources" in the
  *  phase indicator aligned with "N sources (this doc + vault)" in
  *  the collapsed panel. */
+/** A document tag in the chat composer's chips row. Two flavours:
+ *   • "anchor" — the doc the chat is bound to. No dismiss button;
+ *     subtle gray styling.
+ *   • "attached" — a doc the user @-mentioned. Accent-tinted with a
+ *     small × button to remove it. Reads as a deliberate tag, not a
+ *     passive label.
+ */
+function MentionChip({
+  label,
+  kind,
+  title,
+  onRemove,
+}: {
+  label: string
+  kind: 'anchor' | 'attached'
+  title?: string
+  onRemove?: () => void
+}) {
+  const isAttached = kind === 'attached'
+  return (
+    <span
+      className="group inline-flex items-center gap-1 px-1.5 h-5 rounded text-[11px] max-w-[60%]"
+      style={{
+        background: isAttached ? 'var(--selected)' : 'var(--bg)',
+        border: `1px solid ${isAttached ? 'color-mix(in srgb, var(--accent) 30%, transparent)' : 'var(--border-soft)'}`,
+        color: isAttached ? 'var(--accent)' : 'var(--fg-subtle)',
+      }}
+      title={title}
+    >
+      {isAttached ? (
+        <span className="font-semibold opacity-70">@</span>
+      ) : (
+        <FileText size={10} className="shrink-0" />
+      )}
+      <span className="truncate">{label}</span>
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={`Remove ${label}`}
+          title={`Remove ${label}`}
+          className="ml-0.5 inline-flex items-center justify-center w-3.5 h-3.5 rounded hover:bg-white/50"
+        >
+          <X size={8} />
+        </button>
+      )}
+    </span>
+  )
+}
+
 function distinctSourceCount(citations: ChatCitationDTO[]): number {
   const keys = new Set<string>()
   for (const c of citations) keys.add(c.docPath ?? c.docId)
   return keys.size
+}
+
+/** Thread switcher popover, opened from the header chevron. Lists
+ *  threads with most-recent first, plus a "New chat" row at the top
+ *  for quick spawn. Each row has hover-only rename / delete actions.
+ *  Click-outside closes the menu. */
+function ThreadMenu({
+  threads,
+  activeId,
+  triggerRef,
+  onPick,
+  onCreate,
+  onRename,
+  onDelete,
+  onClose,
+}: {
+  threads: ChatThreadDTO[]
+  activeId: string | null
+  /** The button that toggles this menu. Excluded from the close-on-
+   *  outside-click check; without this, clicking the trigger to
+   *  close fires the document listener (close), then the trigger's
+   *  onClick toggles back to open — producing a visible flicker. */
+  triggerRef: React.RefObject<HTMLElement | null>
+  onPick: (id: string) => void
+  onCreate: () => void
+  onRename: (id: string, current: string) => void
+  onDelete: (id: string) => void
+  onClose: () => void
+}) {
+  const ref = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node
+      if (ref.current && ref.current.contains(target)) return
+      if (triggerRef.current && triggerRef.current.contains(target)) return
+      onClose()
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [onClose, triggerRef])
+  const [hover, setHover] = useState<number>(-1)
+  return (
+    <div
+      ref={ref}
+      className="absolute left-2 right-2 top-full mt-2 z-50 rounded-md shadow-card overflow-hidden"
+      style={{
+        background: 'var(--panel)',
+        border: '1px solid var(--border)',
+      }}
+    >
+      {/* "Create" row at the top — mirrors TagsButton's "Create <tag>"
+          leading affordance. Plus icon + accent label, with the
+          border-bottom separating it from the saved-chats list below. */}
+      <button
+        type="button"
+        onClick={onCreate}
+        onMouseEnter={() => setHover(-1)}
+        className="w-full flex items-center gap-2 px-2.5 h-8 text-[12.5px] text-left text-fg"
+        style={{
+          borderBottom: threads.length > 0 ? '1px solid var(--border-soft)' : undefined,
+          ...(hover === -1 ? { background: 'var(--hover)' } : null),
+        }}
+      >
+        <Plus size={11} className="text-accent" />
+        <span className="text-fg">New chat</span>
+      </button>
+      <div className="max-h-[260px] overflow-y-auto">
+        {threads.length === 0 && (
+          <div className="px-2.5 py-2 text-[11.5px] text-subtle">
+            No saved chats yet.
+          </div>
+        )}
+        {threads.map((t, i) => {
+          const isActive = t.id === activeId
+          return (
+            <div
+              key={t.id}
+              className="group flex items-center gap-2 px-2.5 h-8 text-[12.5px]"
+              style={hover === i ? { background: 'var(--hover)' } : undefined}
+              onMouseEnter={() => setHover(i)}
+            >
+              <MessageSquare
+                size={11}
+                style={{ color: isActive ? 'var(--accent)' : 'var(--fg-subtle)' }}
+              />
+              <button
+                type="button"
+                onClick={() => onPick(t.id)}
+                className="flex-1 min-w-0 text-left truncate"
+                style={{
+                  color: isActive ? 'var(--accent)' : 'var(--fg)',
+                  fontWeight: isActive ? 600 : 400,
+                }}
+                title={t.title}
+              >
+                {t.title}
+              </button>
+              {/* Meta column. By default shows recency ("2d", "5h"),
+                  matching the "count" column in TagsButton's
+                  suggestions. On hover, swap to rename + delete
+                  actions in the same slot — no layout shift. */}
+              <span
+                className="text-[10.5px] text-subtle group-hover:hidden whitespace-nowrap"
+                title={new Date(t.updatedAt).toLocaleString()}
+              >
+                {formatRelativeTime(t.updatedAt)}
+              </span>
+              <span className="hidden group-hover:inline-flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onRename(t.id, t.title) }}
+                  className="h-5 w-5 inline-flex items-center justify-center rounded hover:bg-[var(--panel-2)]"
+                  title="Rename chat"
+                  aria-label="Rename chat"
+                >
+                  <FileEdit size={10} />
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onDelete(t.id) }}
+                  className="h-5 w-5 inline-flex items-center justify-center rounded hover:bg-[var(--panel-2)]"
+                  title="Delete chat"
+                  aria-label="Delete chat"
+                >
+                  <Trash2 size={10} />
+                </button>
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+/** Short relative-time label for the thread menu's right column.
+ *  Mirrors the count column in TagsButton's suggestion list — same
+ *  font size + muted color — so the two popovers feel related. */
+function formatRelativeTime(ts: number): string {
+  const delta = Math.max(0, Date.now() - ts)
+  const s = Math.floor(delta / 1000)
+  if (s < 30) return 'now'
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h`
+  const d = Math.floor(h / 24)
+  if (d < 7) return `${d}d`
+  const w = Math.floor(d / 7)
+  if (w < 5) return `${w}w`
+  const mo = Math.floor(d / 30)
+  if (mo < 12) return `${mo}mo`
+  return `${Math.floor(d / 365)}y`
+}
+
+/** One row in the empty-state starter list. Click sends the prompt
+ *  (or pre-fills the draft if the caller wants the user to finish
+ *  typing). Visual: full-width row, left-aligned icon + label,
+ *  subtle hover state — modelled on Notion-AI's starter list so
+ *  the empty surface feels like a menu of capabilities, not a
+ *  blank panel. */
+function StarterPrompt({
+  icon,
+  label,
+  onClick,
+}: {
+  icon: React.ReactNode
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[13px] text-left transition-colors hover:bg-[var(--selected)]"
+      style={{ color: 'var(--fg)' }}
+    >
+      <span
+        className="shrink-0 inline-flex items-center justify-center w-5 h-5"
+        style={{ color: 'var(--fg-subtle)' }}
+      >
+        {icon}
+      </span>
+      <span>{label}</span>
+    </button>
+  )
 }
 
 /** Phase indicator while the assistant turn is in-flight. Two
@@ -1148,100 +2109,71 @@ function SourcesPanel({
       }}
     >
       <button
-        className="w-full px-2 py-1 flex items-center gap-1.5 text-left"
+        className="w-full px-2.5 py-1.5 flex items-center gap-1.5 text-left"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
       >
         {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        <FileText size={11} className="text-accent" />
-        <span className="text-[11px] uppercase tracking-wider font-semibold text-subtle">
-          {totalSources} source{totalSources === 1 ? '' : 's'}
-          {hasPrimary ? ' (this doc + vault)' : ' from your vault'}
+        <Eye size={11} style={{ color: 'var(--accent)' }} />
+        <span className="text-[11.5px] font-medium text-fg">
+          {hasPrimary ? 'Looked at this doc' : `Looked at ${totalSources} source${totalSources === 1 ? '' : 's'}`}
+        </span>
+        <span className="text-[11px] text-subtle">
+          · {totalSources} source{totalSources === 1 ? '' : 's'}
         </span>
       </button>
       {open && (
         <div
-          className="px-2 pb-2"
+          className="flex flex-col"
           style={{ borderTop: '1px solid var(--border-soft)' }}
         >
           {grouped.map((g, i) => {
             const label = g.docTitle ?? `${g.docId.slice(0, 6)}…`
-            // Visual divider between primary section group and vault group.
-            const prevWasPrimary = i > 0 && grouped[i - 1].primary
-            const isFirstVault = !g.primary && prevWasPrimary
+            // Narrative phrasing per source. Reads like a sentence
+            // ("Pulled 6 chunks from this doc") instead of a
+            // function-call signature, matching the Reasoning trace
+            // pattern.
+            const verb = g.primary ? 'this doc' : 'the vault'
+            const chunkPhrase = g.count > 1
+              ? `${g.count} passages`
+              : '1 passage'
             return (
-              <div
+              <button
                 key={`${g.docId}:${g.topIdx}`}
-                className={`pt-2 ${isFirstVault ? 'mt-2 border-t pt-3' : ''}`}
-                style={isFirstVault ? { borderColor: 'var(--border-soft)' } : undefined}
+                type="button"
+                disabled={!g.clickable}
+                onClick={() => {
+                  if (!g.clickable) return
+                  onCitation({
+                    docId: g.docId,
+                    chunkIdx: g.topIdx,
+                    score: g.topScore,
+                    docTitle: g.docTitle,
+                    docPath: g.docPath,
+                  })
+                }}
+                title={g.docPath ?? label}
+                className="px-2.5 h-8 flex items-center gap-2 text-left text-[12.5px] hover:bg-hover disabled:hover:bg-transparent"
+                style={i > 0 ? { borderTop: '1px solid var(--border-soft)' } : undefined}
               >
-                <div className="flex items-center gap-1.5">
-                  {g.primary && (
-                    <span
-                      className="text-[9px] uppercase tracking-wider font-semibold px-1 py-0.5 rounded"
-                      style={{
-                        background: 'var(--selected)',
-                        color: 'var(--accent)',
-                      }}
-                    >
-                      this doc
-                    </span>
-                  )}
-                  <button
-                    className="inline-flex items-center gap-1 text-[11.5px] font-medium hover:underline min-w-0"
+                <FileText
+                  size={11}
+                  className="shrink-0"
+                  style={{ color: g.primary ? 'var(--accent)' : 'var(--fg-subtle)' }}
+                />
+                <span
+                  className="flex-1 min-w-0 truncate"
+                  style={{ color: 'var(--fg)' }}
+                >
+                  {g.primary ? 'Pulled' : 'Pulled'} {chunkPhrase} from{' '}
+                  <span
+                    className="font-semibold"
                     style={{ color: g.clickable ? 'var(--accent)' : 'var(--fg)' }}
-                    onClick={() => {
-                      if (g.clickable) {
-                        onCitation({
-                          docId: g.docId,
-                          chunkIdx: g.topIdx,
-                          score: g.topScore,
-                          docTitle: g.docTitle,
-                          docPath: g.docPath,
-                        })
-                      }
-                    }}
-                    disabled={!g.clickable}
-                    title={g.clickable ? `Open ${g.docPath}` : label}
                   >
-                    <span className="truncate max-w-[160px]">{label}</span>
-                    {g.count > 1 && (
-                      <span className="opacity-60">· {g.count} chunks</span>
-                    )}
-                    {/* Score is only a cosine for cross-doc vault chunks.
-                        Primary (open-doc) entries use a section-match
-                        heuristic that lives on a different scale —
-                        hiding it avoids confusing the user with a
-                        "1.67" next to a "0.67" cosine. */}
-                    {!g.primary && (
-                      <span className="opacity-60">· {g.topScore.toFixed(2)}</span>
-                    )}
-                  </button>
-                </div>
-                {g.docPath && g.docPath !== label && (
-                  <div
-                    className="mt-0.5 text-[10.5px] text-subtle truncate"
-                    title={g.docPath}
-                  >
-                    {g.docPath}
-                  </div>
-                )}
-                {g.topText && (
-                  <div
-                    className="mt-1 text-[11.5px] leading-snug text-subtle whitespace-pre-wrap break-words"
-                    style={{
-                      maxHeight: '5.5em',
-                      overflow: 'hidden',
-                      WebkitMaskImage:
-                        'linear-gradient(to bottom, black 70%, transparent 100%)',
-                      maskImage:
-                        'linear-gradient(to bottom, black 70%, transparent 100%)',
-                    }}
-                  >
-                    {g.topText}
-                  </div>
-                )}
-              </div>
+                    {g.primary ? verb : label}
+                  </span>
+                </span>
+              </button>
             )
           })}
         </div>

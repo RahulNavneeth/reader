@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, List, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -21,7 +21,8 @@ import { PathBreadcrumb } from './PathBreadcrumb'
 import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
 import { CollectionsToolbarButton } from './CollectionsToolbarButton'
-import { VersionsButton } from './VersionsButton'
+import { DocRail } from './DocRail'
+import { VersionDiffView } from './VersionDiffView'
 import { PublicButton } from './PublicButton'
 import { ShareWithUserButton } from './ShareWithUserButton'
 import { CsvTable } from './CsvTable'
@@ -58,12 +59,42 @@ export function PathViewer({ path, canEdit = true }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [indexing, setIndexing] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
+  /** Outline section state inside the rail. When both this AND
+   *  versionsOpen are false, the rail itself shrinks to 32 px
+   *  with two stacked icons (outline + versions). Otherwise the
+   *  rail is 240 px and shows headers for both sections, with
+   *  each section's body visible only when its own flag is true. */
+  const [outlineOpen, setOutlineOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('reader:outlineOpen') !== '0' } catch { return true }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('reader:outlineOpen', outlineOpen ? '1' : '0') } catch { /* ignore */ }
+  }, [outlineOpen])
+  const [versionsOpen, setVersionsOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem('reader:versionsRailOpen') === '1' } catch { return false }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('reader:versionsRailOpen', versionsOpen ? '1' : '0') } catch { /* ignore */ }
+  }, [versionsOpen])
+  /** Active diff state. When non-null, the main content area
+   *  swaps from rendered markdown to an inline line-by-line diff
+   *  between this version's snapshot and the current text. */
+  const [diffTs, setDiffTs] = useState<number | null>(null)
+  // Clear diff view whenever the doc changes.
+  useEffect(() => {
+    setDiffTs(null)
+  }, [path])
   const [chatOpen, setChatOpen] = useState(false)
   // Pending chat message coming from outside ChatDock (e.g. the
   // selection-popover "Explain with Reader AI" button). Consumed
   // by ChatDock via prop + useEffect, then cleared by the
   // onPendingConsumed callback.
   const [pendingChatMessage, setPendingChatMessage] = useState<string | null>(null)
+  // Pending quote from the "Reply with Reader AI" button. Unlike
+  // pendingChatMessage this is NOT auto-sent — it lands as a chip
+  // above the composer so the user can type any follow-up against
+  // the quoted selection.
+  const [pendingChatQuote, setPendingChatQuote] = useState<string | null>(null)
 
   useEffect(() => {
     const i = path.lastIndexOf('/')
@@ -226,7 +257,13 @@ export function PathViewer({ path, canEdit = true }: Props) {
     return () => cancelAnimationFrame(id)
   }, [isMarkdown, text])
 
-  const showOutline = isMarkdown && headings.length > 1
+  // Rail is shown for any markdown doc so the version-history
+  // section is reachable even when the outline list itself is
+  // empty / single-heading. The OUTLINE section inside renders
+  // conditionally on headings.length > 1; VersionsRail hides
+  // itself when no versions exist.
+  const showOutline = isMarkdown
+  const hasOutlineList = isMarkdown && headings.length > 1
   const contentRef = useRef<HTMLDivElement>(null)
 
   const jumpTo = (slug: string) => {
@@ -317,7 +354,6 @@ export function PathViewer({ path, canEdit = true }: Props) {
         )}
         {!ownerOpt && (
           <>
-            <VersionsButton path={path} />
             {meta && <ShareWithUserButton paths={[path]} />}
             {meta ? (
               <PublicButton
@@ -507,7 +543,18 @@ export function PathViewer({ path, canEdit = true }: Props) {
           />
         )}
 
-        {!error && isMarkdown && text != null && (
+        {!error && isMarkdown && text != null && diffTs !== null && (
+          <VersionDiffView
+            path={path}
+            ts={diffTs}
+            currentText={text}
+            parentDir={parentDir}
+            callerOpts={callerOpts}
+            onExit={() => setDiffTs(null)}
+          />
+        )}
+
+        {!error && isMarkdown && text != null && diffTs === null && (
           <div className="px-10 py-10">
             <article className="md">
               <ReactMarkdown
@@ -679,6 +726,15 @@ export function PathViewer({ path, canEdit = true }: Props) {
               setPendingChatMessage(`Explain this: "${trimmed}"`)
               setChatOpen(true)
             }}
+            // Reply affordance is universal — even read-only viewers
+            // can ask freeform questions against a quoted selection.
+            // The Apply button on any resulting proposed_edit card
+            // is the actual edit gate (server enforces write access).
+            onReply={(text) => {
+              const trimmed = text.length > 3500 ? text.slice(0, 3500) + '…' : text
+              setPendingChatQuote(trimmed)
+              setChatOpen(true)
+            }}
           />
         )}
        </div>
@@ -693,33 +749,39 @@ export function PathViewer({ path, canEdit = true }: Props) {
            onClose={() => setChatOpen(false)}
            pendingMessage={pendingChatMessage}
            onPendingConsumed={() => setPendingChatMessage(null)}
+           pendingQuote={pendingChatQuote}
+           onPendingQuoteConsumed={() => setPendingChatQuote(null)}
+           onDocEdited={async () => {
+             // The chat just applied a proposed edit to this doc.
+             // Refetch the body + meta so the viewer reflects the
+             // new content without a hard reload.
+             try {
+               const [r, m] = await Promise.all([
+                 api.fileText(path, callerOpts).catch(() => null),
+                 api.fileMeta(path, callerOpts).catch(() => null),
+               ])
+               if (r) setText(r.content)
+               if (m) setMeta(m.meta)
+             } catch {
+               /* swallow — user can refresh manually */
+             }
+           }}
          />
        )}
        {showOutline && (
-         <aside
-           className="w-[240px] shrink-0 border-l overflow-y-auto"
-           style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
-         >
-           <div
-             className="sticky top-0 h-10 px-3 border-b text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex items-center gap-1.5"
-             style={{ background: 'var(--panel-2)', borderColor: 'var(--border-soft)' }}
-           >
-             <List size={11} /> Outline
-           </div>
-           <nav className="px-2 py-2">
-             {headings.map((h, i) => (
-               <button
-                 key={i + h.slug}
-                 onClick={() => jumpTo(h.slug)}
-                 className="block w-full text-left px-2 py-1 rounded text-[12px] hover:bg-hover transition-colors text-fg truncate"
-                 style={{ paddingLeft: 8 + (h.level - 1) * 12 }}
-                 title={h.text}
-               >
-                 {h.text}
-               </button>
-             ))}
-           </nav>
-         </aside>
+         <DocRail
+           path={path}
+           text={text}
+           headings={headings}
+           hasOutlineList={hasOutlineList}
+           outlineOpen={outlineOpen}
+           setOutlineOpen={setOutlineOpen}
+           versionsOpen={versionsOpen}
+           setVersionsOpen={setVersionsOpen}
+           jumpTo={jumpTo}
+           activeDiffTs={diffTs}
+           onPickVersion={(ts) => setDiffTs(ts)}
+         />
        )}
       </div>
       <MetadataPanel

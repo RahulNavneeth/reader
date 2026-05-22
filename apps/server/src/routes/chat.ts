@@ -22,15 +22,42 @@
 import type { FastifyInstance } from 'fastify'
 import { nanoid } from 'nanoid'
 import { config } from '../config.js'
+import { readFile, writeFile } from 'node:fs/promises'
 import {
   appendMessage,
   clearThread,
   deleteMessageById,
+  discardPendingEdit,
+  findMessageByIdScoped,
   listMessages,
+  markEditApplied,
   type ChatCitation,
   type ChatMessage,
   type MemoryUsed,
+  type ProposedEditOp,
 } from '../db/chatRepo.js'
+import {
+  createThread,
+  deleteThread,
+  getThread,
+  listThreads,
+  maybeAutoTitleFromMessage,
+  renameThread,
+  touchThread,
+} from '../db/threadsRepo.js'
+import {
+  loadMeta,
+  readText,
+  saveMeta,
+  sha256Of,
+  userCanEdit,
+  userCanRead,
+} from '../stores/documents.js'
+import { resolveUserVault } from '../lib/userVault.js'
+import { withEditLock } from '../lib/editLock.js'
+import { audit } from '../stores/audit.js'
+import { ingestDocument } from '../services/ingest.js'
+import * as mdx from '../lib/mdx.js'
 import {
   addUserMemory,
   addDocMemory,
@@ -41,10 +68,12 @@ import {
 } from '../db/memoriesRepo.js'
 import {
   assembleContext,
-  buildOllamaMessages,
   ChatError,
-  streamOllamaChat,
+  detectEditIntent,
+  extractQuotedExcerpt,
+  locateHeadingForExcerpt,
 } from '../services/chat.js'
+import { runAgent } from '../services/agent.js'
 
 export async function chatRoutes(app: FastifyInstance) {
   app.addHook('preHandler', app.requireUser)
@@ -57,25 +86,171 @@ export async function chatRoutes(app: FastifyInstance) {
     }
   })
 
-  app.get<{ Params: { docId: string } }>('/api/chat/:docId/messages', async (req) => {
+  // ── Thread CRUD ────────────────────────────────────────────────
+  // A "thread" is one named conversation inside a (doc, user) pair.
+  // Multiple threads per doc per user are supported — the legacy
+  // "one conversation per doc" world is just the case where the
+  // user has exactly one thread.
+
+  app.get<{ Params: { docId: string } }>('/api/chat/:docId/threads', async (req) => {
     const user = req.currentUser!
-    const messages = listMessages(req.params.docId, user.username)
-    return { messages }
+    const threads = listThreads(req.params.docId, user.username)
+    return { threads }
   })
+
+  app.post<{ Params: { docId: string }; Body: { title?: string } }>(
+    '/api/chat/:docId/threads',
+    async (req) => {
+      const user = req.currentUser!
+      const id = nanoid()
+      const title = String(req.body?.title ?? '').trim() || 'New chat'
+      const t = createThread({ id, docId: req.params.docId, userId: user.username, title })
+      return { thread: t }
+    },
+  )
+
+  app.patch<{ Params: { docId: string; threadId: string }; Body: { title?: string } }>(
+    '/api/chat/:docId/threads/:threadId',
+    async (req, reply) => {
+      const user = req.currentUser!
+      const title = String(req.body?.title ?? '').trim()
+      if (!title) return reply.code(400).send({ error: 'title required' })
+      const ok = renameThread(req.params.threadId, user.username, req.params.docId, title)
+      if (!ok) return reply.code(404).send({ error: 'thread not found' })
+      return { ok: true }
+    },
+  )
+
+  app.delete<{ Params: { docId: string; threadId: string } }>(
+    '/api/chat/:docId/threads/:threadId',
+    async (req, reply) => {
+      const user = req.currentUser!
+      const ok = deleteThread(req.params.threadId, user.username, req.params.docId)
+      if (!ok) return reply.code(404).send({ error: 'thread not found' })
+      return { ok: true }
+    },
+  )
+
+  app.get<{ Params: { docId: string }; Querystring: { threadId?: string } }>(
+    '/api/chat/:docId/messages',
+    async (req, reply) => {
+      const user = req.currentUser!
+      const explicitThreadId = req.query?.threadId
+      let threadId: string
+      if (explicitThreadId) {
+        // Verify the thread belongs to this user before returning
+        // messages. Without this, a known thread id from another
+        // user could be read by guessing it.
+        const t = getThread(explicitThreadId, user.username)
+        if (!t || t.docId !== req.params.docId) {
+          return reply.code(404).send({ error: 'thread not found' })
+        }
+        threadId = t.id
+      } else {
+        // No threadId passed → default to the most-recently-active
+        // thread for this (doc, user). Legacy clients that don't
+        // know about threads keep working. Returns empty when the
+        // user has never chatted on this doc.
+        const existing = listThreads(req.params.docId, user.username)
+        if (existing.length === 0) return { messages: [], threadId: null }
+        threadId = existing[0].id
+      }
+      const messages = listMessages(req.params.docId, user.username, threadId)
+      return { messages, threadId }
+    },
+  )
 
   app.delete<{ Params: { docId: string } }>('/api/chat/:docId', async (req) => {
     const user = req.currentUser!
+    // Legacy "wipe all chat for this doc" endpoint. Wipes every
+    // thread the user has on this doc — drops their messages AND
+    // the thread rows so the switcher dropdown is empty afterwards.
     const cleared = clearThread(req.params.docId, user.username)
+    for (const t of listThreads(req.params.docId, user.username)) {
+      deleteThread(t.id, user.username, req.params.docId)
+    }
     return { cleared }
+  })
+
+  // ── In-flight stream registry ──────────────────────────────────
+  // Lets the cancel endpoint reach into an active /stream request
+  // to abort the agent + flag the request as user-cancelled so the
+  // post-stream block knows NOT to persist the partial. Keyed by
+  // (docId, userId, threadId) — only one active stream per that
+  // triple at a time (the client can't fire concurrent streams on
+  // the same thread).
+  type ActiveStream = {
+    ac: AbortController
+    /** Most-recent user-turn id this stream wrote. Null for
+     *  regenerate flows (which don't add a new user turn). The
+     *  cancel handler optionally deletes this so the user's
+     *  question vanishes alongside the aborted answer. */
+    userMsgId: string | null
+    userAborted: boolean
+  }
+  const activeStreams = new Map<string, ActiveStream>()
+  const streamKey = (docId: string, userId: string, threadId: string) =>
+    `${docId}:${userId}:${threadId}`
+
+  /** Delete a single chat message by id. Scoped to the caller via
+   *  deleteMessageById's (id, userId, docId) WHERE clause so users
+   *  can't drop one another's messages. Used by the client's
+   *  "Edit question" flow which removes the old user + assistant
+   *  pair before sending the edited question as a fresh turn. */
+  app.delete<{
+    Params: { docId: string; messageId: string }
+  }>('/api/chat/:docId/messages/:messageId', async (req, reply) => {
+    const user = req.currentUser!
+    const ok = deleteMessageById(req.params.messageId, user.username, req.params.docId)
+    if (!ok) return reply.code(404).send({ error: 'message not found' })
+    return { ok: true }
   })
 
   app.post<{
     Params: { docId: string }
-    Body: { content?: string; regenerateOf?: string }
+    Body: { threadId?: string; deleteUserTurn?: boolean }
+  }>('/api/chat/:docId/cancel', async (req, reply) => {
+    const user = req.currentUser!
+    const threadId = req.body?.threadId ? String(req.body.threadId) : null
+    if (!threadId) return reply.code(400).send({ error: 'threadId required' })
+    const key = streamKey(req.params.docId, user.username, threadId)
+    const entry = activeStreams.get(key)
+    if (!entry) return { ok: true, found: false }
+    entry.userAborted = true
+    entry.ac.abort()
+    // Optionally remove the user turn so the chat looks clean
+    // after a Stop click — matches the user's expectation that
+    // Stop = cancel the question entirely. Caller passes
+    // deleteUserTurn:false to keep the question for editing.
+    if ((req.body?.deleteUserTurn ?? true) && entry.userMsgId) {
+      try {
+        deleteMessageById(entry.userMsgId, user.username, req.params.docId)
+      } catch {
+        /* swallow */
+      }
+    }
+    return { ok: true, found: true }
+  })
+
+  app.post<{
+    Params: { docId: string }
+    Body: {
+      content?: string
+      regenerateOf?: string
+      threadId?: string
+      /** Doc IDs the user @-mentioned in the composer. Their text
+       *  is loaded server-side and handed to the agent as
+       *  additional context so the model can reference docs that
+       *  RAG might not have surfaced on its own. */
+      attachedDocs?: string[]
+    }
   }>('/api/chat/:docId/stream', async (req, reply) => {
     const user = req.currentUser!
     const docId = req.params.docId
     const content = String(req.body?.content ?? '').trim()
+    const attachedDocIds = Array.isArray(req.body?.attachedDocs)
+      ? req.body!.attachedDocs!.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : []
     const regenerateOf = req.body?.regenerateOf
       ? String(req.body.regenerateOf)
       : null
@@ -84,6 +259,42 @@ export async function chatRoutes(app: FastifyInstance) {
     }
     if (content.length > 4000) {
       return reply.code(400).send({ error: 'message too long (max 4000 chars)' })
+    }
+
+    // Doc-existence + access check upfront. We need a valid doc
+    // before either the slash-command branch (which persists to
+    // chat_messages with an FK on doc_id) or the agent branch
+    // (which calls assembleContext). Both paths used to discover
+    // a missing doc via assembleContext, but that left the slash
+    // branch using `activeThreadId` before it was assigned.
+    {
+      const preMeta = await loadMeta(docId).catch(() => null)
+      if (!preMeta) {
+        return reply.code(400).send({ error: `document not found: ${docId}` })
+      }
+      if (!userCanRead(preMeta, user.username, user.role)) {
+        return reply.code(403).send({ error: 'not allowed to chat on this document' })
+      }
+    }
+
+    // Resolve which thread we're writing into. Both branches below
+    // (slash + agent) persist messages with this threadId, so we
+    // resolve it here once.
+    const requestedThreadId = req.body?.threadId ? String(req.body.threadId) : null
+    let activeThreadId: string
+    if (requestedThreadId) {
+      const t = getThread(requestedThreadId, user.username)
+      if (!t || t.docId !== docId) {
+        return reply.code(404).send({ error: 'thread not found' })
+      }
+      activeThreadId = t.id
+    } else {
+      const existing = listThreads(docId, user.username)
+      if (existing.length > 0) {
+        activeThreadId = existing[0].id
+      } else {
+        activeThreadId = createThread({ id: nanoid(), docId, userId: user.username }).id
+      }
     }
 
     // ── Slash-command intercept ───────────────────────────────
@@ -100,10 +311,15 @@ export async function chatRoutes(app: FastifyInstance) {
         id: userMsgId,
         docId,
         userId: user.username,
+        threadId: activeThreadId,
         role: 'user',
         content,
         citations: null,
         memoriesUsed: null,
+        pendingEdit: null,
+        editAppliedAt: null,
+        editTargetSha256: null,
+        toolTrace: null,
         error: null,
         createdAt: now,
       })
@@ -113,13 +329,20 @@ export async function chatRoutes(app: FastifyInstance) {
         id: asstId,
         docId,
         userId: user.username,
+        threadId: activeThreadId,
         role: 'assistant',
         content: reply_text,
         citations: null,
         memoriesUsed: null,
+        pendingEdit: null,
+        editAppliedAt: null,
+        editTargetSha256: null,
+        toolTrace: null,
         error: null,
         createdAt: now + 1,
       })
+      touchThread(activeThreadId, user.username, docId)
+      maybeAutoTitleFromMessage(activeThreadId, user.username, docId, content)
       // Emit as SSE so the client uses its existing chatStream
       // consumer — no special-case branching needed on the client.
       reply.raw.writeHead(200, {
@@ -142,12 +365,19 @@ export async function chatRoutes(app: FastifyInstance) {
     // clean JSON 4xx/5xx if anchor-load or RAG fails. After this
     // point the body is event-stream and errors stream as events.
     let ctx
-    let history: ChatMessage[]
     try {
       ctx = await assembleContext(docId, { username: user.username, role: user.role }, content)
-      history = listMessages(docId, user.username)
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'failed to build chat context'
+      const code = e instanceof ChatError && msg.includes('not allowed') ? 403 : 400
+      return reply.code(code).send({ error: msg })
+    }
+
+    let history: ChatMessage[]
+    try {
+      history = listMessages(docId, user.username, activeThreadId)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'failed to load thread'
       const code = e instanceof ChatError && msg.includes('not allowed') ? 403 : 400
       return reply.code(code).send({ error: msg })
     }
@@ -159,6 +389,10 @@ export async function chatRoutes(app: FastifyInstance) {
     // would push the regenerated turn to the bottom of a long
     // thread, far away from the question that produced it.
     let regenerateOriginalCreatedAt: number | null = null
+    // ID of the new user turn we persisted up-front (fresh-question
+    // path only). Captured so the cancel endpoint can delete the
+    // user turn alongside the aborted answer when Stop is clicked.
+    let newUserMsgId: string | null = null
     if (regenerateOf) {
       const idx = history.findIndex((m) => m.id === regenerateOf)
       if (idx >= 0) {
@@ -175,18 +409,28 @@ export async function chatRoutes(app: FastifyInstance) {
     } else {
       // Fresh question — persist the user turn up front so a
       // mid-stream disconnect still keeps the question in history.
-      const userMsgId = nanoid()
+      newUserMsgId = nanoid()
       appendMessage({
-        id: userMsgId,
+        id: newUserMsgId,
         docId,
         userId: user.username,
+        threadId: activeThreadId,
         role: 'user',
         content,
         citations: null,
         memoriesUsed: null,
+        pendingEdit: null,
+        editAppliedAt: null,
+        editTargetSha256: null,
+        toolTrace: null,
         error: null,
         createdAt: now,
       })
+      // Bump the thread's updated_at so it floats to the top of
+      // the switcher dropdown, and rename "New chat" to a derived
+      // title based on the first user message.
+      touchThread(activeThreadId, user.username, docId)
+      maybeAutoTitleFromMessage(activeThreadId, user.username, docId, content)
     }
 
     reply.raw.writeHead(200, {
@@ -236,6 +480,39 @@ export async function chatRoutes(app: FastifyInstance) {
       })),
     ]
 
+    // Resolve @-mentioned docs into title/path/text triples + push
+    // each into citations so the Sources panel surfaces them.
+    // Access control: silently drop IDs the user can't read.
+    // Capped at 4 docs per turn so the prompt doesn't balloon.
+    const ATTACH_LIMIT = 4
+    const attachedDocsForPrompt: Array<{ title: string; path: string; text: string }> = []
+    for (const id of attachedDocIds.slice(0, ATTACH_LIMIT)) {
+      if (id === docId) continue // anchor is already in context
+      try {
+        const meta = await loadMeta(id)
+        if (!meta) continue
+        if (!userCanRead(meta, user.username, user.role)) continue
+        const text = (await readText(id)) ?? ''
+        if (!text) continue
+        attachedDocsForPrompt.push({
+          title: meta.title || meta.originalFilename || id,
+          path: meta.storageKey || '',
+          text,
+        })
+        citations.push({
+          docId: meta.id,
+          chunkIdx: -1,
+          score: 1,
+          docTitle: meta.title || meta.originalFilename || id,
+          docPath: meta.storageKey,
+          text: cap(text),
+          primary: false,
+        })
+      } catch {
+        /* skip unreadable / malformed */
+      }
+    }
+
     // CRITICAL: the Ollama generation must NOT be cancelled when
     // the client navigates away. Notion-AI-like UX requires that
     // a question's answer keeps generating in the background and
@@ -256,7 +533,11 @@ export async function chatRoutes(app: FastifyInstance) {
       clientGone = true
     })
 
-    send({ kind: 'meta', citations, memoriesUsed })
+    // Emit threadId in the meta event so the client can call
+    // /cancel correctly even when this is the first turn of a
+    // brand-new thread (where the client had activeThreadId=null
+    // before sending).
+    send({ kind: 'meta', citations, memoriesUsed, threadId: activeThreadId })
 
     // Hard cap on background generations so a runaway model can't
     // pin the worker forever. 5 min covers any 1024-token answer
@@ -264,92 +545,225 @@ export async function chatRoutes(app: FastifyInstance) {
     const ac = new AbortController()
     const hardTimeout = setTimeout(() => ac.abort(), 5 * 60_000)
 
-    let assembled = ''
-    let finished = false
-    // Captured from Ollama's `done` line. `'length'` means the
-    // num_predict cap fired and the answer is truncated mid-
-    // sentence — we surface that to the user explicitly.
-    let doneReason: string | undefined
+    // Register this stream so /cancel can reach in and abort it.
+    // Keyed by (docId, userId, threadId) — only one active stream
+    // per that triple at a time.
+    const myStreamKey = streamKey(docId, user.username, activeThreadId)
+    const streamEntry: ActiveStream = {
+      ac,
+      userMsgId: newUserMsgId,
+      userAborted: false,
+    }
+    activeStreams.set(myStreamKey, streamEntry)
+    // Outer try/finally guarantees the registry entry is reaped
+    // regardless of what happens below — including thrown
+    // exceptions in pre-loop setup that the inner try/catch
+    // wouldn't otherwise cover. Without this, a freak error would
+    // leak the entry forever and the /cancel endpoint would still
+    // see this thread as "in flight" for the rest of the process.
     try {
-      const messages = buildOllamaMessages(ctx, history, content)
-      for await (const ev of streamOllamaChat(messages, ac.signal)) {
+
+    // Agent loop — Ollama tool-calling. The model picks tools
+    // (list_sections, search_doc, propose_edit, answer, …) instead
+    // of generating a giant rules-driven single-shot response. Each
+    // tool call streams as a `tool_call_start` / `tool_call_result`
+    // event so the UI can render a "Reasoning" trace.
+    let assembled = ''
+    const collectedToolTrace: Array<{ id: string; name: string; args: unknown; ok?: boolean; summary?: string }> = []
+    let collectedProposedEdits: ProposedEditOp[] = []
+    let agentDone = false
+    try {
+      const gen = runAgent({
+        anchor: ctx.anchor,
+        docText: ctx.anchorTextFull,
+        history,
+        query: content,
+        user: { username: user.username, role: user.role },
+        signal: ac.signal,
+        attachedDocs: attachedDocsForPrompt,
+      })
+      for await (const ev of gen) {
         if (ev.kind === 'token') {
           assembled += ev.token
           send({ kind: 'token', token: ev.token })
-        } else {
-          finished = true
-          doneReason = ev.reason
+        } else if (ev.kind === 'tool_call_start') {
+          collectedToolTrace.push({ id: ev.id, name: ev.name, args: ev.args })
+          send({ kind: 'tool_call_start', id: ev.id, name: ev.name, args: ev.args })
+        } else if (ev.kind === 'tool_call_result') {
+          const entry = collectedToolTrace.find((t) => t.id === ev.id)
+          if (entry) {
+            entry.ok = ev.ok
+            entry.summary = ev.summary
+          }
+          send({ kind: 'tool_call_result', id: ev.id, ok: ev.ok, summary: ev.summary })
+        } else if (ev.kind === 'thinking_text') {
+          send({ kind: 'thinking_text', text: ev.text })
+        } else if (ev.kind === 'done') {
+          agentDone = true
+          collectedProposedEdits = ev.proposedEdits
+          // If the model never streamed a `token` (e.g. it never
+          // called `answer` and we synthesised the fallback message),
+          // ensure `assembled` carries the final answer text.
+          if (!assembled) assembled = ev.answer
+        } else if (ev.kind === 'error') {
+          throw new ChatError(ev.message)
         }
       }
     } catch (e) {
       clearTimeout(hardTimeout)
-      const msg = e instanceof Error ? e.message : 'chat stream failed'
-      // Persist the failure as an assistant turn so reloading the
-      // page doesn't make the failed answer silently disappear —
-      // the user sees their question followed by a clean error
-      // panel, instead of a dangling YOU bubble.
+      activeStreams.delete(myStreamKey)
+      // If the user explicitly cancelled via /cancel, /cancel
+      // already deleted the user turn — don't persist an error
+      // stub for the assistant turn either. Clean exit.
+      if (streamEntry.userAborted) {
+        try { reply.raw.end() } catch { /* already ended */ }
+        return
+      }
+      const msg = e instanceof Error ? e.message : 'agent failed'
       const errId = nanoid()
       appendMessage({
         id: errId,
         docId,
         userId: user.username,
+        threadId: activeThreadId,
         role: 'assistant',
         content: '',
         citations: null,
         memoriesUsed: null,
+        pendingEdit: null,
+        editAppliedAt: null,
+        editTargetSha256: null,
+        toolTrace: null,
         error: msg,
-        // Same in-place positioning rule as the success path.
         createdAt: regenerateOriginalCreatedAt ?? Date.now(),
       })
       send({ kind: 'error', error: msg, messageId: errId })
-      try {
-        reply.raw.end()
-      } catch {
-        /* already ended */
-      }
+      try { reply.raw.end() } catch { /* already ended */ }
       return
     }
 
     clearTimeout(hardTimeout)
-    if (finished && assembled.length > 0) {
-      // Ollama hit the num_predict token cap mid-sentence. Mark
-      // the persisted answer so the user sees "answer was cut off
-      // — click Regenerate or raise the cap" rather than a baffling
-      // sentence trailing into nothing.
-      if (doneReason === 'length') {
-        assembled += '\n\n*— Answer was cut off at the token limit. Click **Regenerate** for a fresh attempt, or ask a more specific follow-up to get the rest.*'
+
+    // Small-model safety net: if the user asked for an edit on a
+    // Reply-quote (`> "…"` prefix) and the agent never produced a
+    // proposed_edit (the 0.5–1.5b qwen2.5 models silently fail tool
+    // calling and just return empty content), synthesise the edit
+    // deterministically from the located heading. The model's
+    // answer text — if any — becomes the new section body for a
+    // rephrase/rewrite, or we strip the quoted line for a
+    // remove/delete.
+    if (collectedProposedEdits.length === 0 && detectEditIntent(content)) {
+      const excerpt = extractQuotedExcerpt(content)
+      const heading = excerpt && ctx.anchorTextFull
+        ? locateHeadingForExcerpt(ctx.anchorTextFull, excerpt)
+        : null
+      if (heading && excerpt) {
+        const lower = content.toLowerCase()
+        const isRemoval =
+          /\b(remove|delete|drop|strip|get rid of)\b/.test(lower)
+        if (isRemoval) {
+          // Pull the section's current body and remove the quoted
+          // line(s). Fall back to a body that lacks the excerpt
+          // entirely when partial-match removal is ambiguous.
+          const fullText = ctx.anchorTextFull
+          const sectionMatch = fullText.split('\n').reduce<{
+            inSection: boolean
+            startIdx: number
+            endIdx: number
+          }>(
+            (acc, line, idx, arr) => {
+              const isAtxHeading = /^\s{0,3}#{1,6}\s+/.test(line)
+              if (acc.inSection && isAtxHeading) {
+                return { ...acc, inSection: false, endIdx: idx }
+              }
+              if (!acc.inSection && isAtxHeading) {
+                const m = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/)
+                if (m && m[1].trim() === heading) {
+                  return { inSection: true, startIdx: idx + 1, endIdx: arr.length }
+                }
+              }
+              return acc
+            },
+            { inSection: false, startIdx: -1, endIdx: -1 },
+          )
+          if (sectionMatch.startIdx >= 0) {
+            const lines = fullText.split('\n').slice(sectionMatch.startIdx, sectionMatch.endIdx)
+            const needle = excerpt.replace(/\s+/g, ' ').trim()
+            const filtered = lines.filter((line) => {
+              const normalised = line.replace(/\s+/g, ' ').trim()
+              return !normalised.includes(needle) && !needle.includes(normalised) || normalised === ''
+            })
+            const newBody = filtered.join('\n').trim()
+            collectedProposedEdits = [{ op: 'replace_section', heading, content: newBody }]
+            if (!assembled) {
+              assembled = `Proposed removing the quoted line from the **${heading}** section. Review and Apply below.`
+            }
+          }
+        } else if (assembled.length > 0) {
+          // Rephrase / rewrite path: use the model's answer text
+          // as the new section body. Strip a leading `Rephrase:` or
+          // surrounding double-quotes if the model added them.
+          const cleaned = assembled
+            .replace(/^\s*(rephrase|rewrite|edit|fix|update|revised?|new version)\s*:\s*/i, '')
+            .replace(/^\s*"([^]*?)"\s*$/, '$1')
+            .trim()
+          if (cleaned.length > 0) {
+            collectedProposedEdits = [{ op: 'replace_section', heading, content: cleaned }]
+          }
+        }
       }
+    }
+
+    // Treat the agent as successful when it produced ANY artifact:
+    // an answer text OR at least one proposed_edit. A queued edit
+    // with no answer text is still a real outcome (the user gets a
+    // diff card to Apply); the agent service synthesises a default
+    // summary in that case so `assembled` is non-empty by the time
+    // we get here, but we guard for proposed_edits too in case a
+    // future agent change skips the synthesis path.
+    activeStreams.delete(myStreamKey)
+    // User cancelled via /cancel → skip persistence entirely. The
+    // cancel endpoint already deleted the user turn; this skip
+    // keeps the assistant side clean too.
+    if (streamEntry.userAborted) {
+      try { reply.raw.end() } catch { /* already ended */ }
+      return
+    }
+    if (agentDone && (assembled.length > 0 || collectedProposedEdits.length > 0)) {
       const asstId = nanoid()
       appendMessage({
         id: asstId,
         docId,
         userId: user.username,
+        threadId: activeThreadId,
         role: 'assistant',
         content: assembled,
         citations: citations.length ? citations : null,
         memoriesUsed: memoriesUsed.length ? memoriesUsed : null,
         error: null,
-        // Preserve the original assistant turn's timestamp on
-        // regen so the new answer slots back into the same place
-        // in history. Fresh answers use Date.now() as usual.
+        pendingEdit: collectedProposedEdits.length > 0 ? collectedProposedEdits : null,
+        editAppliedAt: null,
+        editTargetSha256: collectedProposedEdits.length > 0 ? ctx.anchor.sha256 : null,
+        toolTrace: collectedToolTrace.length > 0 ? collectedToolTrace : null,
         createdAt: regenerateOriginalCreatedAt ?? Date.now(),
       })
       send({ kind: 'done', messageId: asstId })
     } else {
-      // Streamed nothing useful (small models occasionally return
-      // zero tokens on hard prompts). Persist a stub error turn so
-      // a user who reloaded mid-stream doesn't see a dangling YOU
-      // bubble with no explanation of what happened.
       const stubId = nanoid()
       appendMessage({
         id: stubId,
         docId,
         userId: user.username,
+        threadId: activeThreadId,
         role: 'assistant',
         content: '',
         citations: null,
         memoriesUsed: null,
-        error: 'The model produced no output. Try rephrasing the question, or switch to a larger chat model in Admin → Settings → Embeddings.',
+        pendingEdit: null,
+        editAppliedAt: null,
+        editTargetSha256: null,
+        toolTrace: null,
+        error: 'The agent produced no answer. Try a simpler question, or switch to a larger chat model in Admin → Settings → Embeddings.',
         createdAt: regenerateOriginalCreatedAt ?? Date.now(),
       })
       send({ kind: 'done', messageId: stubId })
@@ -359,7 +773,219 @@ export async function chatRoutes(app: FastifyInstance) {
     } catch {
       /* already ended */
     }
+
+    } finally {
+      // Always reap the registry entry — even if anything above
+      // (including pre-loop setup or persistence) throws. The two
+      // explicit delete()s inside this block are redundant with
+      // this finally but harmless because Map.delete is idempotent;
+      // leaving them in keeps the userAborted check semantics tight
+      // (we want to know whether the user cancelled BEFORE we mark
+      // the entry gone, since /cancel does a map.get → mutate).
+      activeStreams.delete(myStreamKey)
+    }
   })
+
+  // ── Apply a pending edit ───────────────────────────────────────
+  // POST /api/chat/:docId/apply-edit  { messageId }
+  // Looks up the pending_edit JSON on the named assistant turn,
+  // re-checks sha256 against the live doc (refuses on mismatch so
+  // a stale model output can't silently overwrite a recent manual
+  // edit), runs each op through lib/mdx.ts inside withEditLock,
+  // writes the new bytes, re-ingests, marks the row applied.
+  app.post<{
+    Params: { docId: string }
+    Body: { messageId?: string }
+  }>('/api/chat/:docId/apply-edit', async (req, reply) => {
+    const user = req.currentUser!
+    const docId = req.params.docId
+    const messageId = String(req.body?.messageId ?? '').trim()
+    if (!messageId) {
+      return reply.code(400).send({ error: 'messageId required' })
+    }
+
+    // Locate the pending edit. The message id is unique per
+    // assistant turn; we look it up directly rather than scanning
+    // all threads for the user.
+    const turn = findMessageByIdScoped(messageId, user.username, docId)
+    if (!turn) return reply.code(404).send({ error: 'message not found' })
+    if (turn.role !== 'assistant') return reply.code(400).send({ error: 'not an assistant turn' })
+    if (!turn.pendingEdit || turn.pendingEdit.length === 0) {
+      return reply.code(400).send({ error: 'no pending edit on this turn' })
+    }
+    if (turn.editAppliedAt) {
+      return reply.code(409).send({ error: 'edit already applied' })
+    }
+
+    // Permission + doc state.
+    const meta = await loadMeta(docId)
+    if (!meta) return reply.code(404).send({ error: 'document not found' })
+    if (!userCanEdit(meta, user.username, user.role)) {
+      return reply.code(403).send({ error: 'you do not have edit access on this document' })
+    }
+
+    // sha256 conflict check — pre-lock, so we fail fast.
+    if (turn.editTargetSha256 && turn.editTargetSha256 !== meta.sha256) {
+      return reply.code(409).send({
+        error: 'document changed since this edit was proposed',
+        code: 'sha_mismatch',
+        proposedAgainst: turn.editTargetSha256,
+        current: meta.sha256,
+      })
+    }
+
+    const result = await withEditLock(docId, async () => {
+      // Re-load inside the lock — another holder may have just
+      // committed between our pre-check and acquiring the lock.
+      const live = await loadMeta(docId)
+      if (!live) throw Object.assign(new Error('document not found'), { status: 404 })
+      if (turn.editTargetSha256 && turn.editTargetSha256 !== live.sha256) {
+        throw Object.assign(new Error('document changed since this edit was proposed'), {
+          status: 409,
+          code: 'sha_mismatch',
+        })
+      }
+      const abs = resolveUserVault(live.owner, live.storageKey)
+      let buf: Buffer
+      try {
+        buf = await readFile(abs)
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+          throw Object.assign(new Error(`document file is missing on disk (${live.storageKey})`), { status: 404 })
+        }
+        throw e
+      }
+      // Apply each op in order. mdx helpers throw on a missing
+      // heading; we let those bubble up as 422.
+      let text = buf.toString('utf8')
+      for (const op of turn.pendingEdit!) {
+        text = applyOp(text, op)
+      }
+      const nextBuf = Buffer.from(text, 'utf8')
+      // Snapshot the PRE-edit state explicitly. The vault watcher
+      // also fires snapshotVersion on the resulting file change,
+      // but that race captures the NEW meta (because we call
+      // saveMeta before the watcher reads). Calling it here
+      // guarantees the snapshot reflects the state before this
+      // Reader AI edit. Deduped by sha256 inside snapshotVersion,
+      // so the watcher's subsequent fire is a no-op.
+      {
+        const { snapshotVersion } = await import('../stores/versions.js')
+        await snapshotVersion(docId).catch(() => null)
+      }
+      await writeFile(abs, nextBuf)
+      const nextMeta = {
+        ...live,
+        bytes: nextBuf.length,
+        sha256: sha256Of(nextBuf),
+        updatedAt: Date.now(),
+        ingest: { status: 'pending' as const, embedded: false },
+      }
+      await saveMeta(nextMeta)
+      const finalMeta = await ingestDocument(nextMeta, nextBuf)
+      markEditApplied(messageId, user.username, docId)
+      await audit({
+        actor: user.username,
+        action: 'chat.apply_edit',
+        target: docId,
+        meta: {
+          path: live.storageKey,
+          ops: turn.pendingEdit!.map((o) => o.op),
+          messageId,
+        },
+      })
+      return finalMeta
+    }).catch((e) => {
+      const status = (e as { status?: number }).status ?? 500
+      const code = (e as { code?: string }).code
+      reply.code(status).send({
+        error: (e as Error).message ?? 'apply failed',
+        ...(code ? { code } : {}),
+      })
+      return null
+    })
+
+    if (!result) return // error already sent
+    return { ok: true, document: result }
+  })
+
+  // ── Discard a pending edit ─────────────────────────────────────
+  // DELETE /api/chat/:docId/pending-edit/:messageId
+  // Drops the pending_edit JSON payload but preserves the chat
+  // message itself (the model's reasoning text stays in history).
+  app.delete<{
+    Params: { docId: string; messageId: string }
+  }>('/api/chat/:docId/pending-edit/:messageId', async (req, reply) => {
+    const user = req.currentUser!
+    const ok = discardPendingEdit(
+      req.params.messageId,
+      user.username,
+      req.params.docId,
+    )
+    if (!ok) {
+      return reply.code(404).send({
+        error: 'pending edit not found, already applied, or not yours',
+      })
+    }
+    await audit({
+      actor: user.username,
+      action: 'chat.discard_edit',
+      target: req.params.docId,
+      meta: { messageId: req.params.messageId },
+    })
+    return { ok: true }
+  })
+}
+
+/** Apply a single proposed-edit op against the doc's current text.
+ *  Delegates to lib/mdx.ts — same primitives the MCP granular
+ *  tools use. Throws if a referenced heading doesn't exist
+ *  (caller turns this into a 422). */
+function applyOp(text: string, op: ProposedEditOp): string {
+  switch (op.op) {
+    case 'replace_section': {
+      // Defensive: strip a leading "# Heading" / "## Heading" /
+      // "### Heading" line if it matches the target heading. The
+      // model is told not to include it (replaceSection preserves
+      // the original heading line), but small models occasionally
+      // include it anyway, which would result in a duplicated
+      // heading on apply.
+      const body = stripDuplicateLeadingHeading(op.content, op.heading)
+      return mdx.replaceSection(text, op.heading, body)
+    }
+    case 'insert_after':
+      return mdx.insertAfter(text, op.heading, op.content)
+    case 'delete_section':
+      return mdx.deleteSection(text, op.heading)
+    case 'append_text':
+      return mdx.appendText(text, op.content)
+    case 'prepend_text':
+      return mdx.prependText(text, op.content)
+  }
+}
+
+/**
+ * Strip a leading ATX heading from `body` if it matches `heading`
+ * (case-sensitive, whitespace-tolerant). Returns the body unchanged
+ * otherwise. Lets us defensively handle models that include the
+ * heading line at the top of replace_section content even though
+ * the prompt and applyOp keep the original heading in place.
+ */
+function stripDuplicateLeadingHeading(body: string, heading: string): string {
+  const lines = body.split('\n')
+  let i = 0
+  // Skip any leading blank lines.
+  while (i < lines.length && lines[i].trim() === '') i++
+  if (i >= lines.length) return body
+  const m = lines[i].match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/)
+  if (!m) return body
+  if (m[1].trim() !== heading.trim()) return body
+  // Strip the heading line + any blank lines that immediately
+  // followed it, so the remaining body doesn't start with a
+  // stranded blank line.
+  i++
+  while (i < lines.length && lines[i].trim() === '') i++
+  return lines.slice(i).join('\n')
 }
 
 // ── Slash command parser + executor ─────────────────────────────
@@ -415,23 +1041,27 @@ export function executeSlashCommand(
   docId: string,
 ): string {
   if (cmd.kind === 'remember') {
+    const id = nanoid()
     addUserMemory({
-      id: nanoid(),
+      id,
       userId,
       fact: cmd.fact,
       source: 'user_command',
       createdAt: Date.now(),
     })
+    void embedAndStoreSlashMemory('user', id, cmd.fact)
     return `✓ Saved as a permanent memory:\n\n> ${cmd.fact}`
   }
   if (cmd.kind === 'remember-here') {
+    const id = nanoid()
     addDocMemory({
-      id: nanoid(),
+      id,
       docId,
       userId,
       fact: cmd.fact,
       createdAt: Date.now(),
     })
+    void embedAndStoreSlashMemory('doc', id, cmd.fact)
     return `✓ Saved as a memory for **this document**:\n\n> ${cmd.fact}`
   }
   if (cmd.kind === 'forget') {
@@ -479,4 +1109,26 @@ export function executeSlashCommand(
   parts.push('')
   parts.push(`Remove one with \`/forget <substring>\`.`)
   return parts.join('\n')
+}
+
+
+/** Fire-and-forget embed + persist for memories saved via the
+ *  /remember and /remember-here slash commands. Swallows errors —
+ *  the row is already in SQLite; the boot-time backfill picks up
+ *  any NULLs on the next restart. */
+async function embedAndStoreSlashMemory(
+  scope: 'user' | 'doc',
+  id: string,
+  fact: string,
+): Promise<void> {
+  try {
+    const { embedMemoryFact } = await import('../services/memoryEmbed.js')
+    const { setUserMemoryEmbedding, setDocMemoryEmbedding } = await import('../db/memoriesRepo.js')
+    const vec = await embedMemoryFact(fact)
+    if (!vec) return
+    if (scope === 'user') setUserMemoryEmbedding(id, vec)
+    else setDocMemoryEmbedding(id, vec)
+  } catch {
+    /* swallow */
+  }
 }

@@ -116,7 +116,13 @@ export function VaultSidebar() {
         sameJson(prev, mountsR.mounts) ? prev : mountsR.mounts,
       )
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
+      // 401 fires during the brief auth-restore window at sign-in;
+      // the bootstrap flow redirects to login on its own. Don't
+      // surface it as a banner — the user already sees the
+      // sign-in UI.
+      if (!(e instanceof ApiError && e.status === 401)) {
+        setError(e instanceof ApiError ? e.message : String(e))
+      }
     }
   }, [])
 
@@ -725,7 +731,7 @@ export function VaultSidebar() {
             {(vaultError || error) && (
               <div
                 className="px-3 py-2 rounded text-[12.5px] flex items-center gap-2"
-                style={{ background: '#FFEBE6', color: '#BF2600' }}
+                style={{ background: 'var(--danger-bg)', color: 'var(--danger-fg)' }}
               >
                 <AlertCircle size={13} />
                 <span className="flex-1 truncate">{vaultError || error}</span>

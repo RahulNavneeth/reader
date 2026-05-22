@@ -35,6 +35,7 @@ import { audit } from '../stores/audit.js'
 import { config } from '../config.js'
 import { addPin } from '../stores/pins.js'
 import type { ApiToken, DocumentMeta } from '../types.js'
+import { withEditLock } from '../lib/editLock.js'
 
 type RpcRequest = {
   jsonrpc: '2.0'
@@ -304,37 +305,9 @@ async function findDocByPath(owner: string, storageKey: string): Promise<Documen
   )
 }
 
-/**
- * Per-doc edit lock for the granular markdown tools. Without this,
- * two concurrent replace_section calls would both readFile the same
- * initial content, compute different mutations, and racing
- * writeFile would silently overwrite each other. The lock pins the
- * read → apply → write → saveMeta sequence to one in-flight chain
- * per docId. Single-node only — multi-instance deploys would need
- * a real distributed lock, but Reader is single-process today.
- */
-const editLocks = new Map<string, Promise<void>>()
-async function withEditLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
-  const prev = editLocks.get(docId) ?? Promise.resolve()
-  let release!: () => void
-  const next = new Promise<void>((r) => (release = r))
-  // Chain off the previous holder. .catch shields us from a prior
-  // failure tearing down the lock; the new holder still runs.
-  editLocks.set(
-    docId,
-    prev.catch(() => undefined).then(() => next),
-  )
-  await prev.catch(() => undefined)
-  try {
-    return await fn()
-  } finally {
-    release()
-    // Drop the entry only if no one else has chained behind us so
-    // the map doesn't leak. Race-safe because Map.get returns the
-    // CURRENT tail; if our next is still the tail, no one's queued.
-    if (editLocks.get(docId) === next) editLocks.delete(docId)
-  }
-}
+// Per-doc edit serialisation lives in lib/editLock.ts so the chat
+// apply-edit endpoint shares the same map — a concurrent agent
+// edit + chat edit on the same doc serialise together.
 
 async function handleCall(token: ApiToken, name: string, args: any) {
   // For read tools that go through ACL: use a synthetic principal that
@@ -487,6 +460,17 @@ async function handleCall(token: ApiToken, name: string, args: any) {
     const abs = resolveUserVault(actingUser, rel)
     await mkdir(path.dirname(abs), { recursive: true })
     const buffer = Buffer.from(content, 'utf8')
+    // Snapshot the pre-edit state of an existing doc before
+    // overwriting. The watcher would otherwise race saveMeta and
+    // snapshot the new state instead. snapshotVersion dedupes by
+    // sha256 so this is safe even if the watcher also fires.
+    {
+      const existingForSnap = await findDocByPath(actingUser, rel)
+      if (existingForSnap) {
+        const { snapshotVersion } = await import('../stores/versions.js')
+        await snapshotVersion(existingForSnap.id).catch(() => null)
+      }
+    }
     await writeFile(abs, buffer)
     const filename = path.basename(rel)
     const mime = filename.endsWith('.md')
@@ -618,6 +602,15 @@ async function handleCall(token: ApiToken, name: string, args: any) {
     await ensureUserVault(actingUser)
     const abs = resolveUserVault(actingUser, rel)
     await mkdir(path.dirname(abs), { recursive: true })
+    // Snapshot pre-write content if this is an overwrite. Same
+    // race-avoidance reason as the other MCP write paths.
+    {
+      const existingForSnap = await findDocByPath(actingUser, rel)
+      if (existingForSnap) {
+        const { snapshotVersion } = await import('../stores/versions.js')
+        await snapshotVersion(existingForSnap.id).catch(() => null)
+      }
+    }
     await writeFile(abs, buffer)
 
     const now = Date.now()
@@ -897,6 +890,13 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       }
 
       const nextBuffer = Buffer.from(nextText, 'utf8')
+      // Snapshot the pre-edit doc before applying this granular
+      // MCP edit. snapshotVersion dedupes by sha256 so the
+      // watcher's later fire on the file change is a no-op.
+      {
+        const { snapshotVersion } = await import('../stores/versions.js')
+        await snapshotVersion(meta.id).catch(() => null)
+      }
       await writeFile(abs, nextBuffer)
       const nextMeta: DocumentMeta = {
         ...meta,

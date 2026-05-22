@@ -1051,22 +1051,72 @@ export const api = {
     }),
 
   // chat — per-document AI chat
-  chatHistory: (docId: string) =>
-    get<{ messages: ChatMessageDTO[] }>(`/api/chat/${encodeURIComponent(docId)}/messages`),
+  chatHistory: (docId: string, threadId?: string) => {
+    const qs = threadId ? `?threadId=${encodeURIComponent(threadId)}` : ''
+    return get<{ messages: ChatMessageDTO[]; threadId: string | null }>(
+      `/api/chat/${encodeURIComponent(docId)}/messages${qs}`,
+    )
+  },
   chatClear: (docId: string) =>
     request<{ cleared: number }>('DELETE', `/api/chat/${encodeURIComponent(docId)}`),
+
+  /** Delete a single chat message by id. Used by the "Edit
+   *  question" flow which removes the old user turn + its
+   *  assistant answer before re-sending the edited question. */
+  deleteChatMessage: (docId: string, messageId: string) =>
+    request<{ ok: true }>(
+      'DELETE',
+      `/api/chat/${encodeURIComponent(docId)}/messages/${encodeURIComponent(messageId)}`,
+    ),
+
+  /** Tell the server to abort the in-flight generation for this
+   *  (doc, user, thread) AND drop the corresponding user turn so
+   *  the chat history doesn't surface a stopped/empty Q+A pair on
+   *  reload. Best-effort: returns ok even if there was no active
+   *  stream to cancel. */
+  cancelChatStream: (docId: string, threadId: string, opts?: { deleteUserTurn?: boolean }) =>
+    post<{ ok: true; found: boolean }>(
+      `/api/chat/${encodeURIComponent(docId)}/cancel`,
+      { threadId, ...(opts?.deleteUserTurn === false ? { deleteUserTurn: false } : null) },
+    ),
+
+  // Chat threads — multiple named conversations per (doc, user).
+  listChatThreads: (docId: string) =>
+    get<{ threads: ChatThreadDTO[] }>(`/api/chat/${encodeURIComponent(docId)}/threads`),
+  createChatThread: (docId: string, title?: string) =>
+    post<{ thread: ChatThreadDTO }>(
+      `/api/chat/${encodeURIComponent(docId)}/threads`,
+      title ? { title } : {},
+    ),
+  renameChatThread: (docId: string, threadId: string, title: string) =>
+    request<{ ok: true }>(
+      'PATCH',
+      `/api/chat/${encodeURIComponent(docId)}/threads/${encodeURIComponent(threadId)}`,
+      { title },
+    ),
+  deleteChatThread: (docId: string, threadId: string) =>
+    request<{ ok: true }>(
+      'DELETE',
+      `/api/chat/${encodeURIComponent(docId)}/threads/${encodeURIComponent(threadId)}`,
+    ),
 
   // Reader AI memories
   listUserMemories: () =>
     get<{ memories: UserMemoryDTO[] }>('/api/ai-memories'),
-  addUserMemory: (fact: string) =>
-    post<{ memory: UserMemoryDTO }>('/api/ai-memories', { fact }),
+  addUserMemory: (fact: string, opts?: { alwaysInject?: boolean }) =>
+    post<{ memory: UserMemoryDTO }>('/api/ai-memories', {
+      fact,
+      ...(opts?.alwaysInject ? { alwaysInject: true } : null),
+    }),
   deleteUserMemory: (id: string) =>
     request<{ ok: true }>('DELETE', `/api/ai-memories/${encodeURIComponent(id)}`),
   listDocMemories: (docId: string) =>
     get<{ memories: DocMemoryDTO[] }>(`/api/chat/${encodeURIComponent(docId)}/ai-memories`),
-  addDocMemory: (docId: string, fact: string) =>
-    post<{ memory: DocMemoryDTO }>(`/api/chat/${encodeURIComponent(docId)}/ai-memories`, { fact }),
+  addDocMemory: (docId: string, fact: string, opts?: { alwaysInject?: boolean }) =>
+    post<{ memory: DocMemoryDTO }>(`/api/chat/${encodeURIComponent(docId)}/ai-memories`, {
+      fact,
+      ...(opts?.alwaysInject ? { alwaysInject: true } : null),
+    }),
   deleteDocMemory: (docId: string, id: string) =>
     request<{ ok: true }>('DELETE', `/api/chat/${encodeURIComponent(docId)}/ai-memories/${encodeURIComponent(id)}`),
   submitChatFeedback: (
@@ -1077,6 +1127,18 @@ export const api = {
       `/api/chat/${encodeURIComponent(docId)}/feedback`,
       body,
     ),
+
+  // In-chat document editing
+  applyChatEdit: (docId: string, messageId: string) =>
+    post<{ ok: true; document: DocumentMeta }>(
+      `/api/chat/${encodeURIComponent(docId)}/apply-edit`,
+      { messageId },
+    ),
+  discardChatEdit: (docId: string, messageId: string) =>
+    request<{ ok: true }>(
+      'DELETE',
+      `/api/chat/${encodeURIComponent(docId)}/pending-edit/${encodeURIComponent(messageId)}`,
+    ),
 }
 
 export type UserMemoryDTO = {
@@ -1086,6 +1148,10 @@ export type UserMemoryDTO = {
   source: 'user_command' | 'auto_extracted'
   usedCount: number
   createdAt: number
+  /** When true, this memory is injected into every chat turn
+   *  regardless of cosine similarity to the query. Use for
+   *  implicit-preference memories ("answer in INR", "be terse"). */
+  alwaysInject?: boolean
 }
 
 export type DocMemoryDTO = {
@@ -1094,6 +1160,7 @@ export type DocMemoryDTO = {
   userId: string
   fact: string
   createdAt: number
+  alwaysInject?: boolean
 }
 
 export type ChatCitationDTO = {
@@ -1116,6 +1183,30 @@ export type MemoryUsedDTO = {
   preview: string
 }
 
+export type ProposedEditOpDTO =
+  | { op: 'replace_section'; heading: string; content: string }
+  | { op: 'insert_after'; heading: string; content: string }
+  | { op: 'delete_section'; heading: string }
+  | { op: 'append_text'; content: string }
+  | { op: 'prepend_text'; content: string }
+
+export type ChatThreadDTO = {
+  id: string
+  docId: string
+  userId: string
+  title: string
+  createdAt: number
+  updatedAt: number
+}
+
+export type ToolTraceEntryDTO = {
+  id: string
+  name: string
+  args: unknown
+  ok?: boolean
+  summary?: string
+}
+
 export type ChatMessageDTO = {
   id: string
   docId: string
@@ -1130,6 +1221,15 @@ export type ChatMessageDTO = {
    *  not installed, daemon down, etc.). UI renders via the friendly
    *  error formatter instead of the markdown pipeline. */
   error?: string | null
+  /** Structured edits the model proposed in this turn. UI renders
+   *  diff cards with Apply / Discard. */
+  pendingEdit?: ProposedEditOpDTO[] | null
+  editAppliedAt?: number | null
+  editTargetSha256?: string | null
+  /** Agent tool-call trace. Drives the "Reasoning (N steps)"
+   *  collapsible accordion above the answer. Null on legacy /
+   *  non-agent turns. */
+  toolTrace?: ToolTraceEntryDTO[] | null
   createdAt: number
 }
 
@@ -1137,8 +1237,11 @@ export type ChatMessageDTO = {
  *  inline by ChatPanel — kept here next to the type that produced
  *  them so the wire contract is colocated. */
 export type ChatStreamEvent =
-  | { kind: 'meta'; citations: ChatCitationDTO[]; memoriesUsed?: MemoryUsedDTO[] }
+  | { kind: 'meta'; citations: ChatCitationDTO[]; memoriesUsed?: MemoryUsedDTO[]; threadId?: string }
   | { kind: 'token'; token: string }
+  | { kind: 'tool_call_start'; id: string; name: string; args: unknown }
+  | { kind: 'tool_call_result'; id: string; ok: boolean; summary: string }
+  | { kind: 'thinking_text'; text: string }
   | { kind: 'done'; messageId: string | null }
   | { kind: 'error'; error: string }
 
@@ -1157,10 +1260,19 @@ export async function chatStream(
   content: string,
   onEvent: (e: ChatStreamEvent) => void,
   signal: AbortSignal,
-  opts?: { regenerateOf?: string },
+  opts?: { regenerateOf?: string; threadId?: string; attachedDocs?: string[] },
 ): Promise<void> {
-  const body: { content: string; regenerateOf?: string } = { content }
+  const body: {
+    content: string
+    regenerateOf?: string
+    threadId?: string
+    attachedDocs?: string[]
+  } = { content }
   if (opts?.regenerateOf) body.regenerateOf = opts.regenerateOf
+  if (opts?.threadId) body.threadId = opts.threadId
+  if (opts?.attachedDocs && opts.attachedDocs.length > 0) {
+    body.attachedDocs = opts.attachedDocs
+  }
   const res = await fetch(`/api/chat/${encodeURIComponent(docId)}/stream`, {
     method: 'POST',
     credentials: 'include',

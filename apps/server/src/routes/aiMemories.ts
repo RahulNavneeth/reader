@@ -30,7 +30,25 @@ import {
   deleteUserMemory,
   listDocMemories,
   listUserMemories,
+  setDocMemoryEmbedding,
+  setUserMemoryEmbedding,
 } from '../db/memoriesRepo.js'
+import { embedMemoryFact } from '../services/memoryEmbed.js'
+
+/** Embed a freshly-created memory and persist its vector. Fire-
+ *  and-forget; swallows errors (the embed backend may be offline)
+ *  because the row is already saved and the boot-time backfill
+ *  will pick it up next time the server starts. */
+async function embedAndStoreMemory(
+  scope: 'user' | 'doc',
+  id: string,
+  fact: string,
+): Promise<void> {
+  const vec = await embedMemoryFact(fact)
+  if (!vec) return
+  if (scope === 'user') setUserMemoryEmbedding(id, vec)
+  else setDocMemoryEmbedding(id, vec)
+}
 
 const FACT_MAX_CHARS = 1000
 
@@ -52,19 +70,25 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
     return { memories }
   })
 
-  app.post<{ Body: { fact?: string } }>('/api/ai-memories', async (req, reply) => {
+  app.post<{ Body: { fact?: string; alwaysInject?: boolean } }>('/api/ai-memories', async (req, reply) => {
     const user = req.currentUser!
     const fact = trimFact(req.body?.fact)
     if (!fact) return reply.code(400).send({ error: 'fact required (non-empty string)' })
     const id = nanoid()
     const createdAt = Date.now()
+    const alwaysInject = !!req.body?.alwaysInject
     addUserMemory({
       id,
       userId: user.username,
       fact,
       source: 'user_command',
       createdAt,
+      alwaysInject,
     })
+    // Fire-and-forget embed so the relevance retriever can score
+    // this memory immediately. If Ollama is down the row gets
+    // picked up by the boot-time backfill instead.
+    embedAndStoreMemory('user', id, fact).catch(() => { /* swallow */ })
     return {
       memory: {
         id,
@@ -73,6 +97,8 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
         source: 'user_command',
         usedCount: 0,
         createdAt,
+        embedding: null,
+        alwaysInject,
       },
     }
   })
@@ -92,7 +118,7 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
     return { memories }
   })
 
-  app.post<{ Params: { docId: string }; Body: { fact?: string } }>(
+  app.post<{ Params: { docId: string }; Body: { fact?: string; alwaysInject?: boolean } }>(
     '/api/chat/:docId/ai-memories',
     async (req, reply) => {
       const user = req.currentUser!
@@ -101,8 +127,15 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
       const id = nanoid()
       const docId = req.params.docId
       const createdAt = Date.now()
-      addDocMemory({ id, docId, userId: user.username, fact, createdAt })
-      return { memory: { id, docId, userId: user.username, fact, createdAt } }
+      const alwaysInject = !!req.body?.alwaysInject
+      addDocMemory({ id, docId, userId: user.username, fact, createdAt, alwaysInject })
+      embedAndStoreMemory('doc', id, fact).catch(() => { /* swallow */ })
+      return {
+        memory: {
+          id, docId, userId: user.username, fact, createdAt,
+          embedding: null, alwaysInject,
+        },
+      }
     },
   )
 

@@ -22,6 +22,7 @@ import { streamEmbeddedChunks } from '../db/chunksRepo.js'
 import { loadMeta, readText, userCanRead, listAllDocuments } from '../stores/documents.js'
 import { outline, getSection, type SectionRef } from '../lib/mdx.js'
 import {
+  listAllUserMemoriesForRetrieval,
   listUserMemoriesByPopularity,
   listDocMemories,
   listRecentErrorNotes,
@@ -30,7 +31,7 @@ import {
   type DocMemory,
   type ChatErrorNote,
 } from '../db/memoriesRepo.js'
-import type { ChatCitation, ChatMessage } from '../db/chatRepo.js'
+import type { ChatCitation, ChatMessage, ProposedEditOp } from '../db/chatRepo.js'
 import type { DocumentMeta } from '../types.js'
 
 export class ChatError extends Error {
@@ -74,7 +75,16 @@ type RagChunk = Required<Pick<ChatCitation, 'docId' | 'chunkIdx' | 'score' | 'do
 
 type AssembledContext = {
   anchor: DocumentMeta
+  /** Doc text to embed in the prompt's <document> block. Empty when
+   *  a section match fired (primary_sections carry the relevant
+   *  material instead). */
   anchorText: string
+  /** Full, un-budgeted doc text — always populated regardless of
+   *  whether section match fired. Used by tooling that needs to
+   *  look things up in the actual document (heading lookup for
+   *  the Reply-flow proposed-edit synthesiser, etc.). NOT included
+   *  in the prompt — keep ANCHOR_DOC_CHAR_BUDGET as the cap there. */
+  anchorTextFull: string
   /** Top-K chunks from the ANCHOR doc itself, scored against the
    *  query. Surfaced to the model as a "focus here first" block so
    *  a small model doesn't drown in 12K chars of doc text and end
@@ -122,6 +132,16 @@ export async function assembleContext(
   const sectionMatches = retrieveAnchorSections(query, anchor, anchorTextFull)
   const hasSectionMatch = sectionMatches.length > 0
 
+  // Skip cross-doc vault RAG when the query is a Reply-popover
+  // edit (`> "…"` quote + an edit verb). The user clearly wants
+  // the rephrase/rewrite to apply to THIS doc; surfacing
+  // unrelated vault docs in Sources is noise and the agent
+  // doesn't need them to do the edit. The model's @-mention
+  // path is still the way to bring in cross-doc context
+  // deliberately.
+  const skipVaultRag =
+    !!extractQuotedExcerpt(query) && detectEditIntent(query)
+
   let focusChunks: RagChunk[] = []
   let ragChunks: RagChunk[] = []
   try {
@@ -129,7 +149,9 @@ export async function assembleContext(
       hasSectionMatch
         ? Promise.resolve(sectionMatches)
         : retrieveAnchorFocus(query, anchor, user),
-      retrieveRagChunks(query, anchor, user),
+      skipVaultRag
+        ? Promise.resolve([])
+        : retrieveRagChunks(query, anchor, user),
     ])
   } catch (e) {
     if (e instanceof EmbedError) {
@@ -162,14 +184,52 @@ export async function assembleContext(
     anchorText = truncateForBudget(anchorTextFull, ANCHOR_DOC_CHAR_BUDGET)
   }
 
-  // Memory retrieval — synchronous SQLite reads, very cheap. We
-  // bump used_count for surfaced user memories here (rather than
-  // only on stream success) since "the memory was prepared and
-  // delivered to the model" is the right signal — popularity
-  // should track exposure, not just successful generations.
-  const permanentFacts = listUserMemoriesByPopularity(user.username, USER_MEMORY_INJECT_LIMIT)
-  const docFacts = listDocMemories(anchor.id, user.username).slice(0, DOC_MEMORY_INJECT_LIMIT)
+  // Memory retrieval — cosine-rank against the query so we only
+  // inject memories that are actually relevant to what the user
+  // just asked. Implicit-preference memories (alwaysInject=true)
+  // bypass the threshold so things like "answer in INR" always
+  // apply. Falls back to popularity-sort on the rare path where
+  // we couldn't embed the query (Ollama down).
   const knownMistakes = listRecentErrorNotes(user.username, ERROR_NOTE_INJECT_LIMIT)
+  const allUserMemories = listAllUserMemoriesForRetrieval(user.username)
+  const allDocMemories = listDocMemories(anchor.id, user.username)
+
+  // We need a query vector to score memories. Reuse what we
+  // already computed via retrieveAnchorFocus when possible — but
+  // that ran inside a Promise.all above, so we re-embed here. The
+  // memory list is small; one embed call is fine. If the embed
+  // backend is offline we fall back to popularity for permanents
+  // and recency for doc-scoped memories.
+  let queryVec: Float32Array | null = null
+  try {
+    const [v] = await embedBatch([query], 'query')
+    if (v && v.length > 0) queryVec = new Float32Array(v)
+  } catch {
+    queryVec = null
+  }
+
+  const MEMORY_RELEVANCE_THRESHOLD = 0.55
+  const permanentFacts = rankMemoriesByRelevance(
+    allUserMemories,
+    queryVec,
+    USER_MEMORY_INJECT_LIMIT,
+    MEMORY_RELEVANCE_THRESHOLD,
+  )
+  const docFacts = rankMemoriesByRelevance(
+    allDocMemories,
+    queryVec,
+    DOC_MEMORY_INJECT_LIMIT,
+    MEMORY_RELEVANCE_THRESHOLD,
+  )
+
+  // Fallback when the embed backend is offline: keep the legacy
+  // popularity-sort for user memories so the prompt isn't
+  // memory-blind. Doc memories fall back to most-recent.
+  if (queryVec === null && allUserMemories.length > 0 && permanentFacts.length === 0) {
+    const fallback = listUserMemoriesByPopularity(user.username, USER_MEMORY_INJECT_LIMIT)
+    permanentFacts.push(...fallback)
+  }
+
   if (permanentFacts.length > 0) {
     incrementUserMemoryUsage(permanentFacts.map((m) => m.id))
   }
@@ -177,6 +237,7 @@ export async function assembleContext(
   return {
     anchor,
     anchorText,
+    anchorTextFull,
     focusChunks,
     ragChunks,
     hasSectionMatch,
@@ -292,11 +353,78 @@ export function retrieveAnchorSections(
 }
 
 /**
+/**
+ * Cosine-rank memories against the user's query and return the
+ * top N that exceed the threshold, plus any memory flagged
+ * alwaysInject (those bypass the threshold).
+ *
+ *   • If queryVec is null (embed backend offline), the function
+ *     returns ONLY the alwaysInject set — callers should fall
+ *     back to popularity for user memories so the prompt isn't
+ *     memory-blind.
+ *   • A memory without its own embedding cannot be scored against
+ *     the query, so it only survives via alwaysInject.
+ *
+ * The returned array preserves the order: alwaysInject first,
+ * then by cosine descending.
+ */
+export function rankMemoriesByRelevance<
+  T extends { id: string; embedding: Float32Array | null; alwaysInject: boolean },
+>(
+  memories: T[],
+  queryVec: Float32Array | null,
+  limit: number,
+  threshold: number,
+): T[] {
+  const out: T[] = []
+  const seen = new Set<string>()
+  // alwaysInject memories first — they're implicit-preference rules
+  // that should always apply, regardless of how the query reads.
+  for (const m of memories) {
+    if (!m.alwaysInject) continue
+    out.push(m)
+    seen.add(m.id)
+    if (out.length >= limit) return out
+  }
+  if (!queryVec) return out
+
+  // Pre-compute the query's norm so each cosine is one dot product.
+  let qNormSq = 0
+  for (let i = 0; i < queryVec.length; i++) qNormSq += queryVec[i] * queryVec[i]
+  const qNorm = Math.sqrt(qNormSq)
+  if (qNorm === 0) return out
+
+  type Scored = { m: T; score: number }
+  const scored: Scored[] = []
+  for (const m of memories) {
+    if (seen.has(m.id)) continue
+    if (!m.embedding || m.embedding.length !== queryVec.length) continue
+    let dot = 0
+    let mNormSq = 0
+    for (let i = 0; i < queryVec.length; i++) {
+      dot += queryVec[i] * m.embedding[i]
+      mNormSq += m.embedding[i] * m.embedding[i]
+    }
+    const mNorm = Math.sqrt(mNormSq)
+    if (mNorm === 0) continue
+    const cos = dot / (qNorm * mNorm)
+    if (cos < threshold) continue
+    scored.push({ m, score: cos })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  for (const { m } of scored) {
+    out.push(m)
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+/**
  * Score the ANCHOR doc's own chunks against the user's question and
  * return the top N. Lets the prompt highlight "look here first" for
  * section-specific questions like "explain Scenario B".
  */
-async function retrieveAnchorFocus(
+export async function retrieveAnchorFocus(
   query: string,
   anchor: DocumentMeta,
   user: { username: string; role: string },
@@ -333,7 +461,7 @@ async function retrieveAnchorFocus(
   }))
 }
 
-async function retrieveRagChunks(
+export async function retrieveRagChunks(
   query: string,
   anchor: DocumentMeta,
   user: { username: string; role: string },
@@ -432,6 +560,290 @@ async function retrieveRagChunks(
  *      | ---     | ---     |
  *      | cell    | cell    |
  *  Anything else falls through untouched. */
+/** Parse `<proposed_edit op="..." heading="...">…</proposed_edit>`
+ *  blocks out of the assistant's streamed content. Returns the
+ *  list of parsed ops; malformed or unknown-op blocks are silently
+ *  skipped so the assistant turn falls through to a normal text
+ *  message rather than half-applying.
+ *
+ *  The block format mirrors our other XML-tagged prompt sections
+ *  (<primary_sections>, <rules>) so the model can follow a single
+ *  convention. Tagged blocks parse cleanly without bracket-
+ *  balancing inside markdown code fences.
+ *
+ *  Attribute values may be in single or double quotes (qwen
+ *  models sometimes alternate). Body content can span multiple
+ *  lines and contain markdown including tables. */
+export function parseProposedEdits(text: string): ProposedEditOp[] {
+  if (!text || !text.includes('<proposed_edit')) return []
+  const out: ProposedEditOp[] = []
+  // Non-greedy body match across newlines via [\s\S]. We accept
+  // either order of attributes, and either quote style.
+  const blockRe = /<proposed_edit\s+([^>]*?)>([\s\S]*?)<\/proposed_edit>/g
+  let m: RegExpExecArray | null
+  while ((m = blockRe.exec(text)) !== null) {
+    const attrs = parseAttrs(m[1])
+    const body = m[2]
+    // Trim a single leading/trailing newline so the body reads
+    // cleanly without absorbing the indentation between tags.
+    const content = body.replace(/^\n/, '').replace(/\n$/, '')
+    const op = (attrs.op ?? '').toLowerCase()
+    const heading = attrs.heading
+
+    switch (op) {
+      case 'replace_section':
+        if (!heading) continue
+        out.push({ op: 'replace_section', heading, content })
+        break
+      case 'insert_after':
+        if (!heading) continue
+        out.push({ op: 'insert_after', heading, content })
+        break
+      case 'delete_section':
+        if (!heading) continue
+        // delete_section ignores body content — the heading
+        // alone determines what's dropped.
+        out.push({ op: 'delete_section', heading })
+        break
+      case 'append_text':
+        out.push({ op: 'append_text', content })
+        break
+      case 'prepend_text':
+        out.push({ op: 'prepend_text', content })
+        break
+      default:
+        // Unknown op (typo, model confabulation) — skip silently.
+        continue
+    }
+  }
+  return out
+}
+
+/** Lightweight attribute parser for the proposed_edit opening tag.
+ *  Handles single + double quotes; doesn't try to fully parse XML
+ *  (no entity decoding, no namespace handling — not needed). */
+function parseAttrs(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {}
+  const re = /(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(raw)) !== null) {
+    attrs[m[1].toLowerCase()] = m[2] ?? m[3] ?? ''
+  }
+  return attrs
+}
+
+/** Strip `<proposed_edit>` blocks from the assistant's content
+ *  before persistence. The structured edits are stored in the
+ *  pending_edit column; the user-visible text shouldn't contain
+ *  the raw XML markers (rendered as visible XML in the bubble).
+ *  Whitespace around the removed blocks is collapsed so we don't
+ *  leave double-blank-line scars. */
+/**
+ * Strip a trailing echo of the user's instruction from the assistant
+ * response. Small models occasionally append the user's directive
+ * verbatim (or near-verbatim) as a closing line — e.g. ending with
+ * "explain it with simple words." after answering a question.
+ *
+ * Strategy:
+ *   • Tokenise the user's query (lowercased, alphanumerics + stop-
+ *     word-stripped).
+ *   • Look at the last sentence/line of the assistant response. If
+ *     >=70% of its content tokens appear in the query token set
+ *     (and it's <= 18 words), treat it as an echo and drop it.
+ *   • Repeat once on the resulting tail in case the model echoed
+ *     across two lines.
+ *
+ * Conservative on purpose — we only strip very short, very-similar
+ * trailing fragments. Legitimate paraphrases that share fewer tokens
+ * survive; long restatements that are actually informative survive.
+ */
+export function stripInstructionEcho(response: string, query: string): string {
+  if (!response || !query) return response
+  const queryTokens = tokenizeForEchoMatch(query)
+  if (queryTokens.size === 0) return response
+  let cur = response
+  for (let pass = 0; pass < 2; pass++) {
+    const trimmed = cur.replace(/\s+$/, '')
+    if (!trimmed) break
+    // Find the start of the last "sentence/line" segment. We treat
+    // a hard newline OR a sentence terminator (. ! ?) followed by
+    // whitespace as a segment boundary.
+    let cutAt = -1
+    for (let i = trimmed.length - 2; i >= 0; i--) {
+      const c = trimmed[i]
+      if (c === '\n') {
+        cutAt = i + 1
+        break
+      }
+      if ((c === '.' || c === '!' || c === '?') && /\s/.test(trimmed[i + 1] ?? '')) {
+        cutAt = i + 1
+        // Skip leading whitespace of the next segment.
+        while (cutAt < trimmed.length && /\s/.test(trimmed[cutAt])) cutAt++
+        break
+      }
+    }
+    if (cutAt < 0) cutAt = 0
+    const tail = trimmed.slice(cutAt).trim().replace(/[."!?]+$/g, '').trim()
+    if (!tail) break
+    const tailTokens = tokenizeForEchoMatch(tail)
+    if (tailTokens.size === 0 || tailTokens.size > 18) break
+    let overlap = 0
+    for (const t of tailTokens) if (queryTokens.has(t)) overlap++
+    if (overlap / tailTokens.size < 0.7) break
+    cur = trimmed.slice(0, cutAt).replace(/\s+$/, '')
+  }
+  return cur
+}
+
+const ECHO_STOPWORDS = new Set([
+  'a', 'an', 'the', 'this', 'that', 'these', 'those',
+  'it', 'its', 'is', 'are', 'was', 'were', 'be',
+  'i', 'me', 'my', 'you', 'your', 'we', 'us',
+  'and', 'or', 'but', 'if', 'so',
+  'to', 'of', 'in', 'on', 'at', 'by', 'for', 'with', 'about',
+  'as', 'from', 'into',
+  'do', 'does', 'did',
+])
+
+function tokenizeForEchoMatch(s: string): Set<string> {
+  const out = new Set<string>()
+  for (const raw of s.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
+    if (raw.length <= 1) continue
+    if (ECHO_STOPWORDS.has(raw)) continue
+    out.add(raw)
+  }
+  return out
+}
+
+export function stripProposedEditBlocks(text: string): string {
+  return text
+    .replace(/<proposed_edit\s+[^>]*?>[\s\S]*?<\/proposed_edit>/g, '')
+    .replace(/<proposed_edit\s+[^>]*?\/>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/**
+ * Extract the blockquoted excerpt from a Reply-popover query.
+ * Returns null if the query doesn't start with `> "…"`.
+ *
+ * Reply-popover messages have the shape:
+ *   > "<excerpt copied from the doc>"
+ *
+ *   <user's freeform question>
+ */
+export function extractQuotedExcerpt(query: string): string | null {
+  const m = query.match(/^\s*>\s*"([^]*?)"\s*(?:\n|$)/)
+  if (!m) return null
+  const excerpt = m[1].trim()
+  return excerpt.length > 0 ? excerpt : null
+}
+
+/**
+ * Locate the ATX heading whose section CONTAINS the quoted excerpt.
+ * Returns null if the excerpt can't be found in the document, or if
+ * it appears before any heading (top-of-doc preamble).
+ *
+ * Why this matters:
+ *   The model has no reliable way to pick the right heading attribute
+ *   on its own — small models guess, hallucinate, or omit the
+ *   heading entirely. Computing it server-side from the actual doc
+ *   text and passing it as a hint converts an unreliable "find the
+ *   heading" task into a "use this heading" instruction the model
+ *   can follow.
+ */
+export function locateHeadingForExcerpt(docText: string, excerpt: string): string | null {
+  if (!docText || !excerpt) return null
+  // Strip the surrounding `"…"` and normalise whitespace so we can
+  // do a tolerant substring match — the excerpt may have been
+  // copied with subtly different whitespace than the canonical
+  // text.
+  const needle = excerpt.replace(/\s+/g, ' ').trim()
+  if (!needle) return null
+  // Normalise the doc text the same way, but track original line
+  // positions so we can map matches back to headings.
+  const lines = docText.split('\n')
+  const flatLines = lines.map((l) => l.replace(/\s+/g, ' ').trim())
+  const flatJoined = flatLines.join('\n')
+  const idx = flatJoined.indexOf(needle)
+  if (idx < 0) return null
+  // Count how many lines precede the match point.
+  const beforeMatch = flatJoined.slice(0, idx)
+  const matchLineNo = beforeMatch.split('\n').length - 1
+  // Walk backward through the original lines from matchLineNo,
+  // looking for the nearest ATX heading. Fence-aware: skip lines
+  // inside fenced code blocks (heading-shaped lines in code don't
+  // count as section markers).
+  let inFence = false
+  // Tally fence state from line 0 up to matchLineNo so backward
+  // scanning has the right `inFence` baseline.
+  const fenceAtLine: boolean[] = new Array(lines.length).fill(false)
+  let cur = false
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*```/.test(lines[i])) cur = !cur
+    fenceAtLine[i] = cur
+  }
+  for (let i = matchLineNo; i >= 0; i--) {
+    inFence = fenceAtLine[i]
+    if (inFence) continue
+    const m = lines[i].match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/)
+    if (m) return m[2].trim()
+  }
+  return null
+}
+
+/**
+ * Heuristic: does the user's message look like an edit request
+ * (vs. an explanation / lookup)?
+ *
+ * Why an explicit heuristic and not "just trust Rule 10":
+ *   Small models (0.5b–7b) do not reliably emit structured XML
+ *   blocks just because the system prompt asks them to. Their
+ *   compliance shoots up when we ALSO front-load an explicit
+ *   "<edit_mode required=true>" directive at the top of the
+ *   prompt — but only when there's actually edit intent, otherwise
+ *   we'd force proposed_edit blocks for pure-explain questions too.
+ *
+ * Match rules:
+ *   - First we strip any leading `>` blockquote (the Reply popover
+ *     prepends a quoted excerpt) so verbs in the quote itself don't
+ *     count — only the user's freeform question matters.
+ *   - Then we look for an edit verb either at the start of the
+ *     message ("rephrase this", "rewrite the…") or as a whole word
+ *     anywhere in the user-typed portion.
+ *
+ * Explicitly NOT triggers: "explain", "summarize", "describe",
+ * "what does this mean", "how does X work" — pure-read intents.
+ */
+export function detectEditIntent(query: string): boolean {
+  // Strip the leading blockquote that the Reply popover prepends.
+  // We only inspect the user's freeform question, not the quoted
+  // excerpt — otherwise an excerpt that happens to contain "add"
+  // or "remove" would falsely trigger edit mode.
+  const userPart = query.replace(/^\s*>\s*"[^]*?"\s*\n*/m, '').trim()
+  if (!userPart) return false
+  const editVerbs = [
+    'rephrase', 'reword', 'rewrite', 'rewrtie', 'rewite',
+    'edit', 'modify', 'change', 'update', 'revise',
+    'fix', 'correct', 'improve', 'polish', 'clean up', 'tighten',
+    'shorten', 'condense', 'trim', 'cut',
+    'expand', 'elaborate on this in the doc', 'flesh out',
+    'add', 'append', 'prepend', 'insert',
+    'remove', 'delete', 'drop', 'strip', 'get rid of',
+    'replace',
+    'make this', 'make it',
+    'turn this into', 'convert this to',
+  ]
+  const lower = userPart.toLowerCase()
+  return editVerbs.some((verb) => {
+    // Match as a whole word (or phrase) — `\b` handles word
+    // boundaries for single tokens; multi-word phrases match as-is.
+    if (verb.includes(' ')) return lower.includes(verb)
+    const re = new RegExp(`\\b${verb}\\b`, 'i')
+    return re.test(lower)
+  })
+}
+
 /** Generate a one-line hint telling the model what kind of source
  *  the document body came from. Small models otherwise treat OCR'd
  *  image text, extracted PDF text, transcripts, and markdown all
@@ -620,6 +1032,47 @@ export function buildOllamaMessages(
     `You are Reader AI — a document-grounded assistant inside the user's personal vault. You answer ONLY from the supplied material.`,
   ]
 
+  // Edit-intent detection — when the user is clearly asking to
+  // MODIFY the document (verbs like rephrase/rewrite/edit/fix/add/
+  // remove/append/…), we inject a strong directive at the TOP of
+  // the prompt requiring a <proposed_edit> block. Small models do
+  // not follow the rules-at-the-bottom instruction consistently;
+  // a duplicated top-level directive raises the success rate.
+  const editIntent = detectEditIntent(query)
+  // If the query is a Reply-popover message with a `> "…"` quote AND
+  // edit intent fired, locate which heading owns the quote so we can
+  // tell the model exactly which heading to target. Without this hint
+  // the model would have to scan the doc and guess — small models
+  // get this wrong most of the time.
+  const quotedExcerpt = editIntent ? extractQuotedExcerpt(query) : null
+  const quotedHeading = quotedExcerpt && ctx.anchorTextFull
+    ? locateHeadingForExcerpt(ctx.anchorTextFull, quotedExcerpt)
+    : null
+  if (editIntent) {
+    systemParts.push(
+      ``,
+      `<edit_mode required="true">`,
+      `The user is asking you to MODIFY this document. Your response MUST include exactly one <proposed_edit> XML block. A prose-only answer is a hard rule violation.`,
+      ``,
+      `Output shape (in this exact order):`,
+      `  1. ONE short sentence describing what you are changing. No "Rephrase:" prefix, no quoted preview — just describe the change.`,
+      `  2. Then a single <proposed_edit> block. The block contains the NEW content directly, not a rephrase-of-a-rephrase or a description of the change.`,
+      ``,
+      `Pick ONE op:`,
+      `  <proposed_edit op="replace_section" heading="EXACT HEADING">…new BODY only — DO NOT repeat the "## heading" line; the existing heading stays automatically…</proposed_edit>`,
+      `  <proposed_edit op="insert_after" heading="EXACT HEADING">…new content…</proposed_edit>`,
+      `  <proposed_edit op="delete_section" heading="EXACT HEADING"></proposed_edit>`,
+      `  <proposed_edit op="append_text">…content to add at end…</proposed_edit>`,
+      `  <proposed_edit op="prepend_text">…content to add at start…</proposed_edit>`,
+      ``,
+      `The "heading" attribute must match an existing ATX heading character-for-character (no leading #).`,
+      quotedHeading
+        ? `HINT: The user's quoted excerpt comes from the section with heading "${quotedHeading}". Use op="replace_section" heading="${quotedHeading}" and put ONLY the new section body inside (NO leading "## ${quotedHeading}" line — the existing heading is preserved automatically).`
+        : `If unsure which heading owns the change, use append_text or prepend_text.`,
+      `</edit_mode>`,
+    )
+  }
+
   // MIME-aware framing — tells the model whether the body is OCR'd
   // image text, extracted PDF text, a transcript, a spreadsheet
   // dump, etc. Without this, small models treat fragmented OCR
@@ -749,6 +1202,21 @@ export function buildOllamaMessages(
     `7. Quote the source in backticks when you summarise or transform a passage.`,
     `8. Cite supporting vault chunks inline like [DocTitle].`,
     `9. NO META-COMMENTARY — Do NOT mention, quote, or reference the internal labels of this prompt: <primary_sections>, <document>, <supporting_vault_context>, <permanent_facts>, <doc_facts>, <known_mistakes>, <rules>, <example_*>. The user never sees those tag names. Do NOT include sentences like "Primary Sections covers X", "Rule Summary:", "Supporting Vault Context says Y", or any restatement of these rules. Do not restate the question. Do not say "Sure!", "Of course!", "Great question!". Just answer.`,
+    `9a. NO INSTRUCTION ECHO — Do NOT include the user's instruction or directive in your output. The user already knows what they asked. Forbidden patterns: ending your answer with phrases like "explain it with simple words", "explain in detail", "tell me more", "show me X", "what is Y", "can you Z" — those are the user's words, not yours. If you finish the explanation, STOP. Do not append the request back as a closing line.`,
+    `10. PROPOSED EDITS — When the user asks to MODIFY this document (verbs like rewrite, rephrase, edit, fix, improve, tighten, expand, add, append, prepend, insert, remove, delete, replace), do BOTH of the following in order:`,
+    `    (a) Write a brief natural-language explanation of WHAT you are about to change and why (1-3 sentences, no headings).`,
+    `    (b) Then emit ONE proposed_edit XML block using exactly one of these five ops:`,
+    `        • <proposed_edit op="replace_section" heading="EXACT HEADING TEXT">…new content for that section…</proposed_edit>`,
+    `        • <proposed_edit op="insert_after" heading="EXACT HEADING TEXT">…new section to add after that heading's block…</proposed_edit>`,
+    `        • <proposed_edit op="delete_section" heading="EXACT HEADING TEXT"></proposed_edit>`,
+    `        • <proposed_edit op="append_text">…content to append to end of document…</proposed_edit>`,
+    `        • <proposed_edit op="prepend_text">…content to prepend to start of document…</proposed_edit>`,
+    `    RULES FOR THE BLOCK:`,
+    `    • The "heading" attribute must match an existing ATX heading inside <primary_sections> or <document> CHARACTER-FOR-CHARACTER (no leading #, but include exact wording, casing, punctuation). If the heading you need doesn't exist, use append_text or prepend_text instead.`,
+    `    • The content INSIDE the tags is the new markdown body — for replace_section/insert_after, INCLUDE the heading line ("## My Heading") at the top of the content if you want a heading; otherwise omit it.`,
+    `    • Emit AT MOST ONE proposed_edit block per turn. Pick the single change that best satisfies the request.`,
+    `    • Do NOT emit a proposed_edit block when the user is only asking for an explanation, summary, definition, or comparison — only when they explicitly ask to change the document.`,
+    `    • Do NOT mention the proposed_edit block in your natural-language part — the UI renders it as a separate card with Apply / Discard buttons.`,
     `</rules>`,
     ``,
     `<example_explanation_shape>`,
@@ -803,16 +1271,54 @@ export function buildOllamaMessages(
     `User: who is the prime minister of france?`,
     `Reader AI: ${notFound}`,
     `</example_not_in_doc>`,
+    ``,
+    `<example_propose_replace_section>`,
+    `User: rewrite the Risks section to be tighter.`,
+    `Reader AI:`,
+    `Tightening the Risks section into a single paragraph.`,
+    `<proposed_edit op="replace_section" heading="Risks">Equity exposure carries volatility risk: drawdowns of 30-50% are normal once a decade, and the strategy assumes you do not sell into them. Liquidity is constrained by the 3-year ELSS lock-in.`,
+    `</proposed_edit>`,
+    `</example_propose_replace_section>`,
+    ``,
+    `<example_propose_append_text>`,
+    `User: add a TODO at the end reminding me to revisit this in Q3.`,
+    `Reader AI:`,
+    `Adding a TODO line at the end of the document.`,
+    `<proposed_edit op="append_text">`,
+    ``,
+    `> TODO: revisit in Q3.`,
+    `</proposed_edit>`,
+    `</example_propose_append_text>`,
+    ``,
+    `<example_reply_with_quote>`,
+    `User: > "Top up emergency fund to whatever 6x new monthly expenses looks like."`,
+    ``,
+    `rephrase this`,
+    `Reader AI:`,
+    `Rephrasing in a more direct tone while keeping the 6x rule intact.`,
+    `<proposed_edit op="replace_section" heading="Emergency Fund">Raise the emergency fund so it covers six months of current expenses. Park it in a liquid fund, not a savings account.`,
+    `</proposed_edit>`,
+    `</example_reply_with_quote>`,
+    ``,
+    `<example_no_edit_just_explain>`,
+    `User: > "Top up emergency fund to whatever 6x new monthly expenses looks like."`,
+    ``,
+    `what does this mean?`,
+    `Reader AI: It is a rule of thumb: keep liquid savings equal to six months of your current monthly spending. As spending rises with income, the target rises with it. No edit proposed — you only asked for an explanation.`,
+    `</example_no_edit_just_explain>`,
   )
 
   const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
     { role: 'system', content: systemParts.join('\n') },
   ]
-  // Selection-popover questions ("Explain this: …") are always a
-  // fresh topic — the user highlighted some text and asked about
-  // it, prior conversation is irrelevant. Strip history so the
-  // model can't drag in hallucinated content from previous turns.
-  const isSelectionQuery = /^\s*Explain this:\s*"/i.test(query)
+  // Selection-popover questions strip history. Two shapes:
+  //   • "Explain this: …" — Explain button, auto-sent.
+  //   • A leading blockquote line `> "…"` followed by the user's
+  //     freeform question — the Reply button, where the user
+  //     quotes a selection and asks anything against it.
+  // Both are fresh topics; the prior conversation is irrelevant.
+  const isSelectionQuery =
+    /^\s*Explain this:\s*"/i.test(query) || /^\s*>\s*"/.test(query)
   if (!isSelectionQuery) {
     const trimmed = history.slice(-HISTORY_MESSAGE_LIMIT)
     for (const m of trimmed) {

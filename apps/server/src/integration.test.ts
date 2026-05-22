@@ -466,6 +466,183 @@ describe('integration: slash commands', () => {
   })
 })
 
+describe('integration: chat apply-edit', () => {
+  let cookie = ''
+  let docId = ''
+
+  it('logs in + seeds a markdown doc with sections', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+    expect(cookie).toBeTruthy()
+
+    // Insert the doc directly so we don't pull the full upload
+    // pipeline into the test. We need a real file on disk too,
+    // since apply-edit reads it.
+    docId = 'apply-edit-doc'
+    const now = Date.now()
+    const body = '# Heading\n\n## Caveats\n\nshort body.\n'
+    const sha = await import('node:crypto').then((c) =>
+      c.createHash('sha256').update(body).digest('hex'),
+    )
+    db()
+      .prepare(
+        `INSERT INTO documents
+           (id, owner, storage_key, title, original_filename, mime, bytes, sha256, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(docId, 'alice', 'apply-edit-doc.md', 'Apply Edit Doc', 'apply-edit-doc.md', 'text/markdown', body.length, sha, now, now)
+    // Write the file to the user vault so the apply path can
+    // read + write it.
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', 'apply-edit-doc.md')
+    await mkdir(path.dirname(abs), { recursive: true })
+    await writeFile(abs, body)
+
+    // Insert an assistant chat turn with a pending edit.
+    db()
+      .prepare(
+        `INSERT INTO chat_messages
+           (id, doc_id, user_id, role, content, citations, memories_used,
+            error_text, pending_edit, edit_applied_at, edit_target_sha256,
+            created_at)
+         VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, ?)`,
+      )
+      .run(
+        'asst-1',
+        docId,
+        'alice',
+        'assistant',
+        'Here is a shorter Caveats.',
+        JSON.stringify([
+          { op: 'replace_section', heading: 'Caveats', content: 'tiny.' },
+        ]),
+        sha,
+        now,
+      )
+  })
+
+  it('rejects apply-edit with no messageId (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/chat/${docId}/apply-edit`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: {},
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('rejects unknown messageId (404)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/chat/${docId}/apply-edit`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { messageId: 'no-such-id' },
+    })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('applies a pending replace_section, marks applied, returns updated meta', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/chat/${docId}/apply-edit`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { messageId: 'asst-1' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(body.ok).toBe(true)
+    expect(body.document.bytes).toBeGreaterThan(0)
+
+    // Disk reflects the edit.
+    const { readFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', 'apply-edit-doc.md')
+    const text = (await readFile(abs)).toString('utf8')
+    expect(text).toContain('tiny.')
+    expect(text).not.toContain('short body.')
+  })
+
+  it('refuses a second apply on the same turn (409 already applied)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/chat/${docId}/apply-edit`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { messageId: 'asst-1' },
+    })
+    expect(r.statusCode).toBe(409)
+  })
+
+  it('refuses on sha mismatch (conflict)', async () => {
+    // Insert a new assistant turn with a stale sha.
+    db()
+      .prepare(
+        `INSERT INTO chat_messages
+           (id, doc_id, user_id, role, content, citations, memories_used,
+            error_text, pending_edit, edit_applied_at, edit_target_sha256,
+            created_at)
+         VALUES (?, ?, ?, 'assistant', ?, NULL, NULL, NULL, ?, NULL, ?, ?)`,
+      )
+      .run(
+        'asst-2',
+        docId,
+        'alice',
+        'Another edit.',
+        JSON.stringify([{ op: 'delete_section', heading: 'Caveats' }]),
+        'stale-sha-deadbeef',
+        Date.now(),
+      )
+    const r = await app.inject({
+      method: 'POST',
+      url: `/api/chat/${docId}/apply-edit`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { messageId: 'asst-2' },
+    })
+    expect(r.statusCode).toBe(409)
+    expect(r.json().code).toBe('sha_mismatch')
+  })
+
+  it('DELETE discards a pending edit, content stays', async () => {
+    db()
+      .prepare(
+        `INSERT INTO chat_messages
+           (id, doc_id, user_id, role, content, citations, memories_used,
+            error_text, pending_edit, edit_applied_at, edit_target_sha256,
+            created_at)
+         VALUES (?, ?, ?, 'assistant', ?, NULL, NULL, NULL, ?, NULL, ?, ?)`,
+      )
+      .run(
+        'asst-3',
+        docId,
+        'alice',
+        'Maybe rename this.',
+        JSON.stringify([{ op: 'delete_section', heading: 'Heading' }]),
+        null,
+        Date.now(),
+      )
+    const r = await app.inject({
+      method: 'DELETE',
+      url: `/api/chat/${docId}/pending-edit/asst-3`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+
+    // Second discard should 404 — payload's gone.
+    const r2 = await app.inject({
+      method: 'DELETE',
+      url: `/api/chat/${docId}/pending-edit/asst-3`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r2.statusCode).toBe(404)
+  })
+})
+
 describe('integration: security headers', () => {
   it('returns the standard security header bundle on every response', async () => {
     const r = await app.inject({ method: 'GET', url: '/health' })

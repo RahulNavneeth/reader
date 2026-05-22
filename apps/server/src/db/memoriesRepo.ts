@@ -24,6 +24,16 @@ export type UserMemory = {
   source: MemorySource
   usedCount: number
   createdAt: number
+  /** Pre-computed embedding of `fact` via nomic-embed-text. Null
+   *  until the backfill job runs; the retrieval path treats null
+   *  embeddings the same as low cosine — only `alwaysInject`
+   *  memories survive without one. */
+  embedding: Float32Array | null
+  /** When true, this memory is injected into every chat turn
+   *  regardless of cosine similarity. Use for implicit
+   *  preferences ("answer in INR", "be terse") that don't share
+   *  tokens with most queries. */
+  alwaysInject: boolean
 }
 
 export type DocMemory = {
@@ -32,6 +42,8 @@ export type DocMemory = {
   userId: string
   fact: string
   createdAt: number
+  embedding: Float32Array | null
+  alwaysInject: boolean
 }
 
 export type ChatErrorNote = {
@@ -54,6 +66,26 @@ type UserMemoryRow = {
   source: string
   used_count: number
   created_at: number
+  embedding: Buffer | null
+  always_inject: number
+}
+
+/** Convert SQLite BLOB → Float32Array. Returns null if the blob is
+ *  empty, absent, or has a length that isn't a multiple of 4
+ *  bytes (a Float32 is 4 bytes, so unaligned BLOBs would silently
+ *  truncate via `byteLength / 4` integer division and quietly
+ *  corrupt cosine ranking). */
+function blobToEmbedding(buf: Buffer | null): Float32Array | null {
+  if (!buf || buf.byteLength === 0) return null
+  if (buf.byteLength % 4 !== 0) return null
+  // better-sqlite3 returns Buffer; reuse its underlying memory by
+  // creating a Float32Array view without copying.
+  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)
+}
+
+function embeddingToBlob(v: Float32Array | null): Buffer | null {
+  if (!v) return null
+  return Buffer.from(v.buffer, v.byteOffset, v.byteLength)
 }
 
 function rowToUserMemory(r: UserMemoryRow): UserMemory {
@@ -64,6 +96,8 @@ function rowToUserMemory(r: UserMemoryRow): UserMemory {
     source: r.source === 'auto_extracted' ? 'auto_extracted' : 'user_command',
     usedCount: r.used_count,
     createdAt: r.created_at,
+    embedding: blobToEmbedding(r.embedding),
+    alwaysInject: r.always_inject === 1,
   }
 }
 
@@ -73,10 +107,29 @@ function rowToUserMemory(r: UserMemoryRow): UserMemory {
 export function listUserMemories(userId: string): UserMemory[] {
   const rows = db()
     .prepare(
-      `SELECT id, user_id, fact, source, used_count, created_at
+      `SELECT id, user_id, fact, source, used_count, created_at,
+              embedding, always_inject
          FROM user_memories
         WHERE user_id = ?
         ORDER BY created_at DESC`,
+    )
+    .all(userId) as UserMemoryRow[]
+  return rows.map(rowToUserMemory)
+}
+
+/** All user memories for the retrieval ranker. Returns the full
+ *  set (no popularity cap) so the caller can score by cosine
+ *  against the query and pick top-K. Bounded at 200 to keep
+ *  pathological cases sane. */
+export function listAllUserMemoriesForRetrieval(userId: string): UserMemory[] {
+  const rows = db()
+    .prepare(
+      `SELECT id, user_id, fact, source, used_count, created_at,
+              embedding, always_inject
+         FROM user_memories
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT 200`,
     )
     .all(userId) as UserMemoryRow[]
   return rows.map(rowToUserMemory)
@@ -90,7 +143,8 @@ export function listUserMemoriesByPopularity(
 ): UserMemory[] {
   const rows = db()
     .prepare(
-      `SELECT id, user_id, fact, source, used_count, created_at
+      `SELECT id, user_id, fact, source, used_count, created_at,
+              embedding, always_inject
          FROM user_memories
         WHERE user_id = ?
         ORDER BY used_count DESC, created_at DESC
@@ -100,13 +154,50 @@ export function listUserMemoriesByPopularity(
   return rows.map(rowToUserMemory)
 }
 
-export function addUserMemory(m: Omit<UserMemory, 'usedCount'> & { usedCount?: number }): void {
+export function addUserMemory(
+  m: Omit<UserMemory, 'usedCount' | 'embedding' | 'alwaysInject'> & {
+    usedCount?: number
+    embedding?: Float32Array | null
+    alwaysInject?: boolean
+  },
+): void {
   db()
     .prepare(
-      `INSERT INTO user_memories (id, user_id, fact, source, used_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO user_memories
+         (id, user_id, fact, source, used_count, created_at,
+          embedding, always_inject)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(m.id, m.userId, m.fact, m.source, m.usedCount ?? 0, m.createdAt)
+    .run(
+      m.id,
+      m.userId,
+      m.fact,
+      m.source,
+      m.usedCount ?? 0,
+      m.createdAt,
+      embeddingToBlob(m.embedding ?? null),
+      m.alwaysInject ? 1 : 0,
+    )
+}
+
+/** Set the embedding on an existing memory. Used by the backfill
+ *  job + future re-embed flows when the model changes. */
+export function setUserMemoryEmbedding(id: string, embedding: Float32Array): void {
+  db()
+    .prepare(`UPDATE user_memories SET embedding = ? WHERE id = ?`)
+    .run(embeddingToBlob(embedding), id)
+}
+
+/** All user memories that don't yet have an embedding. Returns
+ *  just (id, fact) for the backfill job to embed + persist. */
+export function listUserMemoriesWithoutEmbedding(): Array<{ id: string; fact: string }> {
+  return db()
+    .prepare(
+      `SELECT id, fact FROM user_memories
+        WHERE embedding IS NULL OR length(embedding) = 0
+        LIMIT 500`,
+    )
+    .all() as Array<{ id: string; fact: string }>
 }
 
 /** Scoped to (id, user_id) so a caller can't delete someone
@@ -138,6 +229,8 @@ type DocMemoryRow = {
   user_id: string
   fact: string
   created_at: number
+  embedding: Buffer | null
+  always_inject: number
 }
 
 function rowToDocMemory(r: DocMemoryRow): DocMemory {
@@ -147,13 +240,15 @@ function rowToDocMemory(r: DocMemoryRow): DocMemory {
     userId: r.user_id,
     fact: r.fact,
     createdAt: r.created_at,
+    embedding: blobToEmbedding(r.embedding),
+    alwaysInject: r.always_inject === 1,
   }
 }
 
 export function listDocMemories(docId: string, userId: string): DocMemory[] {
   const rows = db()
     .prepare(
-      `SELECT id, doc_id, user_id, fact, created_at
+      `SELECT id, doc_id, user_id, fact, created_at, embedding, always_inject
          FROM doc_memories
         WHERE doc_id = ? AND user_id = ?
         ORDER BY created_at DESC`,
@@ -162,13 +257,43 @@ export function listDocMemories(docId: string, userId: string): DocMemory[] {
   return rows.map(rowToDocMemory)
 }
 
-export function addDocMemory(m: DocMemory): void {
+export function addDocMemory(
+  m: Omit<DocMemory, 'embedding' | 'alwaysInject'> & {
+    embedding?: Float32Array | null
+    alwaysInject?: boolean
+  },
+): void {
   db()
     .prepare(
-      `INSERT INTO doc_memories (id, doc_id, user_id, fact, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO doc_memories
+         (id, doc_id, user_id, fact, created_at, embedding, always_inject)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(m.id, m.docId, m.userId, m.fact, m.createdAt)
+    .run(
+      m.id,
+      m.docId,
+      m.userId,
+      m.fact,
+      m.createdAt,
+      embeddingToBlob(m.embedding ?? null),
+      m.alwaysInject ? 1 : 0,
+    )
+}
+
+export function setDocMemoryEmbedding(id: string, embedding: Float32Array): void {
+  db()
+    .prepare(`UPDATE doc_memories SET embedding = ? WHERE id = ?`)
+    .run(embeddingToBlob(embedding), id)
+}
+
+export function listDocMemoriesWithoutEmbedding(): Array<{ id: string; fact: string }> {
+  return db()
+    .prepare(
+      `SELECT id, fact FROM doc_memories
+        WHERE embedding IS NULL OR length(embedding) = 0
+        LIMIT 500`,
+    )
+    .all() as Array<{ id: string; fact: string }>
 }
 
 /** Scoped to (id, doc_id, user_id). Returns true when a row was

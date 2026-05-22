@@ -66,7 +66,12 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
         prev && JSON.stringify(prev) === JSON.stringify(r.items) ? prev : r.items,
       )
     } catch (e) {
-      setVaultError(e instanceof ApiError ? e.message : String(e))
+      // 401 fires at the moment auth is restoring; the bootstrap
+      // flow redirects to sign-in on its own. Surfacing the toast
+      // would just look like a real error to the user.
+      if (!(e instanceof ApiError && e.status === 401)) {
+        setVaultError(e instanceof ApiError ? e.message : String(e))
+      }
       setChildren((prev) => (prev ? prev : []))
     } finally {
       if (!silent) setLoading(false)
@@ -156,7 +161,9 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
       }
       refresh()
     } catch (err) {
-      setVaultError(err instanceof ApiError ? err.message : String(err))
+      if (!(err instanceof ApiError && err.status === 401)) {
+        setVaultError(err instanceof ApiError ? err.message : String(err))
+      }
     }
   }
 

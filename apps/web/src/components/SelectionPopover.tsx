@@ -1,13 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
-import { Sparkles } from 'lucide-react'
+import { Sparkles, Quote } from 'lucide-react'
 
 type Props = {
   /** The container whose text selections should trigger the popover.
    *  Selections outside this element (chat sidebar, toolbar, outline)
    *  are ignored. */
   containerRef: React.RefObject<HTMLElement | null>
-  /** Called when the user clicks the popover button. */
+  /** Called when the user clicks "Explain with Reader AI" — fires
+   *  off an auto-sent "Explain this: …" message. */
   onExplain: (selectedText: string) => void
+  /** Called when the user clicks "Reply with Reader AI". The
+   *  selection becomes a quote chip above the chat composer; the
+   *  user can then type any question (explain, rephrase, edit,
+   *  fact-check) against it. Optional — omit on read-only docs. */
+  onReply?: (selectedText: string) => void
 }
 
 /**
@@ -24,9 +30,9 @@ type Props = {
  * Long selections are passed through verbatim — the parent decides
  * how to trim before sending to the chat.
  */
-export function SelectionPopover({ containerRef, onExplain }: Props) {
+export function SelectionPopover({ containerRef, onExplain, onReply }: Props) {
   const [pos, setPos] = useState<{ top: number; left: number; text: string } | null>(null)
-  const popoverRef = useRef<HTMLButtonElement | null>(null)
+  const popoverRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const onSelectionChange = () => {
@@ -85,7 +91,10 @@ export function SelectionPopover({ containerRef, onExplain }: Props) {
       })()
 
       const POPOVER_HEIGHT = 32
-      const POPOVER_WIDTH = 168
+      // Width depends on whether the Reply button is rendered. Pick
+      // the wider value when onReply is available so the popover
+      // stays centered over the selection.
+      const POPOVER_WIDTH = onReply ? 192 : 108
       const PADDING = 8
       // Safe zone = the doc-scroller's bounding rect, not the
       // viewport. Without this the popover above a top-of-pane
@@ -155,14 +164,24 @@ export function SelectionPopover({ containerRef, onExplain }: Props) {
       document.removeEventListener('mousedown', onMouseDown)
       if (rafId !== null) cancelAnimationFrame(rafId)
     }
-  }, [containerRef])
+  }, [containerRef, onReply])
 
   if (!pos) return null
 
+  const dispatch = (kind: 'explain' | 'reply') => {
+    const text = pos.text
+    setPos(null)
+    // Clear the selection so the popover doesn't immediately re-pop
+    // on the next selectionchange fire.
+    window.getSelection()?.removeAllRanges()
+    if (kind === 'explain') onExplain(text)
+    else onReply?.(text)
+  }
+
   return (
-    <button
+    <div
       ref={popoverRef}
-      className="fixed z-50 inline-flex items-center gap-1.5 px-2.5 h-8 rounded-md text-[12px] font-medium transition-transform hover:scale-105"
+      className="fixed z-50 inline-flex items-center h-8 rounded-md overflow-hidden"
       style={{
         top: pos.top,
         left: pos.left,
@@ -172,20 +191,31 @@ export function SelectionPopover({ containerRef, onExplain }: Props) {
       }}
       onMouseDown={(e) => {
         // Prevent the click from collapsing the selection before
-        // we read it.
+        // we read either button.
         e.preventDefault()
       }}
-      onClick={() => {
-        const text = pos.text
-        setPos(null)
-        // Clear the selection so the popover doesn't immediately
-        // re-pop on the next selectionchange fire.
-        window.getSelection()?.removeAllRanges()
-        onExplain(text)
-      }}
     >
-      <Sparkles size={12} />
-      Explain with Reader AI
-    </button>
+      <button
+        type="button"
+        className="inline-flex items-center gap-1.5 px-2.5 h-8 text-[12px] font-medium transition-colors hover:bg-white/10"
+        onClick={() => dispatch('explain')}
+      >
+        <Sparkles size={12} />
+        Explain
+      </button>
+      {onReply && (
+        <>
+          <div className="h-4 w-px bg-white/25" />
+          <button
+            type="button"
+            className="inline-flex items-center gap-1.5 px-2.5 h-8 text-[12px] font-medium transition-colors hover:bg-white/10"
+            onClick={() => dispatch('reply')}
+          >
+            <Quote size={12} />
+            Reply
+          </button>
+        </>
+      )}
+    </div>
   )
 }

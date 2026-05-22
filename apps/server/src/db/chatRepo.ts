@@ -53,10 +53,46 @@ export type MemoryUsed = {
   preview: string
 }
 
+/** Single step in the agent's tool-call trace for one assistant
+ *  turn. Persisted so a reloaded thread can render the same
+ *  "Reasoning (N steps)" accordion it had during streaming. */
+export type ToolTraceEntry = {
+  /** Stable id of the form "iter.step" (e.g. "0.1") used to pair
+   *  start + result events during streaming; survives persistence
+   *  for stable React keys. */
+  id: string
+  /** Tool name as registered in the agent catalog. */
+  name: string
+  /** Arguments the model passed to the tool. JSON-serialisable. */
+  args: unknown
+  /** True when the tool executor returned without error. May be
+   *  undefined on rows persisted before the result event landed
+   *  (defensive — shouldn't happen in normal flow). */
+  ok?: boolean
+  /** One-line human-readable summary of the result, e.g.
+   *  `outline (5 headings)`. */
+  summary?: string
+}
+
+/** Structured edit the model proposed inside a chat turn. Mirrors
+ *  the existing lib/mdx.ts granular-edit ops; the server applies
+ *  via those primitives once the user clicks Apply. */
+export type ProposedEditOp =
+  | { op: 'replace_section'; heading: string; content: string }
+  | { op: 'insert_after'; heading: string; content: string }
+  | { op: 'delete_section'; heading: string }
+  | { op: 'append_text'; content: string }
+  | { op: 'prepend_text'; content: string }
+
 export type ChatMessage = {
   id: string
   docId: string
   userId: string
+  /** Thread this message belongs to. Required for new writes — the
+   *  route always knows the active thread by the time it persists.
+   *  Old rows backfilled by migration 011 carry a deterministic
+   *  legacy thread id (`legacy-<docId>-<userId>`). */
+  threadId: string
   role: ChatRole
   content: string
   citations: ChatCitation[] | null
@@ -67,6 +103,22 @@ export type ChatMessage = {
    *  via the friendly error formatter instead of the markdown
    *  pipeline. Always null for user turns. */
   error: string | null
+  /** Edits the model proposed inside this turn. Null when no
+   *  <proposed_edit> blocks were emitted. UI renders these as
+   *  diff cards with Apply / Discard. Always null for user turns. */
+  pendingEdit: ProposedEditOp[] | null
+  /** Epoch ms when the user clicked Apply on this turn's edits.
+   *  Null = still pending; non-null = applied (UI hides the
+   *  Apply button, shows "Applied N ago"). */
+  editAppliedAt: number | null
+  /** Doc sha256 at the time the model proposed this edit. Server
+   *  compares against current doc sha256 on Apply — mismatch =
+   *  doc changed underneath, refuse + surface conflict UI. */
+  editTargetSha256: string | null
+  /** Agent tool-call trace. Null for non-agent turns. UI renders
+   *  as a collapsible "Reasoning (N steps)" accordion above the
+   *  answer. */
+  toolTrace: ToolTraceEntry[] | null
   createdAt: number
 }
 
@@ -74,11 +126,16 @@ type Row = {
   id: string
   doc_id: string
   user_id: string
+  thread_id: string | null
   role: ChatRole
   content: string
   citations: string | null
   memories_used: string | null
   error_text: string | null
+  pending_edit: string | null
+  edit_applied_at: number | null
+  edit_target_sha256: string | null
+  tool_trace: string | null
   created_at: number
 }
 
@@ -99,15 +156,39 @@ function rowToMessage(r: Row): ChatMessage {
       memoriesUsed = null
     }
   }
+  let pendingEdit: ProposedEditOp[] | null = null
+  if (r.pending_edit) {
+    try {
+      pendingEdit = JSON.parse(r.pending_edit) as ProposedEditOp[]
+    } catch {
+      pendingEdit = null
+    }
+  }
+  let toolTrace: ToolTraceEntry[] | null = null
+  if (r.tool_trace) {
+    try {
+      toolTrace = JSON.parse(r.tool_trace) as ToolTraceEntry[]
+    } catch {
+      toolTrace = null
+    }
+  }
   return {
     id: r.id,
     docId: r.doc_id,
     userId: r.user_id,
+    // Legacy rows backfilled by migration 011 always carry a
+    // non-null thread_id, so this fallback only triggers if someone
+    // bypasses appendMessage to write a raw row.
+    threadId: r.thread_id ?? `legacy-${r.doc_id}-${r.user_id}`,
     role: r.role,
     content: r.content,
     citations,
     memoriesUsed,
     error: r.error_text ?? null,
+    pendingEdit,
+    editAppliedAt: r.edit_applied_at ?? null,
+    editTargetSha256: r.edit_target_sha256 ?? null,
+    toolTrace,
     createdAt: r.created_at,
   }
 }
@@ -115,37 +196,120 @@ function rowToMessage(r: Row): ChatMessage {
 /** Full thread for a (doc, user), oldest first. Bounded — pulls at
  *  most 500 messages; older rows are ignored. The UI is meant to
  *  be cleared periodically. */
-export function listMessages(docId: string, userId: string): ChatMessage[] {
+/** Messages in one thread, oldest first. Bounded at 500 rows; older
+ *  messages are silently dropped from this query (UI doesn't expose
+ *  pagination yet). */
+export function listMessages(
+  docId: string,
+  userId: string,
+  threadId: string,
+): ChatMessage[] {
   const rows = db()
     .prepare(
-      `SELECT id, doc_id, user_id, role, content, citations, memories_used, error_text, created_at
+      `SELECT id, doc_id, user_id, thread_id, role, content, citations,
+              memories_used, error_text, pending_edit, edit_applied_at,
+              edit_target_sha256, tool_trace, created_at
          FROM chat_messages
-        WHERE doc_id = ? AND user_id = ?
+        WHERE doc_id = ? AND user_id = ? AND thread_id = ?
         ORDER BY created_at ASC
         LIMIT 500`,
     )
-    .all(docId, userId) as Row[]
+    .all(docId, userId, threadId) as Row[]
   return rows.map(rowToMessage)
+}
+
+/** Look up one message by id, scoped to (userId, docId). Used by the
+ *  apply-edit endpoint which receives a message id from the client
+ *  and needs the row regardless of which thread the message lives in.
+ *  Returns null if the message doesn't exist or belongs to another
+ *  user / doc. */
+export function findMessageByIdScoped(
+  id: string,
+  userId: string,
+  docId: string,
+): ChatMessage | null {
+  const r = db()
+    .prepare(
+      `SELECT id, doc_id, user_id, thread_id, role, content, citations,
+              memories_used, error_text, pending_edit, edit_applied_at,
+              edit_target_sha256, tool_trace, created_at
+         FROM chat_messages
+        WHERE id = ? AND user_id = ? AND doc_id = ?`,
+    )
+    .get(id, userId, docId) as Row | undefined
+  return r ? rowToMessage(r) : null
 }
 
 /** Append a single message. Returns the persisted row. */
 export function appendMessage(m: ChatMessage): void {
   db()
     .prepare(
-      `INSERT INTO chat_messages (id, doc_id, user_id, role, content, citations, memories_used, error_text, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chat_messages
+         (id, doc_id, user_id, thread_id, role, content, citations,
+          memories_used, error_text, pending_edit, edit_applied_at,
+          edit_target_sha256, tool_trace, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       m.id,
       m.docId,
       m.userId,
+      m.threadId,
       m.role,
       m.content,
       m.citations ? JSON.stringify(m.citations) : null,
       m.memoriesUsed ? JSON.stringify(m.memoriesUsed) : null,
       m.error ?? null,
+      m.pendingEdit ? JSON.stringify(m.pendingEdit) : null,
+      m.editAppliedAt ?? null,
+      m.editTargetSha256 ?? null,
+      m.toolTrace ? JSON.stringify(m.toolTrace) : null,
       m.createdAt,
     )
+}
+
+/** Mark this assistant turn's pending edits as applied. Returns
+ *  true when the update landed (and the row hadn't already been
+ *  applied — second call is a no-op). Scoped by (id, userId,
+ *  docId) so a caller can't apply someone else's edit. */
+export function markEditApplied(
+  id: string,
+  userId: string,
+  docId: string,
+  appliedAt: number = Date.now(),
+): boolean {
+  const r = db()
+    .prepare(
+      `UPDATE chat_messages
+          SET edit_applied_at = ?
+        WHERE id = ? AND user_id = ? AND doc_id = ?
+          AND pending_edit IS NOT NULL
+          AND edit_applied_at IS NULL`,
+    )
+    .run(appliedAt, id, userId, docId)
+  return (r.changes ?? 0) > 0
+}
+
+/** Drop the pending_edit payload on this turn — the user clicked
+ *  Discard. The chat message itself (content + reasoning) stays
+ *  in history so a future scroll-back shows "Reader AI suggested
+ *  X, I discarded it". Scoped by (id, userId, docId). */
+export function discardPendingEdit(
+  id: string,
+  userId: string,
+  docId: string,
+): boolean {
+  const r = db()
+    .prepare(
+      `UPDATE chat_messages
+          SET pending_edit = NULL,
+              edit_target_sha256 = NULL
+        WHERE id = ? AND user_id = ? AND doc_id = ?
+          AND pending_edit IS NOT NULL
+          AND edit_applied_at IS NULL`,
+    )
+    .run(id, userId, docId)
+  return (r.changes ?? 0) > 0
 }
 
 /** Wipe the thread for one (doc, user). Doesn't touch other users'

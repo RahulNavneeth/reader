@@ -355,6 +355,24 @@ async function main() {
     process.exit(1)
   }
 
+  // Best-effort backfill of memory embeddings introduced by
+  // migration 012. Runs in the background after listen — a stopped
+  // Ollama doesn't block boot; we'll retry on next start.
+  void (async () => {
+    try {
+      const { backfillMissingMemoryEmbeddings } = await import('./services/memoryEmbed.js')
+      const r = await backfillMissingMemoryEmbeddings()
+      if (r.user.attempted > 0 || r.doc.attempted > 0) {
+        app.log.info(
+          { user: r.user, doc: r.doc },
+          'memory embedding backfill complete',
+        )
+      }
+    } catch (err) {
+      app.log.warn({ err }, 'memory embedding backfill failed; will retry next boot')
+    }
+  })()
+
   // Graceful shutdown. Docker sends SIGTERM with a 10s grace period
   // before SIGKILL; we let Fastify finish in-flight requests (uploads
   // especially) and close the SSE / EventSource connections cleanly.

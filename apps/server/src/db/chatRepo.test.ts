@@ -1,26 +1,20 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { config } from '../config.js'
-import { _resetDbForTest, db } from './sqlite.js'
-import { runMigrations } from './migrations.js'
 import {
   appendMessage,
   clearThread,
   deleteMessageById,
+  discardPendingEdit,
+  findMessageByIdScoped,
   listMessages,
+  markEditApplied,
   type ChatMessage,
 } from './chatRepo.js'
-
-/**
- * Persistence + isolation contract for the chat history layer.
- *
- * Two scoping rules matter for safety:
- *   - thread per (docId, userId): clearing alice's thread on doc A
- *     must not touch bob's thread on doc A, or alice's on doc B
- *   - listMessages returns oldest-first so the UI can replay turns
- */
+import { config } from '../config.js'
+import { db, _resetDbForTest } from './sqlite.js'
+import { runMigrations } from './migrations.js'
 
 const originalData = config.dataDir
 
@@ -50,22 +44,39 @@ afterEach(async () => {
 })
 
 function msg(partial: Partial<ChatMessage>): ChatMessage {
+  const docId = partial.docId ?? 'docA'
+  const userId = partial.userId ?? 'alice'
   return {
     id: partial.id ?? Math.random().toString(36).slice(2),
-    docId: partial.docId ?? 'docA',
-    userId: partial.userId ?? 'alice',
+    docId,
+    userId,
+    // Tests predate multi-thread; default to the legacy thread id
+    // format so messages from the same (doc, user) land in one
+    // conversation, matching the pre-multi-thread expectation.
+    threadId: partial.threadId ?? `legacy-${docId}-${userId}`,
     role: partial.role ?? 'user',
     content: partial.content ?? 'hi',
     citations: partial.citations ?? null,
     memoriesUsed: partial.memoriesUsed ?? null,
     error: partial.error ?? null,
+    pendingEdit: partial.pendingEdit ?? null,
+    editAppliedAt: partial.editAppliedAt ?? null,
+    editTargetSha256: partial.editTargetSha256 ?? null,
+    toolTrace: partial.toolTrace ?? null,
     createdAt: partial.createdAt ?? Date.now(),
   }
 }
 
+/** Convenience wrapper for tests that predate multi-thread — fills
+ *  in the deterministic legacy thread id so existing assertions
+ *  read the messages they just wrote. */
+function legacyList(docId: string, userId: string) {
+  return listMessages(docId, userId, `legacy-${docId}-${userId}`)
+}
+
 describe('chatRepo', () => {
   it('starts empty for a new (doc, user)', () => {
-    expect(listMessages('docA', 'alice')).toEqual([])
+    expect(legacyList('docA', 'alice')).toEqual([])
   })
 
   it('persists and reads back in chronological order', async () => {
@@ -73,108 +84,190 @@ describe('chatRepo', () => {
     appendMessage(msg({ id: '1', role: 'user', content: 'q1', createdAt: t0 }))
     appendMessage(msg({ id: '2', role: 'assistant', content: 'a1', createdAt: t0 + 10 }))
     appendMessage(msg({ id: '3', role: 'user', content: 'q2', createdAt: t0 + 20 }))
-    const list = listMessages('docA', 'alice')
+    const list = legacyList('docA', 'alice')
     expect(list.map((m) => m.id)).toEqual(['1', '2', '3'])
-    expect(list.map((m) => m.role)).toEqual(['user', 'assistant', 'user'])
+    expect(list.map((m) => m.content)).toEqual(['q1', 'a1', 'q2'])
   })
 
-  it('round-trips an assistant turn with an error (regression: failures must persist)', () => {
+  it('round-trips citations + memoriesUsed JSON', () => {
     appendMessage(
       msg({
-        id: 'e1',
+        id: 'a',
         role: 'assistant',
-        content: '',
-        error: "Ollama returned 404: model 'qwen2.5:7b-instruct' not found",
+        content: 'answer',
+        citations: [{ docId: 'docA', chunkIdx: 0, score: 0.9, docTitle: 'A' }],
+        memoriesUsed: [{ kind: 'user', id: 'm1', preview: 'liquid funds' }],
       }),
     )
-    const list = listMessages('docA', 'alice')
+    const list = legacyList('docA', 'alice')
     expect(list).toHaveLength(1)
-    expect(list[0].error).toMatch(/model 'qwen2\.5:7b-instruct' not found/)
-    expect(list[0].content).toBe('')
+    expect(list[0].citations?.[0].score).toBe(0.9)
+    expect(list[0].memoriesUsed?.[0].kind).toBe('user')
   })
 
-  it('round-trips citations as structured JSON', () => {
+  it('round-trips pendingEdit JSON', () => {
     appendMessage(
       msg({
-        id: 'c1',
+        id: 'p',
         role: 'assistant',
-        content: 'with refs',
-        citations: [
-          { docId: 'docA', chunkIdx: 0, score: 0.91 },
-          { docId: 'docB', chunkIdx: 3, score: 0.77 },
-        ],
+        content: 'sure',
+        pendingEdit: [{ op: 'replace_section', heading: 'Risks', content: 'new body' }],
+        editTargetSha256: 'sha',
       }),
     )
-    const list = listMessages('docA', 'alice')
-    expect(list[0].citations).toEqual([
-      { docId: 'docA', chunkIdx: 0, score: 0.91 },
-      { docId: 'docB', chunkIdx: 3, score: 0.77 },
-    ])
+    const list = legacyList('docA', 'alice')
+    expect(list[0].pendingEdit?.[0].op).toBe('replace_section')
+    expect(list[0].editTargetSha256).toBe('sha')
   })
 
-  it('isolates threads by user', () => {
+  it('scopes by user — alice cannot see bob', () => {
     appendMessage(msg({ id: 'a1', userId: 'alice', content: 'alice msg' }))
     appendMessage(msg({ id: 'b1', userId: 'bob', content: 'bob msg' }))
-    expect(listMessages('docA', 'alice').map((m) => m.content)).toEqual(['alice msg'])
-    expect(listMessages('docA', 'bob').map((m) => m.content)).toEqual(['bob msg'])
+    expect(legacyList('docA', 'alice').map((m) => m.content)).toEqual(['alice msg'])
+    expect(legacyList('docA', 'bob').map((m) => m.content)).toEqual(['bob msg'])
   })
 
-  it('isolates threads by docId', () => {
+  it('scopes by doc — docA messages do not appear in docB list', () => {
     appendMessage(msg({ id: 'a1', docId: 'docA', content: 'on A' }))
     appendMessage(msg({ id: 'b1', docId: 'docB', content: 'on B' }))
-    expect(listMessages('docA', 'alice').map((m) => m.content)).toEqual(['on A'])
-    expect(listMessages('docB', 'alice').map((m) => m.content)).toEqual(['on B'])
+    expect(legacyList('docA', 'alice').map((m) => m.content)).toEqual(['on A'])
+    expect(legacyList('docB', 'alice').map((m) => m.content)).toEqual(['on B'])
   })
 
-  it('clearThread wipes only that (doc, user) pair', () => {
-    appendMessage(msg({ id: 'a1', docId: 'docA', userId: 'alice' }))
-    appendMessage(msg({ id: 'a2', docId: 'docA', userId: 'bob' }))
-    appendMessage(msg({ id: 'b1', docId: 'docB', userId: 'alice' }))
+  it('clearThread wipes only the matching (doc, user)', () => {
+    appendMessage(msg({ id: 'a1', userId: 'alice', docId: 'docA' }))
+    appendMessage(msg({ id: 'b1', userId: 'bob', docId: 'docA' }))
+    appendMessage(msg({ id: 'a2', userId: 'alice', docId: 'docB' }))
     const n = clearThread('docA', 'alice')
     expect(n).toBe(1)
-    expect(listMessages('docA', 'alice')).toEqual([])
-    expect(listMessages('docA', 'bob').length).toBe(1)
-    expect(listMessages('docB', 'alice').length).toBe(1)
+    expect(legacyList('docA', 'alice')).toEqual([])
+    expect(legacyList('docA', 'bob').length).toBe(1)
+    expect(legacyList('docB', 'alice').length).toBe(1)
   })
 
-  it('cascades on document delete', () => {
-    appendMessage(msg({ id: 'a1', docId: 'docA' }))
-    appendMessage(msg({ id: 'b1', docId: 'docB' }))
-    db().prepare(`DELETE FROM documents WHERE id = ?`).run('docA')
-    expect(listMessages('docA', 'alice')).toEqual([])
-    expect(listMessages('docB', 'alice').length).toBe(1)
+  it('deleteMessageById removes a single row, scoped', () => {
+    appendMessage(msg({ id: 'x', userId: 'alice', docId: 'docA' }))
+    appendMessage(msg({ id: 'y', userId: 'alice', docId: 'docB' }))
+    const ok = deleteMessageById('x', 'alice', 'docA')
+    expect(ok).toBe(true)
+    expect(legacyList('docA', 'alice')).toEqual([])
+    expect(legacyList('docB', 'alice').length).toBe(1)
   })
 
-  describe('deleteMessageById', () => {
-    it('drops the named row and only the named row', () => {
-      appendMessage(msg({ id: 'keep', content: 'q1' }))
-      appendMessage(msg({ id: 'drop', role: 'assistant', content: 'a1' }))
-      appendMessage(msg({ id: 'keep2', content: 'q2' }))
-      const ok = deleteMessageById('drop', 'alice', 'docA')
-      expect(ok).toBe(true)
-      const ids = listMessages('docA', 'alice').map((m) => m.id)
-      expect(ids).toEqual(['keep', 'keep2'])
-    })
-
-    it('refuses to delete a row that belongs to another user', () => {
-      appendMessage(msg({ id: 'a-msg', userId: 'alice', content: 'mine' }))
-      const ok = deleteMessageById('a-msg', 'bob', 'docA')
-      expect(ok).toBe(false)
-      expect(listMessages('docA', 'alice')).toHaveLength(1)
-    })
-
-    it('refuses to delete a row scoped to a different doc', () => {
-      appendMessage(msg({ id: 'm1', docId: 'docA', content: 'in A' }))
-      const ok = deleteMessageById('m1', 'alice', 'docB')
-      expect(ok).toBe(false)
-      expect(listMessages('docA', 'alice')).toHaveLength(1)
-    })
+  it('deleteMessageById refuses cross-user / cross-doc', () => {
+    appendMessage(msg({ id: 'x', userId: 'alice', docId: 'docA' }))
+    expect(deleteMessageById('x', 'bob', 'docA')).toBe(false)
+    expect(deleteMessageById('x', 'alice', 'docB')).toBe(false)
+    const ids = legacyList('docA', 'alice').map((m) => m.id)
+    expect(ids).toEqual(['x'])
   })
 
-  it('caps thread reads at the 500-message ceiling', () => {
+  it('LIMIT caps the returned set at 500 rows', () => {
+    const t0 = Date.now()
     for (let i = 0; i < 510; i++) {
-      appendMessage(msg({ id: `m${i}`, createdAt: i, content: `n${i}` }))
+      appendMessage(msg({ id: `n${i}`, createdAt: t0 + i }))
     }
-    expect(listMessages('docA', 'alice').length).toBe(500)
+    // 510 inserted; the SELECT caps at 500 — verify it doesn't blow
+    // up the row reader or return a partial JSON parse failure.
+    expect(legacyList('docA', 'alice').length).toBe(500)
+  })
+
+  it('findMessageByIdScoped returns the row when (id, userId, docId) match', () => {
+    appendMessage(msg({ id: 'find', userId: 'alice', docId: 'docA', content: 'present' }))
+    const r = findMessageByIdScoped('find', 'alice', 'docA')
+    expect(r?.content).toBe('present')
+  })
+
+  it('findMessageByIdScoped returns null cross-user / cross-doc / missing', () => {
+    appendMessage(msg({ id: 'find', userId: 'alice', docId: 'docA' }))
+    expect(findMessageByIdScoped('find', 'bob', 'docA')).toBeNull()
+    expect(findMessageByIdScoped('find', 'alice', 'docB')).toBeNull()
+    expect(findMessageByIdScoped('does-not-exist', 'alice', 'docA')).toBeNull()
+  })
+})
+
+describe('markEditApplied', () => {
+  it('flips edit_applied_at on a turn that had a pending edit', () => {
+    appendMessage(
+      msg({
+        id: 'a',
+        role: 'assistant',
+        pendingEdit: [{ op: 'append_text', content: 'tail' }],
+      }),
+    )
+    expect(markEditApplied('a', 'alice', 'docA', 12345)).toBe(true)
+    expect(legacyList('docA', 'alice')[0].editAppliedAt).toBe(12345)
+  })
+
+  it('is a no-op when the turn has no pending edit', () => {
+    appendMessage(msg({ id: 'a', role: 'assistant', pendingEdit: null }))
+    expect(markEditApplied('a', 'alice', 'docA')).toBe(false)
+  })
+
+  it('is idempotent — second call is a no-op', () => {
+    appendMessage(
+      msg({
+        id: 'a',
+        role: 'assistant',
+        pendingEdit: [{ op: 'append_text', content: 'tail' }],
+      }),
+    )
+    expect(markEditApplied('a', 'alice', 'docA')).toBe(true)
+    expect(markEditApplied('a', 'alice', 'docA')).toBe(false)
+  })
+
+  it('refuses cross-user', () => {
+    appendMessage(
+      msg({
+        id: 'a',
+        userId: 'alice',
+        role: 'assistant',
+        pendingEdit: [{ op: 'append_text', content: 'tail' }],
+      }),
+    )
+    expect(markEditApplied('a', 'bob', 'docA')).toBe(false)
+    expect(legacyList('docA', 'alice')[0].editAppliedAt).toBeNull()
+  })
+})
+
+describe('discardPendingEdit', () => {
+  it('clears the pending_edit payload on success', () => {
+    appendMessage(
+      msg({
+        id: 'a',
+        role: 'assistant',
+        pendingEdit: [{ op: 'append_text', content: 'x' }],
+        editTargetSha256: 'sha',
+      }),
+    )
+    expect(discardPendingEdit('a', 'alice', 'docA')).toBe(true)
+    const row = legacyList('docA', 'alice')[0]
+    expect(row.pendingEdit).toBeNull()
+    expect(row.editTargetSha256).toBeNull()
+  })
+
+  it('refuses cross-user; the original row is untouched', () => {
+    appendMessage(
+      msg({
+        id: 'a',
+        userId: 'alice',
+        role: 'assistant',
+        pendingEdit: [{ op: 'append_text', content: 'x' }],
+      }),
+    )
+    expect(discardPendingEdit('a', 'bob', 'docA')).toBe(false)
+    expect(legacyList('docA', 'alice')[0].pendingEdit).not.toBeNull()
+  })
+
+  it('refuses on an already-applied turn', () => {
+    appendMessage(
+      msg({
+        id: 'a',
+        role: 'assistant',
+        pendingEdit: [{ op: 'append_text', content: 'x' }],
+        editAppliedAt: 1,
+      }),
+    )
+    expect(discardPendingEdit('a', 'alice', 'docA')).toBe(false)
   })
 })

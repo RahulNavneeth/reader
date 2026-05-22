@@ -43,6 +43,30 @@ export async function snapshotVersion(docId: string): Promise<void> {
   const chunksPath = path.join(docRoot, 'chunks.jsonl')
   const metaSt = await stat(metaPath).catch(() => null)
   if (!metaSt) return // no current meta to snapshot
+
+  // Dedupe by sha256: if the most recent existing snapshot already
+  // has the exact same content (same sha256 as the doc's current
+  // meta), skip — adds a new ts row that would be visually
+  // confusing (same content "version" reappearing) and wastes
+  // disk. The watcher can fire multiple change events for a
+  // single write on some platforms; this is the catch-all.
+  try {
+    const rawMeta = await readFile(metaPath, 'utf8')
+    const curSha = JSON.parse(rawMeta)?.sha256 ?? ''
+    if (curSha) {
+      const names = await readdir(versionsDir(docId)).catch(() => [])
+      const tsList = names.filter((n) => /^\d+$/.test(n)).map(Number).sort((a, b) => b - a)
+      const latestTs = tsList[0]
+      if (latestTs !== undefined) {
+        const prevRaw = await readFile(path.join(versionDir(docId, latestTs), 'meta.json'), 'utf8').catch(() => null)
+        if (prevRaw) {
+          const prevSha = JSON.parse(prevRaw)?.sha256 ?? ''
+          if (prevSha === curSha) return
+        }
+      }
+    }
+  } catch { /* fall through and snapshot anyway */ }
+
   const ts = Date.now()
   const dir = versionDir(docId, ts)
   await mkdir(dir, { recursive: true })

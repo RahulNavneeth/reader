@@ -103,6 +103,15 @@ export default function App() {
       .catch(() => setAuth({ status: 'anonymous' }))
   }, [])
 
+  // Auth just transitioned to authed → clear any "auth required"
+  // toast left over from the brief restore window. Without this
+  // guard, the 401 the sidebar caught moments earlier sticks in
+  // state and the user sees a red banner even though they're now
+  // signed in.
+  useEffect(() => {
+    if (auth.status === 'authed') setVaultError(null)
+  }, [auth.status])
+
   const handleLogout = async () => {
     try {
       await api.logout()

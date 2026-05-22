@@ -4,6 +4,12 @@ import {
   matchDocsByName,
   flattenMarkdownTables,
   formatSourceHint,
+  parseProposedEdits,
+  stripProposedEditBlocks,
+  detectEditIntent,
+  extractQuotedExcerpt,
+  locateHeadingForExcerpt,
+  stripInstructionEcho,
 } from './chat.js'
 import type { DocumentMeta } from '../types.js'
 
@@ -276,5 +282,334 @@ describe('formatSourceHint', () => {
 
   it('flags HTML', () => {
     expect(formatSourceHint(make({ mime: 'text/html', originalFilename: 'page.html' }))).toMatch(/HTML/)
+  })
+})
+
+/**
+ * Structured-edit parser for in-chat document editing. The model
+ * emits <proposed_edit> blocks in its streaming output; the parser
+ * pulls them out as typed ops the server can persist + apply.
+ */
+describe('parseProposedEdits', () => {
+  it('returns empty for content with no proposed_edit block', () => {
+    expect(parseProposedEdits('Just a normal answer with no edits.')).toEqual([])
+    expect(parseProposedEdits('')).toEqual([])
+  })
+
+  it('parses a replace_section op with multi-line body', () => {
+    const body = `<proposed_edit op="replace_section" heading="Caveats">
+This is a long-term projection. Markets vary; assumptions may not hold.
+Recheck yearly.
+</proposed_edit>`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(1)
+    expect(r[0]).toEqual({
+      op: 'replace_section',
+      heading: 'Caveats',
+      content: 'This is a long-term projection. Markets vary; assumptions may not hold.\nRecheck yearly.',
+    })
+  })
+
+  it('parses an insert_after op carrying a new heading in the body', () => {
+    const body = `<proposed_edit op="insert_after" heading="Scenario B">
+## Scenario D — flat SIPs + windfalls
+A hybrid scenario combining flat contributions with quarterly
+windfall additions.
+</proposed_edit>`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(1)
+    expect(r[0].op).toBe('insert_after')
+    if (r[0].op === 'insert_after') {
+      expect(r[0].heading).toBe('Scenario B')
+      expect(r[0].content).toContain('## Scenario D')
+    }
+  })
+
+  it('parses delete_section with no body needed', () => {
+    const body = `<proposed_edit op="delete_section" heading="Old Caveats"></proposed_edit>`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(1)
+    expect(r[0]).toEqual({ op: 'delete_section', heading: 'Old Caveats' })
+  })
+
+  it('parses append_text and prepend_text (no heading)', () => {
+    const body = `<proposed_edit op="append_text">
+## Closing thought
+The numbers above are estimates; revisit annually.
+</proposed_edit>`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(1)
+    expect(r[0].op).toBe('append_text')
+    if (r[0].op === 'append_text') {
+      expect(r[0].content).toContain('Closing thought')
+    }
+  })
+
+  it('parses multiple proposed_edit blocks in one stream', () => {
+    const body = `Here are two edits.
+
+<proposed_edit op="replace_section" heading="A">new A body</proposed_edit>
+
+Some intervening narration.
+
+<proposed_edit op="delete_section" heading="B"></proposed_edit>`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(2)
+    expect(r[0].op).toBe('replace_section')
+    expect(r[1].op).toBe('delete_section')
+  })
+
+  it('tolerates single-quoted attribute values', () => {
+    const body = `<proposed_edit op='replace_section' heading='Notes'>new notes</proposed_edit>`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(1)
+    if (r[0].op === 'replace_section') expect(r[0].heading).toBe('Notes')
+  })
+
+  it('skips section-ops with no heading attribute (malformed)', () => {
+    const body = `<proposed_edit op="replace_section">no heading attr</proposed_edit>`
+    expect(parseProposedEdits(body)).toEqual([])
+  })
+
+  it('skips unknown op (typo or hallucination)', () => {
+    const body = `<proposed_edit op="rewrite_everything" heading="X">stuff</proposed_edit>`
+    expect(parseProposedEdits(body)).toEqual([])
+  })
+
+  it('extracts blocks even when they are interleaved with prose', () => {
+    const body = `Sure, here's the change.
+<proposed_edit op="replace_section" heading="Intro">new intro body</proposed_edit>
+Let me know if you want anything else.`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(1)
+  })
+
+  it('preserves markdown table content inside the body', () => {
+    const body = `<proposed_edit op="replace_section" heading="Data">
+| A | B |
+| - | - |
+| 1 | 2 |
+</proposed_edit>`
+    const r = parseProposedEdits(body)
+    expect(r).toHaveLength(1)
+    if (r[0].op === 'replace_section') {
+      expect(r[0].content).toContain('| A | B |')
+      expect(r[0].content).toContain('| 1 | 2 |')
+    }
+  })
+})
+
+describe('stripProposedEditBlocks', () => {
+  it('removes a single block and trims surrounding whitespace', () => {
+    const body = `Sure.
+
+<proposed_edit op="replace_section" heading="X">new</proposed_edit>
+
+Apply if you like.`
+    const r = stripProposedEditBlocks(body)
+    expect(r).not.toContain('<proposed_edit')
+    expect(r).toContain('Sure.')
+    expect(r).toContain('Apply if you like.')
+  })
+
+  it('collapses 3+ blank lines that result from removal', () => {
+    const body = `A\n\n<proposed_edit op="delete_section" heading="X"></proposed_edit>\n\nB`
+    const r = stripProposedEditBlocks(body)
+    // Should be "A\n\nB", not "A\n\n\n\nB".
+    expect(r).toMatch(/^A\n\nB$/)
+  })
+
+  it('leaves non-edit content untouched', () => {
+    const body = `Just a normal answer.`
+    expect(stripProposedEditBlocks(body)).toBe(body)
+  })
+
+  it('removes multiple blocks', () => {
+    const body = `<proposed_edit op="replace_section" heading="A">x</proposed_edit>
+Some text.
+<proposed_edit op="delete_section" heading="B"></proposed_edit>`
+    const r = stripProposedEditBlocks(body)
+    expect(r).not.toContain('<proposed_edit')
+    expect(r).toContain('Some text.')
+  })
+})
+
+describe('detectEditIntent', () => {
+  it('fires on common edit verbs', () => {
+    for (const q of [
+      'rephrase this',
+      'rewrite the Risks section',
+      'edit this paragraph',
+      'fix the typo in the second bullet',
+      'improve this',
+      'tighten this up',
+      'shorten the intro',
+      'add a TODO at the end',
+      'append a note about Q3',
+      'remove the third bullet',
+      'delete the Risks section',
+      'replace the table with prose',
+      'make this more formal',
+      'turn this into a bulleted list',
+    ]) {
+      expect(detectEditIntent(q), q).toBe(true)
+    }
+  })
+
+  it('does NOT fire on pure explain / lookup intent', () => {
+    for (const q of [
+      'explain this',
+      'summarize',
+      'what does this mean?',
+      'how does this work?',
+      'why is this here?',
+      'compare X and Y',
+      'describe section 3',
+      'what is the deadline?',
+    ]) {
+      expect(detectEditIntent(q), q).toBe(false)
+    }
+  })
+
+  it('strips a leading blockquote before scanning — verbs inside the quote do NOT count', () => {
+    // The Reply popover prepends a `> "..."` blockquote. If the
+    // quote itself happens to say "add" or "remove", that's the
+    // document's wording, not the user's request.
+    const q = `> "The team should add a section on risks and remove the deprecated bullet."
+
+what does this paragraph mean?`
+    expect(detectEditIntent(q)).toBe(false)
+  })
+
+  it('fires when the freeform question after a quoted excerpt asks for an edit', () => {
+    const q = `> "Tax planning — fully max ₹50K NPS-80CCD(1B)."
+
+rephrase this`
+    expect(detectEditIntent(q)).toBe(true)
+  })
+
+  it('returns false for empty / whitespace-only input', () => {
+    expect(detectEditIntent('')).toBe(false)
+    expect(detectEditIntent('   ')).toBe(false)
+  })
+})
+
+describe('extractQuotedExcerpt', () => {
+  it('extracts the quote when the message starts with a Reply blockquote', () => {
+    const q = `> "Top up emergency fund to whatever 6× new monthly expenses looks like."
+
+rephrase this`
+    expect(extractQuotedExcerpt(q)).toBe('Top up emergency fund to whatever 6× new monthly expenses looks like.')
+  })
+
+  it('returns null when there is no leading blockquote', () => {
+    expect(extractQuotedExcerpt('just rephrase the Risks section')).toBeNull()
+  })
+
+  it('returns null on an empty quote', () => {
+    expect(extractQuotedExcerpt('> ""\n\nrephrase this')).toBeNull()
+  })
+})
+
+describe('locateHeadingForExcerpt', () => {
+  const doc = `# Tier 0 — Insurance
+
+Make sure health + term insurance are sorted before anything else.
+
+## Tier 1 — Emergency Fund
+
+Top up emergency fund to whatever 6× new monthly expenses looks like.
+Park it in liquid funds (not savings account).
+
+## Tier 2 — Tax planning
+
+Tax planning — fully max ₹50K NPS-80CCD(1B), then max ₹1.5L 80C (ELSS or PPF). These reduce tax on the windfall year.
+`
+
+  it('finds the heading whose section contains the excerpt', () => {
+    expect(
+      locateHeadingForExcerpt(doc, 'Top up emergency fund to whatever 6× new monthly expenses looks like.'),
+    ).toBe('Tier 1 — Emergency Fund')
+  })
+
+  it('walks back through subheadings to the nearest one', () => {
+    expect(
+      locateHeadingForExcerpt(doc, 'fully max ₹50K NPS-80CCD(1B)'),
+    ).toBe('Tier 2 — Tax planning')
+  })
+
+  it('tolerates whitespace differences between excerpt and doc', () => {
+    expect(
+      locateHeadingForExcerpt(doc, 'Top  up   emergency fund\nto whatever 6× new monthly expenses'),
+    ).toBe('Tier 1 — Emergency Fund')
+  })
+
+  it('returns null when the excerpt is not in the doc', () => {
+    expect(locateHeadingForExcerpt(doc, 'this string does not appear')).toBeNull()
+  })
+
+  it('returns null for an excerpt in the doc preamble before any heading', () => {
+    const preambleDoc = `Just a top-of-doc line before any heading.
+
+## Some Section
+
+body text here.
+`
+    expect(locateHeadingForExcerpt(preambleDoc, 'Just a top-of-doc line')).toBeNull()
+  })
+
+  it('skips heading-shaped lines inside fenced code blocks', () => {
+    const fencedDoc = `## Real Section
+
+\`\`\`
+## not-a-real-heading
+some code
+\`\`\`
+
+target line lives in real section.
+`
+    expect(locateHeadingForExcerpt(fencedDoc, 'target line lives in real section')).toBe('Real Section')
+  })
+})
+
+describe('stripInstructionEcho', () => {
+  it('strips a trailing line that echoes the user instruction', () => {
+    const response = `Tax drag is the slow erosion of returns caused by taxes on dividends and short-term gains.
+
+explain it with simple words.`
+    const out = stripInstructionEcho(response, 'explain it with simple words')
+    expect(out).toBe('Tax drag is the slow erosion of returns caused by taxes on dividends and short-term gains.')
+  })
+
+  it('strips an echo at the end of the last sentence (no newline)', () => {
+    const response = `Tax drag is the slow erosion of returns. explain it with simple words.`
+    const out = stripInstructionEcho(response, 'explain it with simple words')
+    expect(out).toBe('Tax drag is the slow erosion of returns.')
+  })
+
+  it('leaves the response untouched when the trailing line is informative', () => {
+    const response = `Tax drag is the slow erosion of returns caused by taxes on dividends and short-term gains.
+
+In an ELSS fund this is largely neutralised by the 80C deduction and the 1-year long-term capital gains regime.`
+    const out = stripInstructionEcho(response, 'explain it with simple words')
+    expect(out).toBe(response)
+  })
+
+  it('leaves the response untouched when the query has no useful tokens', () => {
+    const response = `Some answer here.`
+    expect(stripInstructionEcho(response, 'a the')).toBe(response)
+  })
+
+  it('returns empty string unchanged', () => {
+    expect(stripInstructionEcho('', 'whatever')).toBe('')
+  })
+
+  it('handles a multi-line echo by running two passes', () => {
+    const response = `Real answer here.
+
+show me
+the details please`
+    const out = stripInstructionEcho(response, 'show me the details please')
+    expect(out).toBe('Real answer here.')
   })
 })

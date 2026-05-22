@@ -2949,7 +2949,47 @@ export async function vaultRoutes(app: FastifyInstance) {
     const { q = '', limit } = req.query as { q?: string; limit?: string }
     const needle = q.trim().toLowerCase()
     const lim = Math.min(Number(limit) || 50, 200)
-    if (!needle) return { q: '', items: [], folders: [] }
+    // Empty query → list all readable docs, alphabetically. Used by
+    // the chat @-mention popover so typing just `@` reveals every
+    // doc the user can attach. Callers that don't want this can
+    // guard their own empty-query case upstream.
+    if (!needle) {
+      const allDocs = await listAllDocuments()
+      const sharesIn = await import('../stores/userShares.js').then((m) =>
+        m.listSharesTo(user.username),
+      )
+      const items: Array<{
+        path: string
+        name: string
+        ext: string
+        docId: string
+        tags: string[]
+        public: boolean
+        owner: string
+        score: number
+        matchedTags: string[]
+      }> = []
+      for (const d of allDocs) {
+        const canRead =
+          userCanRead(d, user.username, user.role) ||
+          (await isReadableViaShares(d, user.username, sharesIn))
+        if (!canRead) continue
+        items.push({
+          path: d.storageKey,
+          name: path.basename(d.storageKey),
+          ext: path.extname(d.storageKey).toLowerCase().replace(/^\./, ''),
+          docId: d.id,
+          tags: d.tags ?? [],
+          public: !!d.public,
+          owner: d.owner,
+          score: 0,
+          matchedTags: [],
+        })
+        if (items.length >= lim) break
+      }
+      items.sort((a, b) => a.name.localeCompare(b.name))
+      return { q: '', items, folders: [] }
+    }
     const docs = await listAllDocuments()
     const sharesIn = await import('../stores/userShares.js').then((m) =>
       m.listSharesTo(user.username),

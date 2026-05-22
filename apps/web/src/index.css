@@ -17,6 +17,8 @@
     --hover: #EBECF0;
     --selected: #DEEBFF;
     --code-bg: #F4F5F7;
+    --danger-bg: #FFEBE6;
+    --danger-fg: #BF2600;
   }
   .dark {
     --bg: #0B1424;
@@ -32,6 +34,8 @@
     --hover: #16243F;
     --selected: #0747A6;
     --code-bg: #0A1224;
+    --danger-bg: #2A1014;
+    --danger-fg: #FF8F73;
   }
   html, body, #root {
     height: 100%;
@@ -96,7 +100,14 @@
   }
 
   .tree-item {
-    @apply flex items-center gap-1.5 px-2 h-7 rounded text-[13px] cursor-pointer select-none transition-colors;
+    /* No `transition-colors`: when the user switches theme, every
+     *  .tree-item.selected would otherwise animate its background
+     *  + color from light-selected (#DEEBFF) to dark-selected over
+     *  ~150 ms while the surrounding chrome snaps instantly — the
+     *  selected row visibly lags the rest of the UI. Snapping
+     *  instantly is the right behaviour on theme change; hover is
+     *  already perceptually instant without an explicit transition. */
+    @apply flex items-center gap-1.5 px-2 h-7 rounded text-[13px] cursor-pointer select-none;
     color: var(--fg);
     outline: none !important;
     -webkit-user-drag: element;
@@ -321,3 +332,29 @@
 /* Scrollbars — invisible, scroll still works */
 * { scrollbar-width: none; -ms-overflow-style: none; }
 *::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+/* Shimmer effect for the agent's in-flight "thinking" rows.
+   Used by ReasoningTrace while the loop is still running, so the
+   currently-pending step gets a subtle gradient sweep — feels like
+   Notion AI's reasoning trace. Falls back gracefully (just stays the
+   base color) if background-clip:text isn't supported. */
+@keyframes reader-shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.reader-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--fg-subtle) 0%,
+    var(--fg-subtle) 35%,
+    var(--fg) 50%,
+    var(--fg-subtle) 65%,
+    var(--fg-subtle) 100%
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: reader-shimmer 2.2s linear infinite;
+}
