@@ -18,6 +18,7 @@ import { adminRoutes } from './routes/admin.js'
 import { mcpRoutes } from './routes/mcp.js'
 import { eventsRoutes } from './routes/events.js'
 import { viewsRoutes } from './routes/views.js'
+import { templatesRoutes } from './routes/templates.js'
 import { userSharesRoutes } from './routes/userShares.js'
 import { pinsRoutes } from './routes/pins.js'
 import { exportRoutes } from './routes/export.js'
@@ -253,6 +254,7 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await app.register(collectionsRoutes)
   await app.register(chatRoutes)
   await app.register(aiMemoriesRoutes)
+  await app.register(templatesRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
   // SPA fallback rewrites unknown paths to index.html so React Router-style

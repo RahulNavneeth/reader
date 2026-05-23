@@ -36,6 +36,7 @@ import { config } from '../config.js'
 import { addPin } from '../stores/pins.js'
 import type { ApiToken, DocumentMeta } from '../types.js'
 import { withEditLock } from '../lib/editLock.js'
+import { createRateLimit } from '../lib/rateLimit.js'
 
 type RpcRequest = {
   jsonrpc: '2.0'
@@ -996,6 +997,30 @@ async function dispatch(token: ApiToken, msg: RpcRequest): Promise<RpcResponse |
   }
 }
 
+/**
+ * Per-MCP-token rate limiter. Keyed on the token id so multiple
+ * agents / workflows sharing one IP don't interfere, AND so a
+ * single compromised token can be killed by deleting it rather
+ * than blocking the whole IP. Bucket is generous on bursts
+ * (legitimate agents fan-out reads when crawling a doc set) but
+ * capped on sustained rate so a runaway loop can't pin the server.
+ *
+ * Counts the OUTER POST /mcp call. Batched JSON-RPC arrays count
+ * as one call regardless of how many sub-requests they contain —
+ * we don't want to penalize the protocol's batching affordance.
+ *
+ * For each rate-limit hit we also emit an audit entry so the user
+ * can see in their activity log that a token tripped the limiter
+ * and trace it back to which agent.
+ */
+const MCP_RATE_LIMIT = createRateLimit({
+  // 60-token burst (one a second for a minute, plus a buffer for
+  // multiget patterns) with 5/sec sustained refill — that's 18,000
+  // calls/hour at saturation, more than any honest agent needs.
+  capacity: 60,
+  refillPerSecond: 5,
+})
+
 export async function mcpRoutes(app: FastifyInstance) {
   app.post('/mcp', async (req: FastifyRequest, reply: FastifyReply) => {
     const token = await authHeaderToken(req)
@@ -1005,6 +1030,31 @@ export async function mcpRoutes(app: FastifyInstance) {
         id: (req.body as any)?.id ?? null,
         error: { code: -32001, message: 'authentication required' },
       })
+    }
+
+    // Throttle per token. Token id is the bucket key — same token
+    // from many IPs gets one bucket; many tokens from one IP get
+    // independent buckets.
+    const check = MCP_RATE_LIMIT.check(token.id)
+    if (!check.allowed) {
+      await audit({
+        actor: token.createdBy,
+        action: 'mcp.throttled',
+        target: token.id,
+        meta: { retryAfter: check.retryAfterSeconds, tokenName: token.name },
+      }).catch(() => null)
+      return reply
+        .code(429)
+        .header('Retry-After', String(check.retryAfterSeconds))
+        .send({
+          jsonrpc: '2.0',
+          id: (req.body as any)?.id ?? null,
+          error: {
+            code: -32002,
+            message: 'rate limit exceeded; retry later',
+            data: { retryAfterSeconds: check.retryAfterSeconds },
+          },
+        })
     }
 
     const body = req.body
@@ -1023,4 +1073,10 @@ export async function mcpRoutes(app: FastifyInstance) {
   app.get('/mcp', async (_req, reply) => {
     return reply.code(405).send({ error: 'streaming not implemented; use POST /mcp' })
   })
+}
+
+/** Test hook — clears the rate-limit bucket so tests don't trip
+ *  it from prior runs in the same process. */
+export function _resetMcpRateLimitForTest() {
+  MCP_RATE_LIMIT.reset()
 }

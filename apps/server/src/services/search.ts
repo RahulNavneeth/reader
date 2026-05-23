@@ -161,14 +161,38 @@ export type SearchHit = {
   source: 'lexical' | 'semantic' | 'hybrid' | 'image'
 }
 
+/** Optional filters narrowing the search universe BEFORE scoring.
+ *  Layered after the auth/share filter so they never expand access
+ *  beyond what the user can already see. */
+export type SearchFilters = {
+  /** Restrict to docs whose mime starts with any of these (e.g.
+   *  ['image/'] for all images, ['application/pdf'] for PDFs only).
+   *  Empty array = no mime filter. */
+  mime?: string[]
+  /** Restrict to docs carrying ALL of these tags (intersection).
+   *  Empty array = no tag filter. */
+  tags?: string[]
+  /** Lower bound on `createdAt` (epoch ms, inclusive). */
+  after?: number
+  /** Upper bound on `createdAt` (epoch ms, inclusive). */
+  before?: number
+  /** Restrict to docs whose storageKey is at or under this folder.
+   *  Empty string / unset = no folder scope. */
+  folder?: string
+}
+
 export async function searchKnowledge(opts: {
   q: string
   user: { username: string; role: string }
   limit?: number
+  /** Optional filters applied AFTER the ACL filter — never widens
+   *  access, only narrows. */
+  filters?: SearchFilters
 }): Promise<SearchHit[]> {
   const q = opts.q.trim()
   if (!q) return []
   const limit = opts.limit ?? 20
+  const f = opts.filters
   const c = await getCache()
   // Pull share-grants so chunks/files inside a shared subtree also
   // surface in semantic search results.
@@ -190,12 +214,43 @@ export async function searchKnowledge(opts: {
   }
   const collectionAllows = (d: { id: string }): boolean =>
     collectionGrants.readableDocs.has(d.id)
-  const allowed = c.docs.filter(
+  let allowed = c.docs.filter(
     (d) =>
       userCanRead(d, opts.user.username, opts.user.role) ||
       shareAllows(d) ||
       collectionAllows(d),
   )
+  if (f) {
+    // Mime prefix match: any of the supplied prefixes match.
+    if (f.mime && f.mime.length > 0) {
+      allowed = allowed.filter((d) =>
+        f.mime!.some((p) => (d.mime || '').toLowerCase().startsWith(p.toLowerCase())),
+      )
+    }
+    // Tag AND (must contain every requested tag).
+    if (f.tags && f.tags.length > 0) {
+      const want = f.tags.map((t) => t.toLowerCase())
+      allowed = allowed.filter((d) => {
+        const have = new Set((d.tags ?? []).map((t) => t.toLowerCase()))
+        return want.every((t) => have.has(t))
+      })
+    }
+    if (typeof f.after === 'number') {
+      allowed = allowed.filter((d) => (d.createdAt ?? 0) >= f.after!)
+    }
+    if (typeof f.before === 'number') {
+      allowed = allowed.filter((d) => (d.createdAt ?? 0) <= f.before!)
+    }
+    if (f.folder && f.folder.length > 0) {
+      const fold = f.folder.replace(/^\/+|\/+$/g, '')
+      if (fold) {
+        const prefix = fold + '/'
+        allowed = allowed.filter(
+          (d) => d.storageKey === fold || d.storageKey.startsWith(prefix),
+        )
+      }
+    }
+  }
   const allowedIds = new Set(allowed.map((d) => d.id))
   const titleById = new Map(allowed.map((d) => [d.id, d.title]))
   const pathById = new Map(allowed.map((d) => [d.id, d.storageKey]))
@@ -397,4 +452,107 @@ export async function searchKnowledge(opts: {
 
 export async function preheat(): Promise<void> {
   await getCache().catch(() => null)
+}
+
+/**
+ * Find documents similar to `docId` by averaging the source doc's
+ * chunk embeddings into a single centroid and cosine-scoring it
+ * against every other (allowed) doc's chunks. The result is a
+ * ranked list of distinct docs — the source doc itself is always
+ * excluded. Returns [] if the source has no embeddings yet, or
+ * if the user has no read access to it.
+ */
+export async function findSimilarDocs(opts: {
+  docId: string
+  user: { username: string; role: string }
+  limit?: number
+}): Promise<SearchHit[]> {
+  const limit = opts.limit ?? 10
+  const c = await getCache()
+  const source = c.docs.find((d) => d.id === opts.docId)
+  if (!source) {
+    throw Object.assign(new Error('source document not found'), { status: 404 })
+  }
+  // ACL: caller must have read access to the source, otherwise we
+  // leak similar-doc relationships to a user who can't see the
+  // anchor. Mirrors the access gate the regular search applies.
+  const { listSharesTo } = await import('../stores/userShares.js')
+  const { grantsForUser } = await import('../db/collectionsRepo.js')
+  const sharesIn = await listSharesTo(opts.user.username)
+  const collectionGrants = grantsForUser(opts.user.username)
+  const shareAllows = (d: { owner: string; storageKey: string }): boolean => {
+    if (d.owner === opts.user.username) return false
+    const target = d.storageKey.replace(/^\/+|\/+$/g, '')
+    for (const s of sharesIn) {
+      if (s.owner !== d.owner) continue
+      const sk = s.storageKey.replace(/^\/+|\/+$/g, '')
+      if (s.isFolder) {
+        if (sk === '' || target === sk || target.startsWith(sk + '/')) return true
+      } else if (target === sk) return true
+    }
+    return false
+  }
+  const collectionAllows = (d: { id: string }): boolean =>
+    collectionGrants.readableDocs.has(d.id)
+  const canRead = (d: typeof source): boolean =>
+    userCanRead(d, opts.user.username, opts.user.role) ||
+    shareAllows(d) ||
+    collectionAllows(d)
+  if (!canRead(source)) {
+    throw Object.assign(new Error('forbidden'), { status: 403 })
+  }
+
+  // Pull source doc's chunk embeddings and average them into a
+  // centroid. Skipping a doc with no embeddings yet returns an
+  // empty list rather than failing — the caller can show a "still
+  // indexing" message instead of an error.
+  const sourceChunks: Float32Array[] = []
+  for (const ch of streamEmbeddedChunks(new Set([opts.docId]))) {
+    sourceChunks.push(ch.embedding)
+  }
+  if (sourceChunks.length === 0) return []
+  const dim = sourceChunks[0].length
+  const centroid = new Float32Array(dim)
+  for (const v of sourceChunks) {
+    for (let i = 0; i < dim; i++) centroid[i] += v[i]
+  }
+  for (let i = 0; i < dim; i++) centroid[i] /= sourceChunks.length
+  let cnorm = 0
+  for (let i = 0; i < dim; i++) cnorm += centroid[i] * centroid[i]
+  cnorm = Math.sqrt(cnorm)
+  if (cnorm === 0) return []
+
+  // Score every other allowed doc by best-chunk cosine against the
+  // source centroid. Best-chunk (rather than avg) avoids penalizing
+  // a long doc that has one perfectly-matching section.
+  const allowed = c.docs.filter((d) => d.id !== opts.docId && canRead(d))
+  const allowedIds = new Set(allowed.map((d) => d.id))
+  const titleById = new Map(allowed.map((d) => [d.id, d.title]))
+  const pathById = new Map(allowed.map((d) => [d.id, d.storageKey]))
+  const ownerById = new Map(allowed.map((d) => [d.id, d.owner]))
+  const bestByDoc = new Map<string, { score: number; sample: string; chunkIdx: number }>()
+  for (const ch of streamEmbeddedChunks(allowedIds)) {
+    const cs = cosine(ch.embedding, centroid, ch.norm)
+    if (cs < 0.5) continue // floor noise out
+    const cur = bestByDoc.get(ch.docId)
+    if (!cur || cs > cur.score) {
+      bestByDoc.set(ch.docId, { score: cs, sample: ch.text.slice(0, 280), chunkIdx: ch.idx })
+    }
+  }
+  const out: SearchHit[] = []
+  for (const [docId, best] of bestByDoc) {
+    out.push({
+      docId,
+      title: titleById.get(docId) ?? '',
+      path: pathById.get(docId) ?? '',
+      owner: ownerById.get(docId) ?? '',
+      score: best.score,
+      scores: { lexical: 0, semantic: best.score, metadata: 0, image: 0 },
+      snippet: best.sample,
+      chunkIdx: best.chunkIdx,
+      source: 'semantic',
+    })
+  }
+  out.sort((a, b) => b.score - a.score)
+  return out.slice(0, limit)
 }

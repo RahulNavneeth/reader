@@ -170,6 +170,119 @@ describe('integration: MCP', () => {
     })
     expect(r.statusCode).toBe(401)
   })
+
+  it('per-token throttle: kicks in after sustained bursts (429 + Retry-After + audit)', async () => {
+    // Mint a fresh token. Per-token rate limit is bucket-capacity
+    // 60 + 5/sec refill; we can drain it with ~70 calls in a
+    // tight loop and observe the 429 + audit emit.
+    const { _resetMcpRateLimitForTest } = await import('./routes/mcp.js')
+    _resetMcpRateLimitForTest()
+
+    // Login alice, mint a token through the account endpoint.
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    const cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+    const mint = await app.inject({
+      method: 'POST',
+      url: '/api/account/tokens',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { name: 'rate-limit-test' },
+    })
+    expect(mint.statusCode).toBe(200)
+    const { secret, token } = mint.json() as {
+      secret: string
+      token: { id: string; name: string }
+    }
+
+    // Hit /mcp with a lightweight tools/list until we see a 429.
+    let saw429 = false
+    let retryAfter = ''
+    for (let i = 0; i < 120; i++) {
+      const r = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+        payload: { jsonrpc: '2.0', id: i, method: 'tools/list' },
+      })
+      if (r.statusCode === 429) {
+        saw429 = true
+        retryAfter = r.headers['retry-after'] as string
+        const body = r.json() as {
+          error: { message: string; data?: { retryAfterSeconds?: number } }
+        }
+        expect(body.error.message).toMatch(/rate limit/i)
+        expect(body.error.data?.retryAfterSeconds).toBeGreaterThan(0)
+        break
+      }
+    }
+    expect(saw429).toBe(true)
+    expect(Number(retryAfter)).toBeGreaterThan(0)
+
+    // Audit entry should have landed.
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: token.id, limit: 10 })
+    const throttled = events.find((e) => e.action === 'mcp.throttled')
+    expect(throttled?.actor).toBe('alice')
+    expect((throttled?.meta as { retryAfter?: number })?.retryAfter).toBeGreaterThan(0)
+  })
+
+  it('per-token throttle uses INDEPENDENT buckets per token', async () => {
+    // Reset, mint two tokens, drain the first to 429, verify the
+    // second still works.
+    const { _resetMcpRateLimitForTest } = await import('./routes/mcp.js')
+    _resetMcpRateLimitForTest()
+
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    const cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+    const mintA = await app.inject({
+      method: 'POST',
+      url: '/api/account/tokens',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { name: 'token-a' },
+    })
+    const mintB = await app.inject({
+      method: 'POST',
+      url: '/api/account/tokens',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { name: 'token-b' },
+    })
+    const secretA = (mintA.json() as { secret: string }).secret
+    const secretB = (mintB.json() as { secret: string }).secret
+
+    // Drain token A.
+    let tokenADrained = false
+    for (let i = 0; i < 120; i++) {
+      const r = await app.inject({
+        method: 'POST',
+        url: '/mcp',
+        headers: { authorization: `Bearer ${secretA}`, 'content-type': 'application/json' },
+        payload: { jsonrpc: '2.0', id: i, method: 'tools/list' },
+      })
+      if (r.statusCode === 429) {
+        tokenADrained = true
+        break
+      }
+    }
+    expect(tokenADrained).toBe(true)
+
+    // Token B should still get a 200 on the very next call.
+    const bResp = await app.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: { authorization: `Bearer ${secretB}`, 'content-type': 'application/json' },
+      payload: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+    })
+    expect(bResp.statusCode).toBe(200)
+  })
 })
 
 describe('integration: rate limit', () => {
@@ -1963,6 +2076,300 @@ describe('integration: user shares', () => {
       })
       expect(r.statusCode, `${t.method} ${t.url}`).toBe(401)
     }
+  })
+})
+
+// ── Search filters + similar ──────────────────────────────────────
+// Covers the v0.9 search-depth work: faceted filtering on the
+// /search/knowledge endpoint (mime, tags, folder, after/before)
+// plus the /search/similar/:docId endpoint which short-circuits
+// to an empty list for docs without embeddings.
+describe('integration: search depth', () => {
+  let cookie = ''
+
+  it('logs in alice', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(r.statusCode).toBe(200)
+    cookie = setCookieValue(r.headers['set-cookie']) ?? ''
+  })
+
+  it('GET /api/search/knowledge accepts and round-trips filters', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/search/knowledge?q=anything&mime=text/markdown&tags=urgent,draft&folder=projects&after=1000&before=999999999999',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(body.query).toBe('anything')
+    expect(Array.isArray(body.hits)).toBe(true)
+    // Filter echo so the client can verify what got applied.
+    expect(body.filters.mime).toEqual(['text/markdown'])
+    expect(body.filters.tags).toEqual(['urgent', 'draft'])
+    expect(body.filters.folder).toBe('projects')
+    expect(body.filters.after).toBe(1000)
+    expect(body.filters.before).toBe(999999999999)
+  })
+
+  it('GET /api/search/knowledge with empty q returns no hits', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/search/knowledge?q=',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().hits).toEqual([])
+  })
+
+  it('GET /api/search/knowledge 401s without auth', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/search/knowledge?q=x',
+      headers: { 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('GET /api/search/similar/:docId 404s for unknown docs', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/search/similar/no-such-doc',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(404)
+    expect(r.json().error).toMatch(/not found/i)
+  })
+
+  it('GET /api/search/similar/:docId returns [] for a doc with no embeddings', async () => {
+    // Seed a doc directly without embeddings — findSimilarDocs
+    // returns an empty array (not an error) when the source has
+    // nothing to centroid against.
+    db()
+      .prepare(
+        `INSERT INTO documents
+           (id, owner, storage_key, title, original_filename, mime, bytes, sha256, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run('similar-test-1', 'alice', 'similar-test-1.md', 'no-embed', 'similar-test-1.md', 'text/markdown', 0, '', Date.now(), Date.now())
+    const { invalidateSearchCache } = await import('./services/search.js')
+    invalidateSearchCache()
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/search/similar/similar-test-1',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().hits).toEqual([])
+  })
+
+  it('GET /api/search/similar/:docId enforces ACL (403 from a non-admin on someone else\'s doc)', async () => {
+    // Seed an alice-owned doc; sign in as bob (editor, not admin)
+    // and confirm bob gets 403. Alice is admin in this suite so we
+    // can't use her cookie to assert the deny path — admins bypass
+    // the ACL by design.
+    db()
+      .prepare(
+        `INSERT INTO documents
+           (id, owner, storage_key, title, original_filename, mime, bytes, sha256, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run('alice-secret-similar', 'alice', 'alice-secret.md', 'alice', 'alice-secret.md', 'text/markdown', 0, '', Date.now(), Date.now())
+    const { invalidateSearchCache } = await import('./services/search.js')
+    invalidateSearchCache()
+    const bobLogin = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'bob', password: 'correct-horse-battery' },
+    })
+    expect(bobLogin.statusCode).toBe(200)
+    const bobCookie = setCookieValue(bobLogin.headers['set-cookie']) ?? ''
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/search/similar/alice-secret-similar',
+      headers: { cookie: bobCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(403)
+  })
+
+  it('GET /api/search/similar/:docId 401s without auth', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/search/similar/anything',
+      headers: { 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+})
+
+// ── Document templates ────────────────────────────────────────────
+// `_templates/*.md` under the user's vault drives the template list;
+// instantiation copies the file with placeholder substitution and
+// runs it through the regular ingest pipeline.
+describe('integration: document templates', () => {
+  let cookie = ''
+
+  it('logs in alice + seeds a template under _templates/', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const dir = path.join(config.vault.root, 'alice', '_templates')
+    await mkdir(dir, { recursive: true })
+    await writeFile(
+      path.join(dir, 'meeting-notes.md'),
+      '# {{title}}\n\nDate: {{date}}\nAuthor: {{user}}\nProject: {{project}}\n',
+    )
+  })
+
+  it('GET /api/templates lists the seeded template with preview', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/templates',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    const t = body.templates.find(
+      (x: { name: string }) => x.name === 'meeting-notes.md',
+    )
+    expect(t).toBeTruthy()
+    expect(t.path).toBe('_templates/meeting-notes.md')
+    expect(t.preview).toContain('{{title}}')
+  })
+
+  it('GET /api/templates returns [] when _templates/ does not exist', async () => {
+    // Use bob — never seeded a templates dir for him.
+    const bobLogin = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'bob', password: 'correct-horse-battery' },
+    })
+    const bobCookie = setCookieValue(bobLogin.headers['set-cookie']) ?? ''
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/templates',
+      headers: { cookie: bobCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().templates).toEqual([])
+  })
+
+  it('POST /api/templates/instantiate copies + substitutes + ingests', async () => {
+    // Defensive cleanup — the instantiate endpoint refuses to
+    // clobber an existing file, so any leftover at this path from
+    // a prior run would 409. Same defensive pattern the move test
+    // uses for `move-dst.md`.
+    {
+      const { rm } = await import('node:fs/promises')
+      const path = await import('node:path')
+      await rm(
+        path.join(config.vault.root, 'alice', 'projects/2026-meeting.md'),
+        { force: true },
+      )
+    }
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/templates/instantiate',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: {
+        template: '_templates/meeting-notes.md',
+        target: 'projects/2026-meeting.md',
+        title: 'Q3 Planning',
+        vars: { project: 'reader' },
+      },
+    })
+    expect(r.statusCode).toBe(200)
+    const doc = r.json().document
+    expect(doc.title).toBe('Q3 Planning')
+    expect(doc.storageKey).toBe('projects/2026-meeting.md')
+
+    // Disk content should have all placeholders resolved.
+    const { readFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', 'projects/2026-meeting.md')
+    const text = (await readFile(abs)).toString('utf8')
+    expect(text).toContain('Q3 Planning')
+    expect(text).toContain('Author: alice')
+    expect(text).toContain('Project: reader')
+    expect(text).toMatch(/Date: \d{4}-\d{2}-\d{2}/)
+    expect(text).not.toContain('{{')
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'projects/2026-meeting.md' })
+    expect(events.find((e) => e.action === 'template.instantiate')).toBeTruthy()
+  })
+
+  it('POST /api/templates/instantiate refuses to clobber an existing file (409)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/templates/instantiate',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: {
+        template: '_templates/meeting-notes.md',
+        target: 'projects/2026-meeting.md',
+      },
+    })
+    expect(r.statusCode).toBe(409)
+  })
+
+  it('POST /api/templates/instantiate refuses templates outside _templates/ (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/templates/instantiate',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: {
+        template: 'projects/2026-meeting.md',
+        target: 'projects/other.md',
+      },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toMatch(/_templates/)
+  })
+
+  it('POST /api/templates/instantiate 404s on unknown template', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/templates/instantiate',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: {
+        template: '_templates/nope.md',
+        target: 'projects/x.md',
+      },
+    })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('POST /api/templates/instantiate requires both template and target (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/templates/instantiate',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { template: '_templates/meeting-notes.md' },
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('GET /api/templates 401s without auth', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/templates',
+      headers: { 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(401)
   })
 })
 
