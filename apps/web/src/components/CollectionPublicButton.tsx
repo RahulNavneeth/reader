@@ -143,7 +143,7 @@ export function CollectionPublicButton({
         >
           <div
             className="flex items-center gap-2 px-3 h-8"
-            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
             <Globe size={13} className="text-muted" />
             <span className="text-[12px] font-semibold text-fg flex-1">
@@ -161,7 +161,7 @@ export function CollectionPublicButton({
               <div className="flex items-center gap-2">
                 <code
                   className="flex-1 px-2 py-1.5 rounded text-[11.5px] truncate"
-                  style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
+                  style={{ background: 'var(--bg)', border: '1px solid var(--border)' }}
                 >
                   {window.location.origin}/pc/{publicSlug}
                 </code>

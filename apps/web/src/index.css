@@ -8,7 +8,7 @@
     --panel: #F4F5F7;
     --panel-2: #FAFBFC;
     --border: #DFE1E6;
-    --border-soft: #EBECF0;
+    --border-soft: var(--border);
     --fg: #172B4D;
     --fg-muted: #6B778C;
     --fg-subtle: #8993A4;
@@ -19,13 +19,29 @@
     --code-bg: #F4F5F7;
     --danger-bg: #FFEBE6;
     --danger-fg: #BF2600;
+    --scrim: rgba(0, 0, 0, 0.35);
+    /* Surface roles. In light mode the viewer is the brighter
+     * surface (white) and rails are the tinted secondary surface
+     * (panel). Dark mode keeps the reverse — the rails are the
+     * darker base and the viewer is the slightly-bluer panel. */
+    --viewer: var(--bg);
+    --rail: var(--panel);
+    --composer-input: var(--bg);
+    --input-bg: var(--bg);
+    --input-border: var(--border);
+    /* Table styling derived from --viewer so it adapts whether the
+     * underlying surface is white (light) or the panel tint (dark).
+     * Header is a subtly darker (light) / lighter (dark) shade
+     * than the surface; stripes a milder variant of the same. */
+    --table-header-bg: color-mix(in srgb, var(--fg) 8%, var(--viewer));
+    --table-stripe-bg: color-mix(in srgb, var(--fg) 4%, var(--viewer));
   }
   .dark {
     --bg: #0B1424;
     --panel: #0F1B33;
     --panel-2: #122142;
     --border: #1E2C49;
-    --border-soft: #16243F;
+    --border-soft: var(--border);
     --fg: #E8ECF3;
     --fg-muted: #97A1B7;
     --fg-subtle: #6B778C;
@@ -36,6 +52,18 @@
     --code-bg: #0A1224;
     --danger-bg: #2A1014;
     --danger-fg: #FF8F73;
+    --scrim: rgba(0, 0, 0, 0.35);
+    --viewer: var(--panel);
+    --rail: var(--bg);
+    --composer-input: var(--panel-2);
+    /* One step lighter than --panel-2 so an input visibly pops
+     * against the header / rail surfaces in dark mode. */
+    --input-bg: #1A2B52;
+    /* Slightly lighter than --input-bg so the frame reads as
+     * an intentional outline, not a contrasting ring. Avoids
+     * the "bright border" effect we'd get if we reused --border
+     * (which sits between input-bg and panel-2 and looks off). */
+    --input-border: #243559;
   }
   html, body, #root {
     height: 100%;
@@ -90,9 +118,9 @@
        the chrome. Focus state is snappy without animation — the
        border + shadow change is instant. */
     @apply w-full h-8 px-2.5 rounded text-[13px] outline-none;
-    background: var(--bg);
+    background: var(--input-bg);
     color: var(--fg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--input-border);
   }
   .input:focus {
     border-color: var(--accent);
@@ -231,10 +259,15 @@
   text-align: left;
 }
 .md th {
-  background: var(--panel);
+  background: var(--table-header-bg);
   font-weight: 600;
+  /* Higher-contrast border than the body cells so the header row
+   * stays visually anchored even when its bg sits close in value
+   * to the viewer surface (the default --border at 8% of --fg can
+   * disappear into the header's own tint). */
+  border-color: color-mix(in srgb, var(--fg) 18%, var(--viewer));
 }
-.md tr:nth-child(even) td { background: var(--panel-2); }
+.md tr:nth-child(even) td { background: var(--table-stripe-bg); }
 .md hr { border: 0; border-top: 1px solid var(--border-soft); margin: 24px 0; }
 .md img { max-width: 100%; border-radius: 4px; }
 .md .anchor {
@@ -312,7 +345,12 @@
   padding: 4px 8px;
   text-align: left;
 }
-.chat-md th { background: var(--panel); font-weight: 600; }
+.chat-md th {
+  background: var(--table-header-bg);
+  font-weight: 600;
+  border-color: color-mix(in srgb, var(--fg) 18%, var(--viewer));
+}
+.chat-md tr:nth-child(even) td { background: var(--table-stripe-bg); }
 .chat-md hr { border: 0; border-top: 1px solid var(--border-soft); margin: 10px 0; }
 
 /* Highlight.js — minimal Atlassian-leaning theme */

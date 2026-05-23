@@ -34,6 +34,7 @@ import {
   setUserMemoryEmbedding,
 } from '../db/memoriesRepo.js'
 import { embedMemoryFact } from '../services/memoryEmbed.js'
+import { audit } from '../stores/audit.js'
 
 /** Embed a freshly-created memory and persist its vector. Fire-
  *  and-forget; swallows errors (the embed backend may be offline)
@@ -85,6 +86,11 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
       createdAt,
       alwaysInject,
     })
+    await audit({
+      actor: user.username,
+      action: 'memory.user.add',
+      meta: { id, alwaysInject, preview: fact.slice(0, 120) },
+    })
     // Fire-and-forget embed so the relevance retriever can score
     // this memory immediately. If Ollama is down the row gets
     // picked up by the boot-time backfill instead.
@@ -107,6 +113,11 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
     const user = req.currentUser!
     const ok = deleteUserMemory(req.params.id, user.username)
     if (!ok) return reply.code(404).send({ error: 'memory not found' })
+    await audit({
+      actor: user.username,
+      action: 'memory.user.delete',
+      meta: { id: req.params.id },
+    })
     return { ok: true }
   })
 
@@ -129,6 +140,12 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
       const createdAt = Date.now()
       const alwaysInject = !!req.body?.alwaysInject
       addDocMemory({ id, docId, userId: user.username, fact, createdAt, alwaysInject })
+      await audit({
+        actor: user.username,
+        action: 'memory.doc.add',
+        target: docId,
+        meta: { id, alwaysInject, preview: fact.slice(0, 120) },
+      })
       embedAndStoreMemory('doc', id, fact).catch(() => { /* swallow */ })
       return {
         memory: {
@@ -145,6 +162,12 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
       const user = req.currentUser!
       const ok = deleteDocMemory(req.params.id, req.params.docId, user.username)
       if (!ok) return reply.code(404).send({ error: 'memory not found' })
+      await audit({
+        actor: user.username,
+        action: 'memory.doc.delete',
+        target: req.params.docId,
+        meta: { id: req.params.id },
+      })
       return { ok: true }
     },
   )
@@ -174,6 +197,16 @@ export async function aiMemoriesRoutes(app: FastifyInstance) {
       wrongAnswer,
       correction,
       createdAt: Date.now(),
+    })
+    await audit({
+      actor: user.username,
+      action: 'chat.feedback',
+      target: req.params.docId,
+      meta: {
+        id,
+        messageId: req.body?.messageId,
+        questionPreview: question.slice(0, 120),
+      },
     })
     return { note: { id, docId: req.params.docId, question, correction } }
   })

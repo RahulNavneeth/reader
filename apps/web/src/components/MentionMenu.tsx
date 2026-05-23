@@ -156,7 +156,7 @@ export function MentionMenu({ query, attachedIds, excludeDocId, onPick, onClose 
       }}
     >
       <div className="px-2.5 py-1.5 text-[10.5px] uppercase tracking-wider font-semibold text-subtle"
-           style={{ borderBottom: '1px solid var(--border-soft)' }}>
+           style={{ borderBottom: '1px solid var(--border)' }}>
         Mention a document
       </div>
       <div className="max-h-[240px] overflow-y-auto py-0.5">

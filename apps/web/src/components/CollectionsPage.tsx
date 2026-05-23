@@ -106,7 +106,7 @@ export function CollectionsPage() {
         // fixed.
         <div
           className="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] px-4"
-          style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+          style={{ background: 'var(--scrim)' }}
           onClick={() => {
             if (!creating) {
               setNewOpen(false)
@@ -121,7 +121,7 @@ export function CollectionsPage() {
           >
             <div
               className="flex items-center gap-2.5 px-4 h-12 border-b shrink-0"
-              style={{ borderColor: 'var(--border-soft)' }}
+              style={{ borderColor: 'var(--border)' }}
             >
               <Layers size={15} className="text-accent" />
               <div className="text-[13.5px] font-medium text-fg">New collection</div>
@@ -163,7 +163,7 @@ export function CollectionsPage() {
             </div>
             <div
               className="flex items-center justify-end gap-2 px-4 py-3 border-t"
-              style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+              style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
             >
               <button
                 className="btn-ghost h-7"
@@ -278,7 +278,7 @@ function CollectionCard({
       className="group block rounded-md overflow-hidden no-underline transition-colors"
       style={{
         background: 'var(--panel)',
-        border: '1px solid var(--border-soft)',
+        border: '1px solid var(--border)',
       }}
     >
       <CoverArt preview={c.preview} memberCount={c.memberCount} />
@@ -366,7 +366,7 @@ function CoverArt({
         gridTemplateColumns: '1fr 1fr',
         gridTemplateRows: '1fr 1fr',
         gap: 1,
-        background: 'var(--border-soft)',
+        background: 'var(--border)',
       }}
     >
       {preview.slice(0, 4).map((it) => (

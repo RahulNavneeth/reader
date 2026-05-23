@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save, HardDrive, User as UserIcon } from 'lucide-react'
+import { Filter, X, AlertCircle, Loader2, Tag, ChevronRight, FileText, Folder, Bookmark, Save, HardDrive, User as UserIcon, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
@@ -49,6 +49,22 @@ export function VaultSidebar() {
   const confirm = useConfirm()
   const prompt = usePrompt()
   const activePath = openPath ?? (currentFolder || null)
+
+  // Collapsed-to-icon-strip state for desktop. Mobile uses the
+  // drawer pattern via mobileSidebarOpen instead. Persisted to
+  // localStorage so the choice survives reloads.
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('vault-sidebar-collapsed') === '1'
+    } catch {
+      return false
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem('vault-sidebar-collapsed', collapsed ? '1' : '0')
+    } catch {/* ignore */}
+  }, [collapsed])
 
   const [tree, setTree] = useState<VaultNode[] | null>(null)
   const [tags, setTags] = useState<Array<{ tag: string; count: number }> | null>(null)
@@ -187,26 +203,48 @@ export function VaultSidebar() {
       {mobileSidebarOpen && (
         <div
           className="md:hidden fixed inset-0 z-30"
-          style={{ background: 'rgba(9,30,66,0.42)' }}
+          style={{ background: 'var(--scrim)' }}
           onClick={() => setMobileSidebarOpen(false)}
           aria-hidden
         />
       )}
+      {/* Collapsed-to-icon strip on desktop. Mirrors DocRail's
+          collapsed pattern: a narrow column with a single icon
+          button to expand. Mobile (where mobileSidebarOpen drives
+          show/hide) is unaffected. */}
+      {collapsed && (
+        <aside
+          style={{ background: 'var(--rail)' }}
+          className="hidden md:flex w-8 shrink-0 border-r border-app flex-col items-stretch"
+        >
+          <button
+            className="h-11 w-full inline-flex items-center justify-center border-b border-app transition-[background-color] hover:bg-hover bg-[var(--panel-2)]"
+            style={{ color: 'var(--fg-subtle)' }}
+            onClick={() => setCollapsed(false)}
+            title="Expand vault"
+            aria-label="Expand vault"
+          >
+            <PanelLeftOpen size={13} />
+          </button>
+        </aside>
+      )}
       <aside
+        style={{ background: 'var(--rail)' }}
         className={clsx(
-          'panel border-r border-app overflow-y-auto flex flex-col',
+          'border-r border-app overflow-y-auto flex flex-col',
           // Mobile: fixed-position drawer that slides in from the left.
-          // Desktop: in-flow column at 320px.
+          // Desktop: in-flow column at 320px, hidden when collapsed.
           'md:static md:translate-x-0 md:w-[320px] md:shrink-0',
+          collapsed && 'md:hidden',
           'fixed inset-y-0 left-0 z-40 w-[85vw] max-w-[320px] transition-transform',
           mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0',
         )}
       >
       <div
-        className="h-11 px-2 flex items-center border-b sticky top-0 z-10"
-        style={{ background: 'var(--panel)', borderColor: 'var(--border-soft)' }}
+        className="h-11 px-2 flex items-center gap-1.5 border-b border-app sticky top-0 z-10"
+        style={{ background: 'var(--panel-2)' }}
       >
-        <div className="relative w-full">
+        <div className="relative flex-1 min-w-0">
           <Filter size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-subtle pointer-events-none" />
           <input
             className="input pl-8 pr-7 h-7 text-[12.5px]"
@@ -246,6 +284,17 @@ export function VaultSidebar() {
             </>
           )}
         </div>
+        {/* Collapse-to-icon-strip toggle. Desktop only — on mobile
+            the drawer pattern (mobileSidebarOpen) already provides
+            show/hide via the topbar burger. */}
+        <button
+          className="hidden md:inline-flex btn-ghost h-7 w-7 px-0 shrink-0"
+          onClick={() => setCollapsed(true)}
+          title="Collapse vault"
+          aria-label="Collapse vault"
+        >
+          <PanelLeftClose size={13} />
+        </button>
       </div>
 
       <div

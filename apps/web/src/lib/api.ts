@@ -1139,6 +1139,33 @@ export const api = {
       'DELETE',
       `/api/chat/${encodeURIComponent(docId)}/pending-edit/${encodeURIComponent(messageId)}`,
     ),
+  previewChatEdit: (docId: string, messageId: string) =>
+    get<{
+      current: string
+      next: string
+      sha256: string
+      opPreviews: Array<{
+        op: ProposedEditOpDTO
+        next: string
+        error?: string
+        /** True when this op was already accepted via per-op flow.
+         *  Client renders it as an "Applied" anchor (no buttons,
+         *  no diff hunk) rather than a pending change. */
+        applied?: boolean
+      }>
+    }>(
+      `/api/chat/${encodeURIComponent(docId)}/messages/${encodeURIComponent(messageId)}/preview`,
+    ),
+  applyChatEditOp: (docId: string, messageId: string, opIndex: number) =>
+    post<{ ok: true; document: DocumentMeta }>(
+      `/api/chat/${encodeURIComponent(docId)}/apply-op`,
+      { messageId, opIndex },
+    ),
+  discardChatEditOp: (docId: string, messageId: string, opIndex: number) =>
+    request<{ ok: true }>(
+      'DELETE',
+      `/api/chat/${encodeURIComponent(docId)}/pending-edit/${encodeURIComponent(messageId)}/op/${opIndex}`,
+    ),
 }
 
 export type UserMemoryDTO = {
@@ -1183,12 +1210,20 @@ export type MemoryUsedDTO = {
   preview: string
 }
 
+/** Optional fields tracked per-op on the wire so the UI can
+ *  render per-op state (Applied pill / pending diff). Mirrors
+ *  the server's ProposedEditOp `appliedAt`. */
+type ProposedEditOpStateDTO = {
+  /** Epoch ms when this op was accepted via the per-op preview. */
+  appliedAt?: number | null
+}
+
 export type ProposedEditOpDTO =
-  | { op: 'replace_section'; heading: string; content: string }
-  | { op: 'insert_after'; heading: string; content: string }
-  | { op: 'delete_section'; heading: string }
-  | { op: 'append_text'; content: string }
-  | { op: 'prepend_text'; content: string }
+  | (ProposedEditOpStateDTO & { op: 'replace_section'; heading: string; content: string })
+  | (ProposedEditOpStateDTO & { op: 'insert_after'; heading: string; content: string })
+  | (ProposedEditOpStateDTO & { op: 'delete_section'; heading: string })
+  | (ProposedEditOpStateDTO & { op: 'append_text'; content: string })
+  | (ProposedEditOpStateDTO & { op: 'prepend_text'; content: string })
 
 export type ChatThreadDTO = {
   id: string

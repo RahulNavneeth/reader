@@ -110,7 +110,7 @@ export function RevokePublicPopover({
         >
           <div
             className="flex items-center gap-2 px-3 h-8"
-            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
             <Globe size={13} style={{ color: '#00875A' }} />
             <span className="text-[12px] font-semibold text-fg">Public link</span>

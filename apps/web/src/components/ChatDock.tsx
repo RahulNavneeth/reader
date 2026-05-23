@@ -43,6 +43,19 @@ type Props = {
    *  on a chat turn, so the parent doc viewer can refetch its
    *  body + meta and reflect the new content without a reload. */
   onDocEdited?: () => void
+  /** Called when the user clicks Preview on a proposed-edit card.
+   *  Parent (PathViewer) swaps the main content area to an inline
+   *  diff preview. */
+  onPreviewEdit?: (messageId: string) => void
+  /** Currently-previewed message id, if any. Threaded down to the
+   *  matching card so it can flip its Preview ↔ Back label. */
+  previewingMessageId?: string | null
+  /** Bumped by the parent (PathViewer) when an out-of-band action
+   *  changes the chat state — e.g. Apply succeeded from inside the
+   *  preview view. ChatDock reloads its history when this changes
+   *  so the proposed-edit card flips to "Applied" instead of
+   *  staying on the stale pending UI. */
+  historyReloadKey?: number
 }
 
 /**
@@ -72,6 +85,9 @@ export function ChatDock({
   pendingQuote,
   onPendingQuoteConsumed,
   onDocEdited,
+  onPreviewEdit,
+  previewingMessageId,
+  historyReloadKey,
 }: Props) {
   const navigate = useNavigate()
   const confirmDialog = useConfirm()
@@ -730,6 +746,15 @@ export function ChatDock({
     }
   }
 
+  // Out-of-band reload trigger from the parent. The preview's
+  // Apply runs outside ChatDock; bumping this key from PathViewer
+  // is how it tells us "go refresh, the world changed under you".
+  useEffect(() => {
+    if (historyReloadKey == null) return
+    void reloadHistory()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyReloadKey])
+
   const handleFeedback = async (note: {
     messageId: string
     question: string
@@ -752,7 +777,7 @@ export function ChatDock({
   const renderStreamingBubble = (showDividerAbove = false) => (
     <div
       className={`min-w-0 py-3 first:pt-0 ${showDividerAbove ? 'border-t mt-3 pt-6' : ''}`}
-      style={showDividerAbove ? { borderColor: 'var(--border-soft)' } : undefined}
+      style={showDividerAbove ? { borderColor: 'var(--border)' } : undefined}
     >
       <div
         className="text-[10px] uppercase tracking-wider font-semibold mb-1.5"
@@ -809,7 +834,7 @@ export function ChatDock({
   return (
     <aside
       className="w-[380px] shrink-0 border-l flex flex-col relative"
-      style={{ borderColor: 'var(--border-soft)', background: 'var(--bg)' }}
+      style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
     >
       {/* Header height pinned to h-11 so the h-7 trigger button
           has 8px of vertical air top + bottom, matching the px-2
@@ -817,7 +842,7 @@ export function ChatDock({
           so both rails align when open. */}
       <div
         className="sticky top-0 z-30 h-11 px-2 border-b flex items-center gap-1 shrink-0 relative"
-        style={{ background: 'var(--bg)', borderColor: 'var(--border-soft)' }}
+        style={{ background: 'var(--rail)', borderColor: 'var(--border)' }}
       >
         {/* Thread switcher dropdown. Click opens a popover listing
             every thread for this (doc, user) plus a "New chat"
@@ -917,8 +942,8 @@ export function ChatDock({
           // starter prompts. The composer is right below so the
           // suggestions sit visually attached to it, inviting the
           // user to either pick one or just start typing.
-          <div className="h-full flex flex-col justify-end px-4 pb-3">
-            <div className="flex flex-col items-start gap-3">
+          <div className={`h-full flex flex-col px-4 ${indexedOk ? 'justify-end pb-3' : 'justify-center items-center'}`}>
+            <div className={`flex flex-col gap-3 ${indexedOk ? 'items-start' : 'items-center text-center'}`}>
               <div
                 className="h-9 w-9 rounded-full inline-flex items-center justify-center"
                 style={{ background: 'var(--selected)', color: 'var(--accent)' }}
@@ -978,7 +1003,7 @@ export function ChatDock({
           </div>
         )}
         {(hasHistory || streamText || streaming || resuming) && (
-        <div className="px-3 pt-1.5 pb-3" style={{ borderColor: 'var(--border-soft)' }}>
+        <div className="px-3 pt-1.5 pb-3" style={{ borderColor: 'var(--border)' }}>
           {hiddenCount > 0 && (
             <div className="flex justify-center pb-2">
               <button
@@ -1032,6 +1057,8 @@ export function ChatDock({
                 onFeedback={handleFeedback}
                 onEditChanged={reloadHistory}
                 onDocApplied={onDocEdited}
+                onEditPreview={onPreviewEdit}
+                previewingMessageId={previewingMessageId}
                 canRegenerate={!streaming}
               />
               {showStreamingInline && renderStreamingBubble(false)}
@@ -1051,7 +1078,7 @@ export function ChatDock({
           return (
             <div
               className={`min-w-0 py-3 first:pt-0 ${showDivider ? 'border-t mt-3 pt-6' : ''}`}
-              style={showDivider ? { borderColor: 'var(--border-soft)' } : undefined}
+              style={showDivider ? { borderColor: 'var(--border)' } : undefined}
             >
               <div
                 className="text-[10px] uppercase tracking-wider font-semibold mb-1"
@@ -1084,7 +1111,7 @@ export function ChatDock({
       {indexedOk && (
       <div
         className="shrink-0 px-3 py-2.5 relative"
-        style={{ background: 'var(--bg)' }}
+        style={{ background: 'var(--rail)' }}
       >
         {/* Slash-command suggestions — popped above the composer
             when the draft starts with `/`. Click to accept the
@@ -1139,7 +1166,7 @@ export function ChatDock({
         <div
           className="rounded-lg"
           style={{
-            background: 'var(--panel-2)',
+            background: 'var(--composer-input)',
             border: '1px solid var(--border)',
           }}
         >
@@ -1152,7 +1179,7 @@ export function ChatDock({
             <div
               className="flex items-center gap-1.5 px-2.5 py-1 text-[11.5px]"
               style={{
-                borderBottom: '1px solid var(--border-soft)',
+                borderBottom: '1px solid var(--border)',
                 color: 'var(--fg-subtle)',
               }}
             >
@@ -1302,7 +1329,7 @@ export function ChatDock({
           className="absolute left-0 right-0 bottom-0"
           style={{
             top: '44px',
-            background: 'rgba(0, 0, 0, 0.35)',
+            background: 'var(--scrim)',
             zIndex: 25,
           }}
           onClick={() => setThreadMenuOpen(false)}
@@ -1323,6 +1350,8 @@ function Bubble({
   onFeedback,
   onEditChanged,
   onDocApplied,
+  onEditPreview,
+  previewingMessageId,
   onEditQuestion,
   suppressHoverActions,
   canRegenerate,
@@ -1347,6 +1376,12 @@ function Bubble({
    *  parent doc viewer can refetch the doc body + meta and reflect
    *  the new content without a reload. */
   onDocApplied?: () => void
+  /** Tell the parent (PathViewer) to swap the main content area to
+   *  an inline preview of this proposed edit. */
+  onEditPreview?: (messageId: string) => void
+  /** When set, this edit's preview is currently showing in the
+   *  viewer. The card toggles its Preview button label. */
+  previewingMessageId?: string | null
   /** Called when the user clicks Edit on a USER turn. The parent
    *  drops the old user+assistant pair, re-fills the composer
    *  with the user's content, and focuses the textarea. */
@@ -1394,7 +1429,7 @@ function Bubble({
   return (
     <div
       className={`min-w-0 py-3 first:pt-0 group ${showDividerAbove ? 'border-t mt-3 pt-6' : ''}`}
-      style={showDividerAbove ? { borderColor: 'var(--border-soft)' } : undefined}
+      style={showDividerAbove ? { borderColor: 'var(--border)' } : undefined}
     >
       <div
         className="text-[10px] uppercase tracking-wider font-semibold mb-1.5"
@@ -1440,7 +1475,7 @@ function Bubble({
                     <div
                       className="flex items-start gap-1.5 px-2.5 py-1.5 text-[11.5px] leading-snug"
                       style={{
-                        borderBottom: '1px solid var(--border-soft)',
+                        borderBottom: '1px solid var(--border)',
                         color: 'var(--fg-subtle)',
                       }}
                     >
@@ -1523,6 +1558,8 @@ function Bubble({
                 onDocApplied?.()
               }}
               onDiscarded={onEditChanged}
+              onPreview={onEditPreview ? () => onEditPreview(message.id) : undefined}
+              isPreviewing={previewingMessageId === message.id}
             />
           ))}
         </div>
@@ -1569,7 +1606,7 @@ function Bubble({
       {showFeedback && (
         <div
           className="mt-2 rounded-md p-2.5"
-          style={{ background: 'var(--panel-2)', border: '1px solid var(--border-soft)' }}
+          style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}
         >
           {feedbackState === 'submitted' ? (
             <div className="text-[12px] text-fg flex items-center gap-1.5">
@@ -1651,9 +1688,9 @@ function MentionChip({
     <span
       className="group inline-flex items-center gap-1 px-1.5 h-5 rounded text-[11px] max-w-[60%]"
       style={{
-        background: isAttached ? 'var(--selected)' : 'var(--bg)',
-        border: `1px solid ${isAttached ? 'color-mix(in srgb, var(--accent) 30%, transparent)' : 'var(--border-soft)'}`,
-        color: isAttached ? 'var(--accent)' : 'var(--fg-subtle)',
+        background: isAttached ? 'var(--selected)' : 'var(--rail)',
+        border: `1px solid ${isAttached ? 'color-mix(in srgb, var(--accent) 30%, transparent)' : 'var(--border)'}`,
+        color: isAttached ? 'var(--accent)' : 'var(--fg)',
       }}
       title={title}
     >
@@ -1741,7 +1778,7 @@ function ThreadMenu({
         onMouseEnter={() => setHover(-1)}
         className="w-full flex items-center gap-2 px-2.5 h-8 text-[12.5px] text-left text-fg"
         style={{
-          borderBottom: threads.length > 0 ? '1px solid var(--border-soft)' : undefined,
+          borderBottom: threads.length > 0 ? '1px solid var(--border)' : undefined,
           ...(hover === -1 ? { background: 'var(--hover)' } : null),
         }}
       >
@@ -2105,7 +2142,7 @@ function SourcesPanel({
       className="rounded-md text-[12px] mb-1"
       style={{
         background: 'var(--panel-2)',
-        border: '1px solid var(--border-soft)',
+        border: '1px solid var(--border)',
       }}
     >
       <button
@@ -2125,7 +2162,7 @@ function SourcesPanel({
       {open && (
         <div
           className="flex flex-col"
-          style={{ borderTop: '1px solid var(--border-soft)' }}
+          style={{ borderTop: '1px solid var(--border)' }}
         >
           {grouped.map((g, i) => {
             const label = g.docTitle ?? `${g.docId.slice(0, 6)}…`
@@ -2154,7 +2191,7 @@ function SourcesPanel({
                 }}
                 title={g.docPath ?? label}
                 className="px-2.5 h-8 flex items-center gap-2 text-left text-[12.5px] hover:bg-hover disabled:hover:bg-transparent"
-                style={i > 0 ? { borderTop: '1px solid var(--border-soft)' } : undefined}
+                style={i > 0 ? { borderTop: '1px solid var(--border)' } : undefined}
               >
                 <FileText
                   size={11}
@@ -2216,7 +2253,7 @@ function UsedMemoryFooter({
       {open && (
         <div
           className="mt-1 px-2 py-1.5 rounded text-[11.5px] leading-relaxed space-y-0.5"
-          style={{ background: 'var(--panel-2)', border: '1px solid var(--border-soft)' }}
+          style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}
         >
           {memories.map((m) => (
             <div key={`${m.kind}:${m.id}`} className="flex items-start gap-1.5">

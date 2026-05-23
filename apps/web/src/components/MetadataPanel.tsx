@@ -102,7 +102,7 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
           the chrome. */}
       <div
         className="fixed inset-0 z-[55]"
-        style={{ background: 'rgba(9, 30, 66, 0.18)' }}
+        style={{ background: 'var(--scrim)' }}
         onClick={onClose}
       />
       <aside
@@ -114,7 +114,7 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
             behind it. */}
         <div
           className="h-12 px-3 flex items-center gap-2 shrink-0"
-          style={{ borderBottom: '1px solid var(--border-soft)' }}
+          style={{ borderBottom: '1px solid var(--border)' }}
         >
           <span className="text-[11.5px] uppercase tracking-wider font-semibold text-subtle flex-1">
             Details
@@ -261,7 +261,7 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
                 className="rounded-md overflow-hidden"
                 style={{
                   height: 160,
-                  border: '1px solid var(--border-soft)',
+                  border: '1px solid var(--border)',
                   position: 'relative',
                 }}
               >
@@ -391,7 +391,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   return (
     <section
       className="rounded-md p-3"
-      style={{ border: '1px solid var(--border-soft)' }}
+      style={{ border: '1px solid var(--border)' }}
     >
       <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-2">
         {title}
@@ -430,7 +430,7 @@ function EntityRow({ label, items }: { label: string; items: string[]; mono?: bo
             className="inline-flex items-center px-1.5 h-[18px] rounded text-[11px]"
             style={{
               background: 'var(--bg)',
-              border: '1px solid var(--border-soft)',
+              border: '1px solid var(--border)',
               color: 'var(--fg)',
             }}
             title={s}

@@ -156,7 +156,7 @@ export function DocRail({
       {!eitherOpen ? (
         <div
           className="w-8 shrink-0 border-l flex flex-col items-stretch"
-          style={{ borderColor: 'var(--border-soft)', background: 'var(--bg)' }}
+          style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
         >
           <RailIconButton
             label="Expand outline"
@@ -183,7 +183,7 @@ export function DocRail({
       ) : (
         <aside
           className="w-[240px] shrink-0 border-l overflow-y-auto"
-          style={{ borderColor: 'var(--border-soft)', background: 'var(--bg)' }}
+          style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
         >
           {outlineOpen && (
             <>
@@ -337,8 +337,8 @@ function RailIconButton({
 }) {
   return (
     <button
-      className="h-11 w-full inline-flex items-center justify-center border-b transition-colors hover:bg-hover"
-      style={{ borderColor: 'var(--border-soft)', color: 'var(--fg-subtle)' }}
+      className="h-11 w-full inline-flex items-center justify-center border-b transition-[background-color] hover:bg-hover"
+      style={{ borderColor: 'var(--border)', color: 'var(--fg-subtle)' }}
       onClick={onClick}
       title={label}
       aria-label={label}
@@ -364,7 +364,7 @@ function SectionHeader({
   return (
     <div
       className="sticky top-0 h-11 px-3 border-b text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex items-center gap-1.5"
-      style={{ background: 'var(--bg)', borderColor: 'var(--border-soft)' }}
+      style={{ background: 'var(--rail)', borderColor: 'var(--border)' }}
     >
       {icon}
       <span className="flex-1">{label}</span>

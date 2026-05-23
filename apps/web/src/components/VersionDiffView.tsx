@@ -121,7 +121,7 @@ export function VersionDiffView({ path, ts, currentText, parentDir, callerOpts, 
           exit back to the current rendering. */}
       <div
         className="sticky top-0 z-10 px-3 h-11 flex items-center gap-3 border-b shrink-0"
-        style={{ background: 'var(--bg)', borderColor: 'var(--border-soft)' }}
+        style={{ background: 'var(--bg)', borderColor: 'var(--border)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0"

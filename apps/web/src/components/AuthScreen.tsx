@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowRight, FileText, Lock, ShieldOff } from 'lucide-react'
+import { AlertCircle, ArrowRight, FileText, Lock, ShieldOff } from 'lucide-react'
 import { api, ApiError, type PublicUser } from '../lib/api'
 
 type Mode = 'signup' | 'login'
@@ -34,9 +34,21 @@ export function AuthScreen({ onAuthed }: Props) {
   const signupBlocked = mode === 'signup' && hasAdmin === true && !allowSignup
 
   const submit = async () => {
-    setError(null)
-    if (username.length < 2 || password.length < 8) {
-      setError('username ≥ 2 chars, password ≥ 8 chars')
+    // Don't pre-clear the error here. If the new error message is
+    // identical to the current one, React skips the re-render and
+    // the alert box stays mounted (no flicker). If it differs, the
+    // box just updates its text in place. Clearing first creates a
+    // visible gap between the unmount and the re-mount.
+    const userTooShort = username.length < 2
+    const passTooShort = password.length < 8
+    if (userTooShort || passTooShort) {
+      if (userTooShort && passTooShort) {
+        setError('Username must be at least 2 characters and password at least 8.')
+      } else if (userTooShort) {
+        setError('Username must be at least 2 characters.')
+      } else {
+        setError('Password must be at least 8 characters.')
+      }
       return
     }
     setBusy(true)
@@ -45,6 +57,7 @@ export function AuthScreen({ onAuthed }: Props) {
         mode === 'signup'
           ? await api.signup(username, password)
           : await api.login(username, password)
+      setError(null)
       onAuthed(r.user)
     } catch (e) {
       if (e instanceof ApiError) setError(e.message)
@@ -117,12 +130,12 @@ export function AuthScreen({ onAuthed }: Props) {
           autoFocus
           onChange={(e) => setUsername(e.target.value.toLowerCase())}
           onKeyDown={(e) => e.key === 'Enter' && submit()}
-          placeholder="your username"
+          placeholder="Enter your username"
         />
 
         <label className="block text-[12px] font-medium text-muted mb-1.5">Password</label>
         <input
-          className="input mb-4"
+          className="input mb-3"
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
@@ -131,8 +144,17 @@ export function AuthScreen({ onAuthed }: Props) {
         />
 
         {error && (
-          <div className="text-[12.5px] mb-3" style={{ color: '#DE350B' }}>
-            {error}
+          <div
+            className="text-[12.5px] mb-3 px-2.5 py-2 rounded flex items-start gap-1.5"
+            style={{
+              background: 'var(--danger-bg)',
+              color: 'var(--danger-fg)',
+              border: '1px solid color-mix(in srgb, var(--danger-fg) 20%, transparent)',
+            }}
+            role="alert"
+          >
+            <AlertCircle size={12} className="shrink-0 mt-0.5" />
+            <span className="leading-snug">{error}</span>
           </div>
         )}
 

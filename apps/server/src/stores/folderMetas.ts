@@ -77,11 +77,16 @@ export async function listFolderMetas(owner?: string): Promise<FolderMeta[]> {
 }
 
 /** Sweep folder metas whose public expiry has passed; flip them to
- *  private so the listing UI + access gates behave consistently. */
+ *  private so the listing UI + access gates behave consistently.
+ *  Audits each flip with actor:'system' so the folder owner can
+ *  trace "why did my shared folder go private?" back to its TTL
+ *  in the Activity panel. */
 export async function sweepExpiredPublicFolders(): Promise<number> {
   const metas = await listFolderMetas()
   const now = Date.now()
   let flipped = 0
+  // Late-imported to dodge load-time cycles between stores.
+  const { audit } = await import('./audit.js')
   for (const m of metas) {
     if (!m.public) continue
     if (m.publicExpiresAt == null) continue
@@ -94,6 +99,18 @@ export async function sweepExpiredPublicFolders(): Promise<number> {
       updatedAt: now,
     })
     flipped++
+    await audit({
+      actor: 'system',
+      action: 'vault.folder-visibility',
+      target: m.storageKey,
+      meta: {
+        public: false,
+        owner: m.owner,
+        reason: 'public-link-expired',
+        expiredAt: m.publicExpiresAt,
+        source: 'auto-expire',
+      },
+    }).catch(() => { /* never break the sweep on an audit failure */ })
   }
   return flipped
 }

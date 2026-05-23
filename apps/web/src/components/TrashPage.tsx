@@ -118,14 +118,14 @@ export function TrashPage() {
         ) : (
           <div
             className="rounded-xl overflow-hidden"
-            style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+            style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
           >
             {entries.map((e, i) => (
               <div
                 key={e.id}
                 className="flex items-center gap-3 px-4 py-3"
                 style={{
-                  borderTop: i === 0 ? undefined : '1px solid var(--border-soft)',
+                  borderTop: i === 0 ? undefined : '1px solid var(--border)',
                 }}
               >
                 <div className="flex-1 min-w-0">

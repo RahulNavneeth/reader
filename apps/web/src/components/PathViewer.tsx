@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -23,6 +23,7 @@ import { ActivityButton } from './ActivityButton'
 import { CollectionsToolbarButton } from './CollectionsToolbarButton'
 import { DocRail } from './DocRail'
 import { VersionDiffView } from './VersionDiffView'
+import { ProposedEditPreview, type PreviewData } from './ProposedEditPreview'
 import { PublicButton } from './PublicButton'
 import { ShareWithUserButton } from './ShareWithUserButton'
 import { CsvTable } from './CsvTable'
@@ -80,11 +81,52 @@ export function PathViewer({ path, canEdit = true }: Props) {
    *  swaps from rendered markdown to an inline line-by-line diff
    *  between this version's snapshot and the current text. */
   const [diffTs, setDiffTs] = useState<number | null>(null)
+  /** Active proposed-edit preview. When set, the main content area
+   *  swaps from rendered markdown to an inline diff between the
+   *  current doc and what it would look like after applying this
+   *  message's pending edit. */
+  const [previewMessageId, setPreviewMessageId] = useState<string | null>(null)
+  /** Cache of fetched preview payloads, keyed by messageId. Lets
+   *  the user toggle preview ↔ back without re-fetching (and
+   *  without showing the loading flicker on the second open). */
+  const previewCacheRef = useRef<Map<string, PreviewData>>(new Map())
+  // Tick state so React re-renders when cache fills. The ref is
+  // the source of truth — we just need to nudge a render.
+  const [, setPreviewCacheTick] = useState(0)
+  /** Bumped on per-op apply / discard so ChatDock reloads its
+   *  history and the proposed-edit card reflects the shrunken
+   *  pendingEdit array (or flips to Applied if empty). */
+  const [chatHistoryReloadKey, setChatHistoryReloadKey] = useState(0)
   // Clear diff view whenever the doc changes.
   useEffect(() => {
     setDiffTs(null)
+    setPreviewMessageId(null)
+    previewCacheRef.current.clear()
   }, [path])
-  const [chatOpen, setChatOpen] = useState(false)
+  // PathViewer is no longer keyed on path (so the chat sidebar
+  // inside stays mounted across file switches without flicker), so
+  // we now have to explicitly drop the things `key` used to wipe:
+  // pending selection-driven chat triggers, scroll position. The
+  // text / meta / error reset happens in their own fetch effect.
+  useEffect(() => {
+    setPendingChatMessage(null)
+    setPendingChatQuote(null)
+    if (contentRef.current) contentRef.current.scrollTop = 0
+  }, [path])
+  // Chat-open is global: opening Reader AI on one doc keeps it
+  // open as the user navigates to others. PathViewer remounts per
+  // path (it's keyed on `path` in VaultView) so component-local
+  // state would reset; localStorage survives the remount.
+  const [chatOpen, setChatOpenState] = useState<boolean>(() => {
+    try { return localStorage.getItem('reader:chatOpen') === '1' } catch { return false }
+  })
+  const setChatOpen = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
+    setChatOpenState((prev) => {
+      const next = typeof v === 'function' ? (v as (p: boolean) => boolean)(prev) : v
+      try { localStorage.setItem('reader:chatOpen', next ? '1' : '0') } catch { /* ignore */ }
+      return next
+    })
+  }, [])
   // Pending chat message coming from outside ChatDock (e.g. the
   // selection-popover "Explain with Reader AI" button). Consumed
   // by ChatDock via prop + useEffect, then cleared by the
@@ -95,6 +137,17 @@ export function PathViewer({ path, canEdit = true }: Props) {
   // above the composer so the user can type any follow-up against
   // the quoted selection.
   const [pendingChatQuote, setPendingChatQuote] = useState<string | null>(null)
+  // Sticky copy of `meta` for ChatDock. The main fetch effect
+  // resets `meta` to null between path changes (clears stale
+  // toolbar state). ChatDock is rendered as `{chatOpen && meta &&
+  // …}` so that null transition would unmount it for one frame
+  // and flash the sidebar. Holding the previous meta until a new
+  // one arrives keeps ChatDock continuously mounted across
+  // navigation — it sees old → new without going through null.
+  const [chatMeta, setChatMeta] = useState<DocumentMeta | null>(null)
+  useEffect(() => {
+    if (meta) setChatMeta(meta)
+  }, [meta])
 
   useEffect(() => {
     const i = path.lastIndexOf('/')
@@ -257,11 +310,11 @@ export function PathViewer({ path, canEdit = true }: Props) {
     return () => cancelAnimationFrame(id)
   }, [isMarkdown, text])
 
-  // Rail is shown for any markdown doc so the version-history
+  // DocRail is shown for any markdown doc so the version-history
   // section is reachable even when the outline list itself is
   // empty / single-heading. The OUTLINE section inside renders
-  // conditionally on headings.length > 1; VersionsRail hides
-  // itself when no versions exist.
+  // conditionally on headings.length > 1; the VERSIONS section
+  // hides itself when no snapshots exist.
   const showOutline = isMarkdown
   const hasOutlineList = isMarkdown && headings.length > 1
   const contentRef = useRef<HTMLDivElement>(null)
@@ -322,7 +375,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
             style={{
               background: canEdit ? 'var(--selected)' : 'var(--bg)',
               color: canEdit ? 'var(--accent)' : 'var(--fg-subtle)',
-              border: '1px solid var(--border-soft)',
+              border: '1px solid var(--border)',
             }}
             title={canEdit ? 'You have edit access via share' : 'You have read-only access via share'}
           >
@@ -496,7 +549,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
 
       <div className="flex-1 overflow-hidden flex">
        <div className="flex-1 relative min-w-0">
-        <div ref={contentRef} className="h-full overflow-y-auto">
+        <div ref={contentRef} className="h-full overflow-y-auto" style={{ background: 'var(--viewer)' }}>
         {error && (
           <div className="px-10 py-10 text-muted">
             <div className="flex items-center gap-2 text-fg font-semibold mb-1">
@@ -511,12 +564,12 @@ export function PathViewer({ path, canEdit = true }: Props) {
             src={api.rawUrl(path, callerOpts)}
             title={filename}
             className="w-full h-full border-0"
-            style={{ background: 'var(--panel)' }}
+            style={{ background: 'var(--viewer)' }}
           />
         )}
 
         {!error && isImage && (
-          <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--panel)' }}>
+          <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--viewer)' }}>
             <img
               src={needsPreview ? api.previewUrl(path, callerOpts) : api.rawUrl(path, callerOpts)}
               alt={filename}
@@ -543,7 +596,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
           />
         )}
 
-        {!error && isMarkdown && text != null && diffTs !== null && (
+        {!error && isMarkdown && text != null && previewMessageId === null && diffTs !== null && (
           <VersionDiffView
             path={path}
             ts={diffTs}
@@ -554,7 +607,42 @@ export function PathViewer({ path, canEdit = true }: Props) {
           />
         )}
 
-        {!error && isMarkdown && text != null && diffTs === null && (
+        {!error && isMarkdown && text != null && previewMessageId !== null && meta && (
+          <ProposedEditPreview
+            docId={meta.id}
+            messageId={previewMessageId}
+            parentDir={parentDir}
+            callerOpts={callerOpts}
+            seedData={previewCacheRef.current.get(previewMessageId) ?? null}
+            onLoaded={(data) => {
+              previewCacheRef.current.set(previewMessageId, data)
+              setPreviewCacheTick((t) => t + 1)
+            }}
+            onOpMutated={() => {
+              // A per-op apply or discard succeeded — the cached
+              // preview for this message is stale (its op list
+              // shrunk), and the chat card needs to refresh so
+              // the stack of <ProposedEditCard>s reflects the
+              // server's new pendingEdit.
+              previewCacheRef.current.delete(previewMessageId)
+              setChatHistoryReloadKey((k) => k + 1)
+            }}
+            onDocChanged={async () => {
+              // The underlying doc just changed (an op was
+              // applied). Refetch text + meta so the rest of
+              // the doc state stays in sync.
+              const [r, m] = await Promise.all([
+                api.fileText(path, callerOpts).catch(() => null),
+                api.fileMeta(path, callerOpts).catch(() => null),
+              ])
+              if (r) setText(r.content)
+              if (m) setMeta(m.meta)
+            }}
+            onExit={() => setPreviewMessageId(null)}
+          />
+        )}
+
+        {!error && isMarkdown && text != null && diffTs === null && previewMessageId === null && (
           <div className="px-10 py-10">
             <article className="md">
               <ReactMarkdown
@@ -661,7 +749,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
         {!error && wantsExtractedText && text == null && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center max-w-md p-6">
-              <div className="inline-flex items-center justify-center w-12 h-12 rounded-full mb-3" style={{ background: 'var(--panel)' }}>
+              <div className="inline-flex items-center justify-center w-12 h-12 rounded-full mb-3" style={{ background: 'var(--viewer)' }}>
                 <Sparkles size={22} className="text-accent" />
               </div>
               <div className="text-fg font-semibold">Not indexed yet</div>
@@ -743,9 +831,9 @@ export function PathViewer({ path, canEdit = true }: Props) {
            adjacent to the content. The natural reading flow is left
            → right; the active "ask" surface belongs next to the doc,
            not pushed past navigation chrome. */}
-       {chatOpen && meta && (
+       {chatOpen && chatMeta && (
          <ChatDock
-           meta={meta}
+           meta={chatMeta}
            onClose={() => setChatOpen(false)}
            pendingMessage={pendingChatMessage}
            onPendingConsumed={() => setPendingChatMessage(null)}
@@ -754,7 +842,9 @@ export function PathViewer({ path, canEdit = true }: Props) {
            onDocEdited={async () => {
              // The chat just applied a proposed edit to this doc.
              // Refetch the body + meta so the viewer reflects the
-             // new content without a hard reload.
+             // new content without a hard reload. Also drop any
+             // active edit preview — it's now stale.
+             setPreviewMessageId(null)
              try {
                const [r, m] = await Promise.all([
                  api.fileText(path, callerOpts).catch(() => null),
@@ -766,6 +856,11 @@ export function PathViewer({ path, canEdit = true }: Props) {
                /* swallow — user can refresh manually */
              }
            }}
+           onPreviewEdit={(messageId) =>
+             setPreviewMessageId((cur) => (cur === messageId ? null : messageId))
+           }
+           previewingMessageId={previewMessageId}
+           historyReloadKey={chatHistoryReloadKey}
          />
        )}
        {showOutline && (

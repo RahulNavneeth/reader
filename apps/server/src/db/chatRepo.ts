@@ -77,12 +77,23 @@ export type ToolTraceEntry = {
 /** Structured edit the model proposed inside a chat turn. Mirrors
  *  the existing lib/mdx.ts granular-edit ops; the server applies
  *  via those primitives once the user clicks Apply. */
+/** Per-op state tracked inline on the pending-edit payload.
+ *  `appliedAt` lets the user accept individual ops via the
+ *  preview's per-op buttons without losing record of which
+ *  ops have already landed. Apply-edit (bulk) and apply-op
+ *  both skip ops that already carry an appliedAt. */
+type ProposedEditCommon = {
+  /** Epoch ms when this specific op was applied via the per-op
+   *  preview flow. Null / undefined = still pending. */
+  appliedAt?: number | null
+}
+
 export type ProposedEditOp =
-  | { op: 'replace_section'; heading: string; content: string }
-  | { op: 'insert_after'; heading: string; content: string }
-  | { op: 'delete_section'; heading: string }
-  | { op: 'append_text'; content: string }
-  | { op: 'prepend_text'; content: string }
+  | (ProposedEditCommon & { op: 'replace_section'; heading: string; content: string })
+  | (ProposedEditCommon & { op: 'insert_after'; heading: string; content: string })
+  | (ProposedEditCommon & { op: 'delete_section'; heading: string })
+  | (ProposedEditCommon & { op: 'append_text'; content: string })
+  | (ProposedEditCommon & { op: 'prepend_text'; content: string })
 
 export type ChatMessage = {
   id: string
@@ -309,6 +320,52 @@ export function discardPendingEdit(
           AND edit_applied_at IS NULL`,
     )
     .run(id, userId, docId)
+  return (r.changes ?? 0) > 0
+}
+
+/** Replace the pending_edit array on a turn with a new array.
+ *  Used by per-op apply / discard to mark the one op the user
+ *  acted on. The array is preserved (not shrunk) when applying
+ *  so the UI keeps a record of "Applied to <heading>" pills for
+ *  every op the model originally proposed. Discard-op DOES shrink
+ *  (a discarded op is gone, not history-worthy). */
+export function setPendingEdit(
+  id: string,
+  userId: string,
+  docId: string,
+  ops: unknown[],
+): boolean {
+  const r = db()
+    .prepare(
+      `UPDATE chat_messages
+          SET pending_edit = ?
+        WHERE id = ? AND user_id = ? AND doc_id = ?
+          AND pending_edit IS NOT NULL
+          AND edit_applied_at IS NULL`,
+    )
+    .run(JSON.stringify(ops), id, userId, docId)
+  return (r.changes ?? 0) > 0
+}
+
+/** Update the turn's edit_target_sha256 to a new value. Called
+ *  after a per-op apply that left additional ops pending: the
+ *  doc's sha256 just changed, so the next per-op apply would
+ *  otherwise 409 on the (now stale) sha check. */
+export function updateEditTargetSha(
+  id: string,
+  userId: string,
+  docId: string,
+  sha: string,
+): boolean {
+  const r = db()
+    .prepare(
+      `UPDATE chat_messages
+          SET edit_target_sha256 = ?
+        WHERE id = ? AND user_id = ? AND doc_id = ?
+          AND pending_edit IS NOT NULL
+          AND edit_applied_at IS NULL`,
+    )
+    .run(sha, id, userId, docId)
   return (r.changes ?? 0) > 0
 }
 

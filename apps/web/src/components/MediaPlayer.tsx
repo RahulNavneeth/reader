@@ -169,7 +169,7 @@ export function MediaPlayer({ src, hlsSrc, poster, filename, kind }: Props) {
               height: 220,
               background:
                 'linear-gradient(135deg, rgba(76,110,245,0.18), rgba(132,94,247,0.18))',
-              border: '1px solid var(--border-soft)',
+              border: '1px solid var(--border)',
             }}
           >
             <button
@@ -192,7 +192,7 @@ export function MediaPlayer({ src, hlsSrc, poster, filename, kind }: Props) {
       {/* Controls bar — same shape for audio + video. */}
       <div
         className="w-full max-w-[640px] rounded-lg px-3 py-2.5 flex items-center gap-3"
-        style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
+        style={{ background: 'var(--bg)', border: '1px solid var(--border)' }}
       >
         <button
           onClick={togglePlay}

@@ -32,12 +32,12 @@ export function UserMenu({ user, onLogout }: Props) {
 
       {open && (
         <div
-          className="absolute right-0 top-full mt-1 min-w-[220px] rounded-md shadow-raised z-30 overflow-hidden"
+          className="absolute right-0 top-full mt-1 min-w-[220px] rounded-md shadow-raised z-50 overflow-hidden"
           style={{ background: 'var(--bg)', border: '1px solid var(--border)' }}
         >
           <div
             className="px-3 py-2 border-b"
-            style={{ borderColor: 'var(--border-soft)' }}
+            style={{ borderColor: 'var(--border)' }}
           >
             <div className="text-[13px] font-medium text-fg truncate">{user.username}</div>
             <div className="text-[11.5px] text-muted capitalize flex items-center gap-1">

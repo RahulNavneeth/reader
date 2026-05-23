@@ -146,7 +146,7 @@ export function AccountPage() {
             style={{
               background:
                 'linear-gradient(135deg, rgba(255,153,31,0.10), rgba(190,75,219,0.10))',
-              border: '1px solid var(--border-soft)',
+              border: '1px solid var(--border)',
             }}
           >
             <div className="flex items-center gap-2.5 mb-3">
@@ -273,7 +273,7 @@ export function AccountPage() {
             </div>
             <div
               className="h-3 rounded-full overflow-hidden"
-              style={{ background: 'var(--border-soft)' }}
+              style={{ background: 'var(--border)' }}
             >
               <div
                 className="h-full rounded-full transition-all"
@@ -370,7 +370,7 @@ export function AccountPage() {
                       <span className="text-fg w-[60px] shrink-0">{t.ext}</span>
                       <div
                         className="flex-1 h-2 rounded-full overflow-hidden"
-                        style={{ background: 'var(--border-soft)' }}
+                        style={{ background: 'var(--border)' }}
                       >
                         <div
                           className="h-full rounded-full"
@@ -467,7 +467,7 @@ function Card({ children, padded }: { children: React.ReactNode; padded?: boolea
       className={`rounded-xl ${padded ? 'p-5' : ''}`}
       style={{
         background: 'var(--panel)',
-        border: '1px solid var(--border-soft)',
+        border: '1px solid var(--border)',
       }}
     >
       {children}
@@ -512,7 +512,7 @@ function Kpi({
   return (
     <div
       className="rounded-xl p-4"
-      style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+      style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
     >
       <div className="flex items-center gap-2.5 mb-3">
         <IconBadge bg={iconBg} color={iconColor}>{icon}</IconBadge>
@@ -669,7 +669,7 @@ function EmailAndReindex({ user }: { user: { username: string; email?: string } 
   return (
     <section
       className="rounded-xl p-4 flex flex-col md:flex-row items-stretch md:items-center gap-3"
-      style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+      style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
     >
       <div className="flex-1 flex items-center gap-2.5 min-w-0">
         <Mail size={14} className="text-subtle shrink-0" />
@@ -701,7 +701,7 @@ function EmailAndReindex({ user }: { user: { username: string; email?: string } 
       </div>
       <div
         className="hidden md:block w-px self-stretch"
-        style={{ background: 'var(--border-soft)' }}
+        style={{ background: 'var(--border)' }}
       />
       <div className="flex items-center gap-2">
         <button

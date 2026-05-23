@@ -402,7 +402,7 @@ function ClusterCard({
     >
       <div
         className="flex items-center gap-2 px-2.5 h-8"
-        style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+        style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
       >
         <MapPin size={11} className="text-accent" />
         <div className="text-[11.5px] font-semibold text-fg flex-1">
@@ -541,7 +541,7 @@ function ClusterSidebar({
     <>
       <div
         className="fixed inset-0 z-[55]"
-        style={{ background: 'rgba(9, 30, 66, 0.18)' }}
+        style={{ background: 'var(--scrim)' }}
         onClick={onClose}
       />
       <aside
@@ -552,7 +552,7 @@ function ClusterSidebar({
             Cleaner than the dense two-line subtitle. */}
         <div
           className="px-4 pt-4 pb-3 shrink-0"
-          style={{ borderBottom: '1px solid var(--border-soft)' }}
+          style={{ borderBottom: '1px solid var(--border)' }}
         >
           <div className="flex items-start gap-3">
             <div

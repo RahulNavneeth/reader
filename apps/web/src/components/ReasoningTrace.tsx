@@ -45,7 +45,7 @@ export function ReasoningTrace({ entries, streaming }: Props) {
       className="mt-1.5 mb-2 rounded-md text-[12px]"
       style={{
         background: 'var(--panel-2)',
-        border: '1px solid var(--border-soft)',
+        border: '1px solid var(--border)',
       }}
     >
       <button
@@ -79,7 +79,7 @@ export function ReasoningTrace({ entries, streaming }: Props) {
       {open && (
         <div
           className="flex flex-col"
-          style={{ borderTop: '1px solid var(--border-soft)' }}
+          style={{ borderTop: '1px solid var(--border)' }}
         >
           {entries.map((e, i) => (
             <ThinkingStep
@@ -103,7 +103,7 @@ function ThinkingStep({ entry, showDivider }: { entry: ToolTraceEntryDTO; showDi
   return (
     <div
       className="px-2.5 h-8 flex items-center gap-2"
-      style={showDivider ? { borderTop: '1px solid var(--border-soft)' } : undefined}
+      style={showDivider ? { borderTop: '1px solid var(--border)' } : undefined}
       title={entry.summary ?? undefined}
     >
       <Icon

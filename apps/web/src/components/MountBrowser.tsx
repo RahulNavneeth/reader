@@ -136,7 +136,7 @@ export function MountBrowser() {
           style={{
             background: 'var(--bg)',
             color: 'var(--fg-subtle)',
-            border: '1px solid var(--border-soft)',
+            border: '1px solid var(--border)',
           }}
           title="External library — server refuses writes under this path"
         >
@@ -178,7 +178,7 @@ export function MountBrowser() {
                 key={entry.path}
                 onClick={() => openEntry(entry)}
                 className="rounded-lg p-2 text-left hover:bg-hover transition-colors flex flex-col items-center gap-2"
-                style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+                style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
               >
                 <div
                   className="w-full aspect-square rounded-md overflow-hidden flex items-center justify-center"

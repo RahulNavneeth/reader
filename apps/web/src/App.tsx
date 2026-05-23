@@ -294,8 +294,8 @@ export default function App() {
                 placeholder="Search vault…"
                 className="w-full h-8 pl-8 pr-[96px] rounded text-[12.5px] text-fg placeholder:text-subtle outline-none"
                 style={{
-                  background: 'var(--bg)',
-                  border: '1px solid var(--border-soft)',
+                  background: 'var(--input-bg)',
+                  border: '1px solid var(--input-border)',
                 }}
               />
               {/* Right-side actions sit inside the input border, before
@@ -328,7 +328,7 @@ export default function App() {
                 />
                 <span
                   className="mx-1 h-3 w-px"
-                  style={{ background: 'var(--border)' }}
+                  style={{ background: 'var(--input-border)' }}
                   aria-hidden
                 />
                 <kbd
@@ -336,7 +336,7 @@ export default function App() {
                   style={{
                     background: 'var(--panel)',
                     color: 'var(--fg-subtle)',
-                    border: '1px solid var(--border-soft)',
+                    border: '1px solid var(--border)',
                   }}
                 >
                   ⌘K
@@ -397,7 +397,7 @@ export default function App() {
         {paletteOpen && (
           <div
             className="fixed inset-0 z-40"
-            style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+            style={{ background: 'var(--scrim)' }}
             onClick={() => setPaletteOpen(false)}
           />
         )}
@@ -447,7 +447,7 @@ export default function App() {
               </div>
               <div
                 className="h-1.5 rounded-full overflow-hidden"
-                style={{ background: 'var(--border-soft)' }}
+                style={{ background: 'var(--border)' }}
               >
                 <div
                   className="h-full transition-[width]"

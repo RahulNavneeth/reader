@@ -66,7 +66,7 @@ export function ActivityButton({
               popover family reads as one component. */}
           <div
             className="flex items-center gap-2 px-3 h-8 shrink-0"
-            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
             <History size={13} className="text-muted" />
             <span className="text-[12px] font-semibold text-fg flex-1">

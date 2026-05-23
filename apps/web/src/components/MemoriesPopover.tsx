@@ -133,7 +133,7 @@ export function MemoriesPopover({ docId, open, onClose, anchorRef }: Props) {
     >
       <div
         className="px-2.5 h-8 flex items-center gap-2 shrink-0"
-        style={{ borderBottom: '1px solid var(--border-soft)' }}
+        style={{ borderBottom: '1px solid var(--border)' }}
       >
         <Brain size={11} className="text-accent shrink-0" />
         <span className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex-1">
@@ -166,7 +166,7 @@ export function MemoriesPopover({ docId, open, onClose, anchorRef }: Props) {
           placeholder="Use ₹ for currency"
         />
 
-        <div style={{ borderTop: '1px solid var(--border-soft)' }} />
+        <div style={{ borderTop: '1px solid var(--border)' }} />
 
         <Section
           icon={<FileText size={10} className="text-muted" />}

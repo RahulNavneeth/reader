@@ -130,7 +130,7 @@ function Backdrop({
   return (
     <div
       className="fixed inset-0 z-[200] flex items-center justify-center"
-      style={{ background: 'rgba(9, 30, 66, 0.55)' }}
+      style={{ background: 'var(--scrim)' }}
       onClick={onDismiss}
     >
       <div onClick={(e) => e.stopPropagation()}>{children}</div>
@@ -172,7 +172,7 @@ function ConfirmDialog({
       </div>
       <div
         className="px-4 py-3 flex justify-end gap-2"
-        style={{ background: 'var(--panel-2)', borderTop: '1px solid var(--border-soft)' }}
+        style={{ background: 'var(--panel-2)', borderTop: '1px solid var(--border)' }}
       >
         <button className="btn-ghost h-7" onClick={() => onResolve(false)}>
           {opts.cancelLabel ?? 'Cancel'}
@@ -259,7 +259,7 @@ function PromptDialog({
       </div>
       <div
         className="px-4 py-3 flex justify-end gap-2"
-        style={{ background: 'var(--panel-2)', borderTop: '1px solid var(--border-soft)' }}
+        style={{ background: 'var(--panel-2)', borderTop: '1px solid var(--border)' }}
       >
         <button className="btn-ghost h-7" onClick={() => onResolve(null)}>
           {opts.cancelLabel ?? 'Cancel'}

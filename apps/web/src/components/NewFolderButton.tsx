@@ -181,7 +181,7 @@ export function NewFolderButton({
         // squash the panel into a thin column.
         <div
           className="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] px-4"
-          style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+          style={{ background: 'var(--scrim)' }}
           onClick={() => setOpen(false)}
         >
           <div
@@ -191,7 +191,7 @@ export function NewFolderButton({
           >
             <div
               className="flex items-center gap-2.5 px-4 h-12 border-b shrink-0"
-              style={{ borderColor: 'var(--border-soft)' }}
+              style={{ borderColor: 'var(--border)' }}
             >
               <FolderPlus size={15} className="text-accent" />
               <div className="text-[13.5px] font-medium text-fg">New folder</div>
@@ -205,7 +205,7 @@ export function NewFolderButton({
               </button>
             </div>
 
-            <div className="px-4 py-4 border-b" style={{ borderColor: 'var(--border-soft)' }}>
+            <div className="px-4 py-4 border-b" style={{ borderColor: 'var(--border)' }}>
               <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
                 Folder name
               </div>
@@ -232,7 +232,7 @@ export function NewFolderButton({
             {matches.length > 0 && (
               <div
                 className="max-h-[220px] overflow-y-auto py-1 border-b"
-                style={{ borderColor: 'var(--border-soft)' }}
+                style={{ borderColor: 'var(--border)' }}
               >
                 <div className="px-4 pt-1 pb-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
                   Folders
@@ -259,7 +259,7 @@ export function NewFolderButton({
 
             <div
               className="flex items-center gap-2 px-4 py-3"
-              style={{ borderTop: '1px solid var(--border-soft)', background: 'var(--panel-2)' }}
+              style={{ borderTop: '1px solid var(--border)', background: 'var(--panel-2)' }}
             >
               <div
                 className="flex-1 text-[11.5px]"

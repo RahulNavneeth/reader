@@ -169,7 +169,7 @@ export function CollectionDetailPage() {
             style={{
               background: 'var(--bg)',
               color: 'var(--fg-subtle)',
-              border: '1px solid var(--border-soft)',
+              border: '1px solid var(--border)',
             }}
           >
             shared · {data.collection.role === 'editor' ? 'edit' : 'read-only'}
@@ -254,7 +254,7 @@ export function CollectionDetailPage() {
                 style={{
                   aspectRatio: '1 / 1',
                   background: 'var(--bg)',
-                  border: '1px solid var(--border-soft)',
+                  border: '1px solid var(--border)',
                 }}
               >
                 <button

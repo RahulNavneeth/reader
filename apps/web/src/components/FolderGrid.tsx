@@ -333,7 +333,7 @@ export function FolderGrid({
       <div
         data-grid-toolbar=""
         className="flex items-center gap-2 px-3 min-h-11 py-1.5 border-b shrink-0 flex-wrap"
-        style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+        style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
       >
         <PathBreadcrumb
           dir={dir}
@@ -355,7 +355,7 @@ export function FolderGrid({
                 : canEdit
                 ? 'var(--accent)'
                 : 'var(--fg-subtle)',
-              border: '1px solid var(--border-soft)',
+              border: '1px solid var(--border)',
             }}
             title={
               partialAccess
@@ -776,7 +776,7 @@ function GridTile({
             // Expired badge reads red — the link is dead, not a healthy
             // signal. Active links stay green.
             color: node.publicExpiresAt <= Date.now() ? '#BF2600' : '#00875A',
-            border: '1px solid var(--border-soft)',
+            border: '1px solid var(--border)',
           }}
           title={`Public link expires ${describeExpiry(node.publicExpiresAt)}`}
         >

@@ -265,7 +265,7 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
         )}
 
         {!error && hits == null && (
-          <div className="px-4 py-3 text-[11.5px] text-subtle flex items-center gap-2 border-t" style={{ borderColor: 'var(--border-soft)' }}>
+          <div className="px-4 py-3 text-[11.5px] text-subtle flex items-center gap-2 border-t" style={{ borderColor: 'var(--border)' }}>
             <CornerDownLeft size={11} />
             <span>
               <kbd className="px-1 py-0.5 rounded" style={{ background: 'var(--panel-2)' }}>↑</kbd>{' '}

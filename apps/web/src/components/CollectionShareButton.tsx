@@ -136,7 +136,7 @@ export function CollectionShareButton({
         >
           <div
             className="flex items-center gap-2 px-3 h-8"
-            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
             <Users size={13} className="text-muted" />
             <span className="text-[12px] font-semibold text-fg flex-1">
@@ -146,7 +146,7 @@ export function CollectionShareButton({
               {shares.length === 0 ? 'Not shared' : `Shared with ${shares.length}`}
             </span>
           </div>
-          <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border-soft)' }}>
+          <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border)' }}>
             <input
               className="input h-7 text-[12.5px]"
               placeholder="Username"
@@ -183,7 +183,7 @@ export function CollectionShareButton({
                 <div
                   key={s.recipient}
                   className="flex items-center gap-2 px-3 py-1.5"
-                  style={{ borderTop: '1px solid var(--border-soft)' }}
+                  style={{ borderTop: '1px solid var(--border)' }}
                 >
                   <span className="text-[12px] text-fg flex-1 truncate">{s.recipient}</span>
                   <button
@@ -194,7 +194,7 @@ export function CollectionShareButton({
                     style={{
                       background: s.canEdit ? 'var(--selected)' : 'var(--bg)',
                       color: s.canEdit ? 'var(--accent)' : 'var(--fg)',
-                      border: '1px solid var(--border-soft)',
+                      border: '1px solid var(--border)',
                     }}
                   >
                     {s.canEdit ? 'edit' : 'read-only'}

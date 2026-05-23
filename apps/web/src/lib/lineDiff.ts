@@ -1,8 +1,8 @@
 /**
- * Line-level diff utilities. Shared between the VersionDiffModal
- * (which renders full ins/del/eq sequences) and the DocRail
- * (which only needs the added / removed line counts to show a
- * tiny "+5 −2" summary on each row).
+ * Line-level diff utilities. Shared between VersionDiffView /
+ * ProposedEditPreview (which render full ins/del/eq sequences)
+ * and the DocRail (which only needs the added / removed line
+ * counts to show a tiny "+5 −2" summary on each row).
  *
  * Implementation: standard LCS over line arrays + backtrack.
  * Caps each side at 4000 lines so a pathological doc doesn't

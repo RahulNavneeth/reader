@@ -54,7 +54,7 @@ export function TaggedFilesView() {
     <div className="h-full flex flex-col" style={{ background: 'var(--bg)' }}>
       <header
         className="flex items-center gap-2 px-3 h-11 border-b shrink-0"
-        style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+        style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
       >
         <button className="btn-ghost h-7 w-7 px-0" onClick={() => navigate('/')} title="Back to vault">
           <ChevronLeft size={14} />

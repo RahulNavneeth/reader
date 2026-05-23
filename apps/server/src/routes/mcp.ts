@@ -468,7 +468,11 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       const existingForSnap = await findDocByPath(actingUser, rel)
       if (existingForSnap) {
         const { snapshotVersion } = await import('../stores/versions.js')
-        await snapshotVersion(existingForSnap.id).catch(() => null)
+        await snapshotVersion(existingForSnap.id, {
+          actor: actingUser,
+          source: 'mcp',
+          reason: 'upload',
+        }).catch(() => null)
       }
     }
     await writeFile(abs, buffer)
@@ -608,7 +612,11 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       const existingForSnap = await findDocByPath(actingUser, rel)
       if (existingForSnap) {
         const { snapshotVersion } = await import('../stores/versions.js')
-        await snapshotVersion(existingForSnap.id).catch(() => null)
+        await snapshotVersion(existingForSnap.id, {
+          actor: actingUser,
+          source: 'mcp',
+          reason: 'upload',
+        }).catch(() => null)
       }
     }
     await writeFile(abs, buffer)
@@ -895,7 +903,11 @@ async function handleCall(token: ApiToken, name: string, args: any) {
       // watcher's later fire on the file change is a no-op.
       {
         const { snapshotVersion } = await import('../stores/versions.js')
-        await snapshotVersion(meta.id).catch(() => null)
+        await snapshotVersion(meta.id, {
+          actor: actingUser,
+          source: 'mcp',
+          reason: auditAction,
+        }).catch(() => null)
       }
       await writeFile(abs, nextBuffer)
       const nextMeta: DocumentMeta = {

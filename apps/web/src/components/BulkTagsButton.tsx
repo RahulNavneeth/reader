@@ -149,7 +149,7 @@ export function BulkTagsButton({ paths }: { paths: string[] }) {
             style={{
               background: 'var(--bg)',
               borderBottom: hasSuggestionArea
-                ? '1px solid var(--border-soft)'
+                ? '1px solid var(--border)'
                 : undefined,
             }}
             onClick={() => inputRef.current?.focus()}

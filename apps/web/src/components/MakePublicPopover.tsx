@@ -128,7 +128,7 @@ export function MakePublicPopover({
         >
           <div
             className="flex items-center gap-2 px-3 h-8"
-            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
             <Lock size={13} className="text-muted" />
             <span className="text-[12px] font-semibold text-fg flex-1">{title}</span>

@@ -107,7 +107,7 @@ export function VaultView() {
           // usually a <100ms /api/resolve round-trip.
           <div className="flex-1" />
         ) : resolved.status === 'file' ? (
-          <PathViewer key={resolved.path} path={resolved.path} canEdit={resolved.canEdit} />
+          <PathViewer path={resolved.path} canEdit={resolved.canEdit} />
         ) : (
           <FolderGrid
             initialPath={resolved.status === 'folder' ? resolved.path : ''}

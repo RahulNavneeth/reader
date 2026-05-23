@@ -128,7 +128,7 @@ export function AccountWebhooksPage() {
 
         <section
           className="rounded-xl p-4 mb-6"
-          style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+          style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
         >
           <div className="text-[13px] font-semibold text-fg mb-2.5">Add a webhook</div>
           <div className="space-y-2.5">
@@ -160,7 +160,7 @@ export function AccountWebhooksPage() {
                     style={{
                       background: on ? 'var(--selected)' : 'var(--bg)',
                       color: on ? 'var(--accent)' : 'var(--fg)',
-                      border: '1px solid var(--border-soft)',
+                      border: '1px solid var(--border)',
                     }}
                     disabled={busy}
                   >
@@ -197,13 +197,13 @@ export function AccountWebhooksPage() {
           ) : (
             <div
               className="rounded-xl overflow-hidden"
-              style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+              style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
             >
               {hooks.map((h, i) => (
                 <div
                   key={h.id}
                   className="flex items-start gap-3 px-4 py-3"
-                  style={{ borderTop: i === 0 ? undefined : '1px solid var(--border-soft)' }}
+                  style={{ borderTop: i === 0 ? undefined : '1px solid var(--border)' }}
                 >
                   <div className="mt-0.5 shrink-0">
                     {h.lastDelivery ? (
@@ -228,7 +228,7 @@ export function AccountWebhooksPage() {
                           className="inline-flex items-center px-1.5 h-[18px] rounded text-[10.5px]"
                           style={{
                             background: 'var(--bg)',
-                            border: '1px solid var(--border-soft)',
+                            border: '1px solid var(--border)',
                           }}
                         >
                           {ev}

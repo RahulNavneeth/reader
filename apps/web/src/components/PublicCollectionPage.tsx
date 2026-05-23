@@ -160,7 +160,7 @@ export function PublicCollectionPage() {
                 style={{
                   aspectRatio: '1 / 1',
                   background: 'var(--bg)',
-                  border: '1px solid var(--border-soft)',
+                  border: '1px solid var(--border)',
                 }}
                 title={it.title}
               >

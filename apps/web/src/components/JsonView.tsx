@@ -41,7 +41,7 @@ export function JsonView({ text }: { text: string }) {
         className="text-[13px] leading-relaxed"
         style={{
           background: 'var(--code-bg)',
-          border: '1px solid var(--border-soft)',
+          border: '1px solid var(--border)',
           borderRadius: 6,
           padding: '12px 14px',
           overflowX: 'auto',

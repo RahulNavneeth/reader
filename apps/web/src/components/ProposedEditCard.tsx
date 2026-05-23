@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Check, X, AlertTriangle, Loader2, FileEdit, Plus, Minus, ChevronDown, ChevronRight } from 'lucide-react'
+import { Check, X, AlertTriangle, Loader2, FileEdit, Plus, Minus, Eye, ChevronLeft } from 'lucide-react'
 import { api, ApiError, type ProposedEditOpDTO } from '../lib/api'
 
 type Props = {
@@ -18,6 +18,14 @@ type Props = {
   /** Called when the user discards — parent refreshes so the
    *  pendingEdit field clears. */
   onDiscarded?: () => void
+  /** Toggle the inline preview for this turn. When provided, the
+   *  card shows a Preview / Unpreview button alongside Apply /
+   *  Discard. When `isPreviewing` is true the same click closes
+   *  the open preview. */
+  onPreview?: () => void
+  /** True when the viewer is currently showing the inline preview
+   *  for THIS turn. Drives the button label / icon swap. */
+  isPreviewing?: boolean
 }
 
 /**
@@ -38,20 +46,25 @@ export function ProposedEditCard({
   appliedAt,
   onApplied,
   onDiscarded,
+  onPreview,
+  isPreviewing,
 }: Props) {
+  // Per-op appliedAt (set by the per-op preview flow) wins over
+  // message-level. Either signal means this card should render
+  // as the small "Applied" pill — never as actionable.
+  const opApplied = edit.appliedAt != null
   const [state, setState] = useState<'pending' | 'applying' | 'applied' | 'discarding' | 'discarded' | 'conflict'>(
-    appliedAt ? 'applied' : 'pending',
+    appliedAt || opApplied ? 'applied' : 'pending',
   )
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
-  const [contentOpen, setContentOpen] = useState(false)
 
   // If the parent gets a fresh appliedAt after Apply succeeds, flip
   // our local state. Defensive — handles the case where the parent
   // re-renders with appliedAt before our internal `applied` state
   // is set.
   useEffect(() => {
-    if (appliedAt) setState('applied')
-  }, [appliedAt])
+    if (appliedAt || opApplied) setState('applied')
+  }, [appliedAt, opApplied])
 
   const handleApply = async () => {
     setState('applying')
@@ -112,59 +125,27 @@ export function ProposedEditCard({
       className="mt-2 rounded-md overflow-hidden"
       style={{
         background: state === 'conflict' ? 'var(--danger-bg)' : 'var(--panel-2)',
-        border: `1px solid ${state === 'conflict' ? 'color-mix(in srgb, var(--danger-fg) 20%, transparent)' : 'var(--border-soft)'}`,
+        border: `1px solid ${state === 'conflict' ? 'color-mix(in srgb, var(--danger-fg) 20%, transparent)' : 'var(--border)'}`,
       }}
     >
-      <button
-        className="w-full px-2.5 py-2 flex items-center gap-2 text-left"
-        onClick={() => setContentOpen((v) => !v)}
-      >
-        {contentOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        <OpIcon op={edit.op} />
-        <span className="text-[11px] uppercase tracking-wider font-semibold text-subtle">
+      <div className="w-full px-2.5 py-2 flex items-center gap-2">
+        <OpIcon op={edit.op} inConflict={state === 'conflict'} />
+        <span
+          className="text-[11px] uppercase tracking-wider font-semibold"
+          style={{
+            color: state === 'conflict' ? 'var(--danger-fg)' : 'var(--fg-subtle)',
+            opacity: state === 'conflict' ? 0.85 : 1,
+          }}
+        >
           {opLabel(edit.op)}
         </span>
-        <span className="text-[12px] font-medium truncate flex-1">
+        <span
+          className="text-[12px] font-medium truncate flex-1"
+          style={state === 'conflict' ? { color: 'var(--danger-fg)' } : undefined}
+        >
           {describeTarget(edit)}
         </span>
-      </button>
-
-      {contentOpen && (
-        <div
-          className="px-2.5 pb-2 pt-1 text-[12px]"
-          style={{ borderTop: '1px solid var(--border-soft)' }}
-        >
-          {/* Show the proposed new content for ops that have one. */}
-          {(edit.op === 'replace_section' ||
-            edit.op === 'insert_after' ||
-            edit.op === 'append_text' ||
-            edit.op === 'prepend_text') && (
-            <>
-              <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1">
-                {edit.op === 'replace_section' ? 'New content' : 'To be added'}
-              </div>
-              <pre
-                className="text-[11.5px] leading-snug whitespace-pre-wrap break-words m-0 p-2 rounded"
-                style={{
-                  background: 'var(--bg)',
-                  border: '1px solid var(--border-soft)',
-                  color: 'var(--fg)',
-                  maxHeight: '320px',
-                  overflowY: 'auto',
-                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                }}
-              >
-                {edit.content}
-              </pre>
-            </>
-          )}
-          {edit.op === 'delete_section' && (
-            <div className="text-[12px] text-subtle">
-              The section <span className="font-medium text-fg">{edit.heading}</span> and all its content will be removed.
-            </div>
-          )}
-        </div>
-      )}
+      </div>
 
       {state === 'conflict' && (
         <div
@@ -191,12 +172,18 @@ export function ProposedEditCard({
       )}
 
       <div
-        className="px-2.5 py-1.5 flex items-center gap-1.5"
-        style={{ borderTop: '1px solid var(--border-soft)' }}
+        className="p-1.5 flex items-center gap-1.5"
+        style={{
+          borderTop: `1px solid ${
+            state === 'conflict'
+              ? 'color-mix(in srgb, var(--danger-fg) 20%, transparent)'
+              : 'var(--border)'
+          }`,
+        }}
       >
         {state !== 'conflict' && (
           <button
-            className="h-7 px-2.5 inline-flex items-center gap-1 rounded text-[12px] font-medium disabled:opacity-40"
+            className="h-7 px-2.5 inline-flex items-center justify-center gap-1.5 rounded text-[12px] font-medium disabled:opacity-40"
             style={{ background: 'var(--accent)', color: 'white' }}
             onClick={handleApply}
             disabled={state === 'applying' || state === 'discarding'}
@@ -206,13 +193,49 @@ export function ProposedEditCard({
           </button>
         )}
         <button
-          className="btn-ghost h-7 px-2 text-[12px]"
+          className="h-7 px-2.5 inline-flex items-center justify-center gap-1.5 rounded text-[12px] font-medium transition-colors"
+          style={{
+            color: state === 'conflict' ? 'var(--danger-fg)' : 'var(--fg-muted)',
+          }}
+          onMouseEnter={(e) => {
+            const btn = e.currentTarget as HTMLButtonElement
+            btn.style.background =
+              state === 'conflict'
+                ? 'color-mix(in srgb, var(--danger-fg) 12%, transparent)'
+                : 'color-mix(in srgb, var(--danger-fg) 8%, transparent)'
+            btn.style.color = 'var(--danger-fg)'
+          }}
+          onMouseLeave={(e) => {
+            const btn = e.currentTarget as HTMLButtonElement
+            btn.style.background = 'transparent'
+            btn.style.color = state === 'conflict' ? 'var(--danger-fg)' : 'var(--fg-muted)'
+          }}
           onClick={handleDiscard}
           disabled={state === 'applying' || state === 'discarding'}
         >
           {state === 'discarding' ? <Loader2 size={11} className="animate-spin" /> : <X size={11} />}
           Discard
         </button>
+        {state !== 'conflict' && onPreview && (
+          <button
+            className="h-7 px-2.5 inline-flex items-center justify-center gap-1.5 rounded text-[12px] font-medium transition-colors ml-auto"
+            style={{ color: 'var(--fg-muted)' }}
+            onMouseEnter={(e) => {
+              ;(e.currentTarget as HTMLButtonElement).style.background = 'var(--selected)'
+              ;(e.currentTarget as HTMLButtonElement).style.color = 'var(--accent)'
+            }}
+            onMouseLeave={(e) => {
+              ;(e.currentTarget as HTMLButtonElement).style.background = 'transparent'
+              ;(e.currentTarget as HTMLButtonElement).style.color = 'var(--fg-muted)'
+            }}
+            onClick={onPreview}
+            disabled={state === 'applying' || state === 'discarding'}
+            title={isPreviewing ? 'Close the preview' : 'Preview this edit in the doc viewer'}
+          >
+            {isPreviewing ? <ChevronLeft size={11} /> : <Eye size={11} />}
+            {isPreviewing ? 'Back' : 'Preview'}
+          </button>
+        )}
       </div>
     </div>
   )
@@ -233,10 +256,13 @@ function describeTarget(edit: ProposedEditOpDTO): string {
   return edit.op === 'append_text' ? 'end of document' : 'start of document'
 }
 
-function OpIcon({ op }: { op: ProposedEditOpDTO['op'] }) {
-  if (op === 'delete_section') return <Minus size={11} className="text-danger" />
-  if (op === 'insert_after' || op === 'append_text' || op === 'prepend_text') {
-    return <Plus size={11} className="text-accent" />
+function OpIcon({ op, inConflict }: { op: ProposedEditOpDTO['op']; inConflict?: boolean }) {
+  const tint = inConflict ? { color: 'var(--danger-fg)' } : undefined
+  if (op === 'delete_section') {
+    return <Minus size={11} className={inConflict ? undefined : 'text-danger'} style={tint} />
   }
-  return <FileEdit size={11} className="text-accent" />
+  if (op === 'insert_after' || op === 'append_text' || op === 'prepend_text') {
+    return <Plus size={11} className={inConflict ? undefined : 'text-accent'} style={tint} />
+  }
+  return <FileEdit size={11} className={inConflict ? undefined : 'text-accent'} style={tint} />
 }

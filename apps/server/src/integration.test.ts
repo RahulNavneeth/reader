@@ -643,6 +643,1329 @@ describe('integration: chat apply-edit', () => {
   })
 })
 
+// ── Per-op apply / discard ────────────────────────────────────────
+// Covers the granular Accept / Reject preview flow: each op in a
+// multi-op turn can be committed independently, the doc's sha is
+// re-anchored between calls so a second per-op apply doesn't 409
+// on stale sha, and the message-level applied flag flips only once
+// every op carries its own appliedAt.
+describe('integration: chat per-op apply / discard', () => {
+  let cookie = ''
+  let docId = ''
+  const startBody = '# Doc\n\n## A\n\nalpha body.\n\n## B\n\nbeta body.\n\n## C\n\ngamma body.\n'
+  const apply = (msgId: string, opIndex: number) =>
+    app.inject({
+      method: 'POST',
+      url: `/api/chat/${docId}/apply-op`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { messageId: msgId, opIndex },
+    })
+  const discard = (msgId: string, opIndex: number) =>
+    app.inject({
+      method: 'DELETE',
+      url: `/api/chat/${docId}/pending-edit/${msgId}/op/${opIndex}`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+
+  it('logs in + seeds a 3-section doc with a 3-op pending edit', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+
+    docId = 'per-op-doc'
+    const now = Date.now()
+    const sha = await import('node:crypto').then((c) =>
+      c.createHash('sha256').update(startBody).digest('hex'),
+    )
+    db()
+      .prepare(
+        `INSERT INTO documents
+           (id, owner, storage_key, title, original_filename, mime, bytes, sha256, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(docId, 'alice', 'per-op-doc.md', 'Per-Op', 'per-op-doc.md', 'text/markdown', startBody.length, sha, now, now)
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', 'per-op-doc.md')
+    await mkdir(path.dirname(abs), { recursive: true })
+    await writeFile(abs, startBody)
+
+    db()
+      .prepare(
+        `INSERT INTO chat_messages
+           (id, doc_id, user_id, role, content, citations, memories_used,
+            error_text, pending_edit, edit_applied_at, edit_target_sha256,
+            created_at)
+         VALUES (?, ?, ?, 'assistant', ?, NULL, NULL, NULL, ?, NULL, ?, ?)`,
+      )
+      .run(
+        'asst-perop',
+        docId,
+        'alice',
+        'Three edits, one per section.',
+        JSON.stringify([
+          { op: 'replace_section', heading: 'A', content: 'AAA.' },
+          { op: 'replace_section', heading: 'B', content: 'BBB.' },
+          { op: 'replace_section', heading: 'C', content: 'CCC.' },
+        ]),
+        sha,
+        now,
+      )
+  })
+
+  it('applies a single op, stamps its appliedAt, leaves others pending', async () => {
+    const r = await apply('asst-perop', 0)
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(body.ok).toBe(true)
+
+    const row = db()
+      .prepare(`SELECT pending_edit, edit_applied_at FROM chat_messages WHERE id = ?`)
+      .get('asst-perop') as { pending_edit: string; edit_applied_at: number | null }
+    const ops = JSON.parse(row.pending_edit) as Array<{ appliedAt?: number | null }>
+    expect(ops).toHaveLength(3)
+    expect(ops[0].appliedAt).toBeTruthy()
+    expect(ops[1].appliedAt ?? null).toBeNull()
+    expect(ops[2].appliedAt ?? null).toBeNull()
+    // Message-level applied flag stays null until ALL ops land.
+    expect(row.edit_applied_at).toBeNull()
+
+    const { readFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const text = (await readFile(path.join(config.vault.root, 'alice', 'per-op-doc.md'))).toString('utf8')
+    expect(text).toContain('AAA.')
+    expect(text).not.toContain('alpha body.')
+    expect(text).toContain('beta body.')
+    expect(text).toContain('gamma body.')
+  })
+
+  it('refuses re-applying the same op (409)', async () => {
+    const r = await apply('asst-perop', 0)
+    expect(r.statusCode).toBe(409)
+  })
+
+  // The regression that motivated this whole audit pass: the
+  // second per-op apply used to 409 on sha_mismatch because we
+  // forgot to update edit_target_sha256 after the first apply.
+  it('re-anchors sha so a second per-op apply succeeds', async () => {
+    const r = await apply('asst-perop', 1)
+    expect(r.statusCode).toBe(200)
+
+    const { readFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const text = (await readFile(path.join(config.vault.root, 'alice', 'per-op-doc.md'))).toString('utf8')
+    expect(text).toContain('AAA.')
+    expect(text).toContain('BBB.')
+    expect(text).toContain('gamma body.')
+  })
+
+  it('discarding the final pending op shrinks array + flips message-level applied (since remaining were all applied)', async () => {
+    // Discard the third (still-pending) op. After this, only the
+    // two appliedAt-stamped ops remain → server should mark the
+    // whole turn applied so the card shows pills.
+    const r = await discard('asst-perop', 2)
+    expect(r.statusCode).toBe(200)
+
+    const row = db()
+      .prepare(`SELECT pending_edit, edit_applied_at FROM chat_messages WHERE id = ?`)
+      .get('asst-perop') as { pending_edit: string; edit_applied_at: number | null }
+    const ops = JSON.parse(row.pending_edit) as Array<unknown>
+    expect(ops).toHaveLength(2)
+    expect(row.edit_applied_at).toBeTruthy()
+  })
+
+  it('refuses to discard an already-applied op (409)', async () => {
+    // op[0] in the (now-shrunken) array carries appliedAt — can't
+    // discard it.
+    const r = await discard('asst-perop', 0)
+    expect(r.statusCode).toBe(409)
+  })
+
+  it('refuses apply-op on a now-fully-applied turn (409)', async () => {
+    // edit_applied_at was set above; further apply-ops should
+    // bounce.
+    const r = await apply('asst-perop', 0)
+    expect(r.statusCode).toBe(409)
+  })
+
+  it('preview endpoint surfaces opPreviews + per-op applied flags', async () => {
+    // Seed a fresh turn so the doc still has a pending baseline to
+    // preview against. We don't want to depend on the prior turn,
+    // which was fully resolved.
+    const now = Date.now()
+    const liveSha = await import('node:crypto').then(async (c) => {
+      const { readFile } = await import('node:fs/promises')
+      const path = await import('node:path')
+      const buf = await readFile(path.join(config.vault.root, 'alice', 'per-op-doc.md'))
+      return c.createHash('sha256').update(buf).digest('hex')
+    })
+    db()
+      .prepare(
+        `INSERT INTO chat_messages
+           (id, doc_id, user_id, role, content, citations, memories_used,
+            error_text, pending_edit, edit_applied_at, edit_target_sha256,
+            created_at)
+         VALUES (?, ?, ?, 'assistant', ?, NULL, NULL, NULL, ?, NULL, ?, ?)`,
+      )
+      .run(
+        'asst-preview',
+        docId,
+        'alice',
+        'Two more.',
+        JSON.stringify([
+          { op: 'replace_section', heading: 'C', content: 'GGG.', appliedAt: now - 1000 },
+          { op: 'replace_section', heading: 'C', content: 'HHH.' },
+        ]),
+        liveSha,
+        now,
+      )
+
+    const r = await app.inject({
+      method: 'GET',
+      url: `/api/chat/${docId}/messages/asst-preview/preview`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(Array.isArray(body.opPreviews)).toBe(true)
+    expect(body.opPreviews).toHaveLength(2)
+    expect(body.opPreviews[0].applied).toBe(true)
+    expect(body.opPreviews[1].applied ?? false).toBe(false)
+    expect(typeof body.opPreviews[1].next).toBe('string')
+  })
+
+  it('apply-op rejects unknown opIndex (400)', async () => {
+    const r = await apply('asst-preview', 99)
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('discard-op rejects unknown opIndex (400)', async () => {
+    const r = await discard('asst-preview', 99)
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('discard-op rejects negative opIndex (400)', async () => {
+    const r = await app.inject({
+      method: 'DELETE',
+      url: `/api/chat/${docId}/pending-edit/asst-preview/op/-1`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('audits version.snapshot with reader-ai attribution on per-op apply', async () => {
+    // Apply the still-pending op on asst-preview, then sweep the
+    // audit log for a version.snapshot row attributed to Reader AI.
+    const r = await apply('asst-preview', 1)
+    expect(r.statusCode).toBe(200)
+
+    const { listAudit } = await import('./stores/audit.js')
+    const entries = await listAudit({ target: docId, limit: 50 })
+    const snap = entries.find(
+      (e) => e.action === 'version.snapshot' && e.meta?.source === 'reader-ai',
+    )
+    expect(snap).toBeTruthy()
+    expect(snap?.actor).toBe('alice')
+  })
+})
+
+// ── Pins routes ───────────────────────────────────────────────────
+// Covers the GET / POST / DELETE happy paths, the access guards
+// (you can't pin a file in someone else's vault without a share),
+// auto-pruning of dead pins on list, and audit emits for pin.add /
+// pin.remove (including the system-attributed auto-cleanup row).
+describe('integration: pins', () => {
+  let cookie = ''
+  const listPins = () =>
+    app.inject({
+      method: 'GET',
+      url: '/api/pins',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+  const addPin = (body: Record<string, unknown>) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/pins',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: body,
+    })
+  const deletePin = (body: Record<string, unknown>) =>
+    app.inject({
+      method: 'DELETE',
+      url: '/api/pins',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: body,
+    })
+
+  it('logs in alice + writes a vault file she can pin', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', 'pin-target.md')
+    await mkdir(path.dirname(abs), { recursive: true })
+    await writeFile(abs, '# pin me')
+  })
+
+  it('starts with an empty pin list', async () => {
+    const r = await listPins()
+    expect(r.statusCode).toBe(200)
+    expect(r.json().pins).toEqual([])
+  })
+
+  it('rejects POST without a path (400)', async () => {
+    const r = await addPin({})
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('pins a real own-vault file', async () => {
+    const r = await addPin({ path: 'pin-target.md', label: 'fav doc' })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(body.pins).toHaveLength(1)
+    expect(body.pins[0].storageKey).toBe('pin-target.md')
+    expect(body.pins[0].label).toBe('fav doc')
+  })
+
+  it('audits pin.add', async () => {
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'pin-target.md' })
+    const add = events.find((e) => e.action === 'pin.add')
+    expect(add?.actor).toBe('alice')
+    expect((add?.meta as { label?: string })?.label).toBe('fav doc')
+  })
+
+  it('refuses to pin a path the user has no access to (403)', async () => {
+    // Different owner, no share grant. Must 403, not silently pin.
+    const r = await addPin({ path: 'someone-else.md', owner: 'bob' })
+    expect([403, 404]).toContain(r.statusCode)
+  })
+
+  it('refuses to pin a non-existent file (404)', async () => {
+    const r = await addPin({ path: 'does-not-exist.md' })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('DELETE removes the pin and audits it', async () => {
+    const r = await deletePin({ path: 'pin-target.md' })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().pins).toEqual([])
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'pin-target.md' })
+    const remove = events.find(
+      (e) => e.action === 'pin.remove' && e.actor === 'alice',
+    )
+    expect(remove).toBeTruthy()
+  })
+
+  it('auto-prunes pins whose target no longer exists, with a system audit', async () => {
+    // Pin a file, then delete the file on disk → next listPins
+    // call should drop the pin and audit pin.remove as the system.
+    const { writeFile, unlink } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', 'soon-gone.md')
+    await writeFile(abs, 'temp')
+    const addR = await addPin({ path: 'soon-gone.md' })
+    expect(addR.statusCode).toBe(200)
+    expect(addR.json().pins).toHaveLength(1)
+    await unlink(abs)
+
+    const listR = await listPins()
+    expect(listR.statusCode).toBe(200)
+    expect(listR.json().pins).toEqual([])
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'soon-gone.md' })
+    const auto = events.find(
+      (e) =>
+        e.action === 'pin.remove' &&
+        e.actor === 'system' &&
+        (e.meta as { source?: string })?.source === 'auto-cleanup',
+    )
+    expect(auto).toBeTruthy()
+    expect((auto?.meta as { reason?: string })?.reason).toBe('target-missing')
+  })
+
+  it('requires auth — anonymous GET 401s', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/pins',
+      headers: { 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+})
+
+// ── Vault routes ──────────────────────────────────────────────────
+// Coverage for the largest unauthenticated-surface file in the
+// codebase. Hits the security-critical paths (auth gates, cross-
+// owner access denial) and the mutation flows that audit (upload,
+// visibility, tags, trash, restore, move, index, mkdir). Reads
+// are exercised end-to-end through fastify.inject so any
+// middleware regression (CSRF, rate-limit, security headers)
+// would also trip the relevant assertion below.
+describe('integration: vault routes', () => {
+  let cookie = ''
+  /** Seed a doc directly via DB + disk so the test can exercise
+   *  the read / mutate endpoints without pulling the upload
+   *  pipeline into every suite. Tags live in the document_tags
+   *  join table (not a column on documents). */
+  async function seed(
+    docId: string,
+    storageKey: string,
+    body = 'seeded body',
+    opts?: { mime?: string; tags?: string[]; isPublic?: boolean },
+  ) {
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const { createHash } = await import('node:crypto')
+    const sha = createHash('sha256').update(body).digest('hex')
+    const abs = path.join(config.vault.root, 'alice', storageKey)
+    await mkdir(path.dirname(abs), { recursive: true })
+    await writeFile(abs, body)
+    const now = Date.now()
+    db()
+      .prepare(
+        `INSERT INTO documents
+           (id, owner, storage_key, title, original_filename, mime, bytes, sha256, public, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        docId,
+        'alice',
+        storageKey,
+        storageKey,
+        storageKey,
+        opts?.mime ?? 'text/markdown',
+        body.length,
+        sha,
+        opts?.isPublic ? 1 : 0,
+        now,
+        now,
+      )
+    if (opts?.tags && opts.tags.length > 0) {
+      const ins = db().prepare(`INSERT INTO document_tags (doc_id, tag) VALUES (?, ?)`)
+      for (const t of opts.tags) ins.run(docId, t)
+    }
+  }
+
+  it('logs in alice', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+    expect(cookie).toBeTruthy()
+  })
+
+  // ── Reads ────────────────────────────────────────────────────────
+
+  it('GET /api/file/text 401s when unauthenticated', async () => {
+    await seed('vault-read-1', 'vault-read-1.md', 'hello')
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/text?path=vault-read-1.md',
+      headers: { 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('GET /api/file/text returns the file body for the owner', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/text?path=vault-read-1.md',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().content).toBe('hello')
+  })
+
+  it('GET /api/file/raw streams bytes for the owner', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/raw?path=vault-read-1.md',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.body).toBe('hello')
+  })
+
+  it('GET /api/file/meta returns the doc record', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/meta?path=vault-read-1.md',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const meta = r.json().meta
+    expect(meta.id).toBe('vault-read-1')
+    expect(meta.owner).toBe('alice')
+    expect(meta.bytes).toBe(5)
+  })
+
+  it('GET /api/file/text returns 404 for an unknown path', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/text?path=nope.md',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('GET /api/list returns owner files', async () => {
+    await seed('vault-list-1', 'list-1.md', 'one')
+    await seed('vault-list-2', 'subdir/list-2.md', 'two')
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/list?path=',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    // Endpoint returns { path, items: [...] }, not { entries }.
+    const body = r.json()
+    expect(Array.isArray(body.items)).toBe(true)
+    expect(body.items.some((e: { name: string }) => e.name === 'list-1.md')).toBe(true)
+    // Sub-folder entry is included as a dir-typed item.
+    expect(body.items.some((e: { name: string; type: string }) => e.name === 'subdir' && e.type === 'dir')).toBe(true)
+  })
+
+  // ── Visibility ───────────────────────────────────────────────────
+
+  it('POST /api/file/visibility makes a file public + audits', async () => {
+    await seed('vault-vis-1', 'vis-1.md')
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/visibility',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'vis-1.md', public: true },
+    })
+    expect(r.statusCode).toBe(200)
+    const row = db()
+      .prepare(`SELECT public FROM documents WHERE storage_key = 'vis-1.md' AND owner = 'alice'`)
+      .get() as { public: number }
+    expect(row.public).toBe(1)
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'vis-1.md' })
+    const vis = events.find((e) => e.action === 'vault.visibility')
+    expect(vis?.actor).toBe('alice')
+    expect((vis?.meta as { public?: boolean })?.public).toBe(true)
+  })
+
+  it('POST /api/file/visibility flips back to private', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/visibility',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'vis-1.md', public: false },
+    })
+    expect(r.statusCode).toBe(200)
+    const row = db()
+      .prepare(`SELECT public FROM documents WHERE storage_key = 'vis-1.md' AND owner = 'alice'`)
+      .get() as { public: number }
+    expect(row.public).toBe(0)
+  })
+
+  it('POST /api/file/visibility refuses on a doc the user does not own', async () => {
+    // Seed a doc owned by bob (not alice).
+    db()
+      .prepare(
+        `INSERT INTO documents
+           (id, owner, storage_key, title, original_filename, mime, bytes, sha256, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run('vault-bob-1', 'bob', 'bobs-secret.md', 'Bob', 'bobs-secret.md', 'text/markdown', 0, '', Date.now(), Date.now())
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/visibility',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'bobs-secret.md', public: true, owner: 'bob' },
+    })
+    expect([403, 404]).toContain(r.statusCode)
+  })
+
+  // ── Tags ─────────────────────────────────────────────────────────
+
+  it('POST /api/file/tags sets tags + audits', async () => {
+    await seed('vault-tag-1', 'tag-1.md')
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/tags',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'tag-1.md', tags: ['draft', 'idea'] },
+    })
+    expect(r.statusCode).toBe(200)
+    // Tags live in the document_tags join table.
+    const rows = db()
+      .prepare(`SELECT tag FROM document_tags WHERE doc_id = 'vault-tag-1' ORDER BY tag`)
+      .all() as Array<{ tag: string }>
+    expect(rows.map((r) => r.tag)).toEqual(['draft', 'idea'])
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'tag-1.md' })
+    const tag = events.find((e) => e.action === 'vault.tags')
+    expect(tag?.actor).toBe('alice')
+    expect((tag?.meta as { tags?: string[] })?.tags).toEqual(['draft', 'idea'])
+  })
+
+  it('POST /api/file/tags can clear tags via empty array', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/tags',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'tag-1.md', tags: [] },
+    })
+    expect(r.statusCode).toBe(200)
+    const rows = db()
+      .prepare(`SELECT tag FROM document_tags WHERE doc_id = 'vault-tag-1'`)
+      .all() as Array<{ tag: string }>
+    expect(rows).toEqual([])
+  })
+
+  // ── Delete / restore / purge ─────────────────────────────────────
+
+  it('DELETE /api/file trashes the file (moves it off disk) + audits vault.trash', async () => {
+    await seed('vault-del-1', 'del-1.md', 'to be trashed')
+    const r = await app.inject({
+      method: 'DELETE',
+      url: '/api/file?path=del-1.md',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    // Vault file is gone (moved to trash dir on disk).
+    const { stat } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const exists = await stat(path.join(config.vault.root, 'alice', 'del-1.md')).catch(() => null)
+    expect(exists).toBeNull()
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'del-1.md' })
+    expect(events.find((e) => e.action === 'vault.trash')).toBeTruthy()
+  })
+
+  it('GET /api/trash lists trashed entries', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/trash',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(Array.isArray(body.entries)).toBe(true)
+    // Trash entries are keyed by a generated id, not the docId, but
+    // the storageKey survives so we can find ours that way.
+    expect(
+      body.entries.some(
+        (e: { storageKey?: string }) => e.storageKey === 'del-1.md',
+      ),
+    ).toBe(true)
+  })
+
+  // ── Folder ops ───────────────────────────────────────────────────
+
+  it('POST /api/folder creates a directory + audits vault.mkdir', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/folder',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'newfolder' },
+    })
+    expect(r.statusCode).toBe(200)
+    const { stat } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const s = await stat(path.join(config.vault.root, 'alice', 'newfolder')).catch(() => null)
+    expect(s?.isDirectory()).toBe(true)
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'newfolder' })
+    expect(events.find((e) => e.action === 'vault.mkdir')).toBeTruthy()
+  })
+
+  it('POST /api/folder/visibility flips a folder public', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/folder/visibility',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'newfolder', public: true },
+    })
+    expect(r.statusCode).toBe(200)
+  })
+
+  it('POST /api/folder/tags writes folder tags', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/folder/tags',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'newfolder', tags: ['work', 'archive'] },
+    })
+    expect(r.statusCode).toBe(200)
+  })
+
+  it('GET /api/folder/meta returns folder meta with the new tags', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/folder/meta?path=newfolder',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    // Response shape is { folder: { ... } }, not { meta: ... }.
+    // Folder-tags endpoint dedups + sorts alphabetically, so the
+    // returned order is ['archive', 'work'] not the input order.
+    const body = r.json()
+    expect(body.folder.tags).toEqual(['archive', 'work'])
+    expect(body.folder.public).toBe(true)
+  })
+
+  it('GET /api/folder/activity surfaces folder-scoped events', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/folder/activity?path=newfolder',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(Array.isArray(body.entries)).toBe(true)
+    // Should include the visibility + tags edits we just did.
+    const actions = body.entries.map((e: { action: string }) => e.action)
+    expect(actions).toContain('vault.folder-visibility')
+    expect(actions).toContain('vault.folder-tags')
+  })
+
+  // ── Move ─────────────────────────────────────────────────────────
+
+  it('POST /api/file/move renames a file + audits vault.move', async () => {
+    await seed('vault-move-1', 'move-src.md', 'movable')
+    // Defensive cleanup — any leftover at the destination from a
+    // prior test (or a half-finished run) would 409 with
+    // "destination already exists". The move endpoint refuses to
+    // clobber, intentionally.
+    {
+      const { rm } = await import('node:fs/promises')
+      const path = await import('node:path')
+      await rm(path.join(config.vault.root, 'alice', 'move-dst.md'), { force: true })
+    }
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/move',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      // Endpoint expects {from, to}, NOT {path, to} — regression
+      // guard if anyone refactors the body shape.
+      payload: { from: 'move-src.md', to: 'move-dst.md' },
+    })
+    expect(r.statusCode).toBe(200)
+    const row = db()
+      .prepare(`SELECT storage_key FROM documents WHERE id = 'vault-move-1'`)
+      .get() as { storage_key: string }
+    expect(row.storage_key).toBe('move-dst.md')
+    const { stat } = await import('node:fs/promises')
+    const path = await import('node:path')
+    expect(await stat(path.join(config.vault.root, 'alice', 'move-dst.md')).catch(() => null)).toBeTruthy()
+
+    // Audit is keyed on the SOURCE path, with the new path in meta.
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'move-src.md' })
+    const move = events.find((e) => e.action === 'vault.move')
+    expect(move).toBeTruthy()
+    expect((move?.meta as { to?: string })?.to).toBe('move-dst.md')
+  })
+
+  // ── Versions ─────────────────────────────────────────────────────
+
+  it('GET /api/file/versions returns [] for a doc with no snapshots', async () => {
+    await seed('vault-ver-1', 'ver-1.md')
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/versions?path=ver-1.md',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().versions).toEqual([])
+  })
+
+  // ── Activity ─────────────────────────────────────────────────────
+
+  it('GET /api/file/activity returns this file\'s audit entries', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/activity?path=tag-1.md',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const actions = r.json().entries.map((e: { action: string }) => e.action)
+    // We set + cleared tags above; both should show in this feed.
+    expect(actions).toContain('vault.tags')
+  })
+
+  // ── Tags listing ─────────────────────────────────────────────────
+
+  it('GET /api/tags returns the user\'s tag universe', async () => {
+    await seed('vault-tagset-1', 'tagset-1.md', 'a', { tags: ['alpha', 'beta'] })
+    await seed('vault-tagset-2', 'tagset-2.md', 'b', { tags: ['beta', 'gamma'] })
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/tags',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    const names = body.tags.map((t: { tag: string }) => t.tag)
+    expect(names).toEqual(expect.arrayContaining(['alpha', 'beta', 'gamma']))
+  })
+
+  // ── 401 / 403 / 404 guards across the surface ────────────────────
+
+  it('every mutation endpoint 401s without auth', async () => {
+    const targets = [
+      { method: 'POST', url: '/api/file/visibility', payload: { path: 'x.md', public: true } },
+      { method: 'POST', url: '/api/file/tags', payload: { path: 'x.md', tags: [] } },
+      { method: 'POST', url: '/api/file/move', payload: { path: 'x.md', to: 'y.md' } },
+      { method: 'POST', url: '/api/folder', payload: { path: 'z' } },
+      { method: 'DELETE', url: '/api/file?path=x.md' },
+      { method: 'POST', url: '/api/file/index', payload: { path: 'x.md' } },
+    ] as const
+    for (const t of targets) {
+      const r = await app.inject({
+        method: t.method,
+        url: t.url,
+        headers: { 'X-Requested-With': 'fetch' },
+        payload: 'payload' in t ? t.payload : undefined,
+      })
+      expect(r.statusCode, `${t.method} ${t.url}`).toBe(401)
+    }
+  })
+})
+
+// ── Auth login lockout ────────────────────────────────────────────
+// LOGIN_MAX_FAILURES wrong-password attempts within LOGIN_WINDOW_MS
+// (15 min) locks the (ip, username) bucket for 15 min. Tests use a
+// fresh username so we don't interfere with the existing alice
+// session in other suites. Each failure should:
+//   • 401 on the attempt itself
+//   • emit auth.login.failed audit
+// After the cap: subsequent attempts (even with the correct
+// password) must 429 with Retry-After + auth.login.throttled audit.
+describe('integration: auth login lockout', () => {
+  let lockUser = ''
+  beforeAll(async () => {
+    // Unique user so we control the bucket independently of other
+    // tests' alice/bob sessions.
+    lockUser = `locktest-${Date.now()}`
+    const signup = await app.inject({
+      method: 'POST',
+      url: '/api/auth/signup',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: lockUser, password: 'right-password-here' },
+    })
+    expect(signup.statusCode).toBe(200)
+  })
+
+  it('returns 401 on a single wrong password', async () => {
+    // Wrong password must be ≥ 8 chars to pass the credSchema
+    // (min 8) — otherwise we'd 400 at Zod and never reach the
+    // auth check we're trying to exercise.
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: lockUser, password: 'wrong-pw-1' },
+    })
+    expect(r.statusCode).toBe(401)
+    expect(r.json().error).toMatch(/invalid credentials/i)
+  })
+
+  it('locks after 5 failures and 429s with Retry-After', async () => {
+    // 4 more failures (we already burned 1 above) → trips the cap.
+    for (let i = 0; i < 4; i++) {
+      const r = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        headers: { 'X-Requested-With': 'fetch' },
+        payload: { username: lockUser, password: `wrong-pw-${i + 2}` },
+      })
+      expect(r.statusCode).toBe(401)
+    }
+    // The 6th attempt — even with the right password — must 429.
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: lockUser, password: 'right-password-here' },
+    })
+    expect(blocked.statusCode).toBe(429)
+    expect(blocked.headers['retry-after']).toBeTruthy()
+    const body = blocked.json()
+    expect(body.error).toMatch(/too many failed attempts/i)
+    expect(typeof body.retryAfter).toBe('number')
+    expect(body.retryAfter).toBeGreaterThan(0)
+  })
+
+  it('audits auth.login.failed for wrong-password attempts', async () => {
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ limit: 50 })
+    const failures = events.filter(
+      (e) => e.action === 'auth.login.failed' && e.actor === lockUser,
+    )
+    expect(failures.length).toBeGreaterThanOrEqual(5)
+  })
+
+  it('audits auth.login.throttled when the bucket trips', async () => {
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ limit: 50 })
+    const throttled = events.find(
+      (e) => e.action === 'auth.login.throttled' && e.actor === lockUser,
+    )
+    expect(throttled).toBeTruthy()
+    expect((throttled?.meta as { retryAfter?: number })?.retryAfter).toBeGreaterThan(0)
+  })
+
+  it('successful signup still works for OTHER users while one is locked', async () => {
+    // The lockout is per-(ip, username), not per-ip. A different
+    // username from the same ip must not be blocked.
+    const otherUser = `other-${Date.now()}`
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/auth/signup',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: otherUser, password: 'unrelated-secret' },
+    })
+    expect(r.statusCode).toBe(200)
+  })
+})
+
+// ── Account routes ────────────────────────────────────────────────
+// User-scoped self-service: email change, personal API tokens, and
+// webhooks. All emit audits. Cross-user safety: a token created by
+// alice can't be deleted by bob.
+describe('integration: account routes', () => {
+  let cookie = ''
+  let createdTokenId = ''
+  let createdSecret = ''
+
+  it('logs in alice', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+  })
+
+  it('PATCH /api/account/email sets + audits', async () => {
+    const r = await app.inject({
+      method: 'PATCH',
+      url: '/api/account/email',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { email: 'alice@example.com' },
+    })
+    expect(r.statusCode).toBe(200)
+    expect(r.json().user.email).toBe('alice@example.com')
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ limit: 30 })
+    const ev = events.find(
+      (e) => e.action === 'account.email' && e.actor === 'alice',
+    )
+    expect((ev?.meta as { email?: string })?.email).toBe('alice@example.com')
+  })
+
+  it('PATCH /api/account/email with empty string clears it', async () => {
+    const r = await app.inject({
+      method: 'PATCH',
+      url: '/api/account/email',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { email: '' },
+    })
+    expect(r.statusCode).toBe(200)
+    // app.publicUser strips undefined; assert it's not present.
+    expect(r.json().user.email).toBeFalsy()
+  })
+
+  it('PATCH /api/account/email rejects malformed addresses (400)', async () => {
+    const r = await app.inject({
+      method: 'PATCH',
+      url: '/api/account/email',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { email: 'not-an-email' },
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('PATCH /api/account/email 401s without auth', async () => {
+    const r = await app.inject({
+      method: 'PATCH',
+      url: '/api/account/email',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { email: 'x@y.z' },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('POST /api/account/tokens mints a token + returns secret', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/account/tokens',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { name: 'cli token' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(typeof body.secret).toBe('string')
+    expect(body.secret.length).toBeGreaterThan(20)
+    expect(body.token.name).toBe('cli token')
+    expect(body.token.createdBy).toBe('alice')
+    createdTokenId = body.token.id
+    createdSecret = body.secret
+  })
+
+  it('GET /api/account/tokens lists only the caller\'s tokens', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/account/tokens',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const tokens = r.json().tokens as Array<{ id: string; createdBy: string }>
+    expect(tokens.some((t) => t.id === createdTokenId)).toBe(true)
+    expect(tokens.every((t) => t.createdBy === 'alice')).toBe(true)
+  })
+
+  it('POST /api/account/tokens rejects invalid payloads', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/account/tokens',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { name: '' },
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('DELETE /api/account/tokens/:id requires ownership (403 for someone else\'s)', async () => {
+    // Sign in as bob, try to delete alice's token.
+    const bobSignup = await app.inject({
+      method: 'POST',
+      url: '/api/auth/signup',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'bob', password: 'correct-horse-battery' },
+    })
+    expect([200, 409]).toContain(bobSignup.statusCode)
+    const bobLogin = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'bob', password: 'correct-horse-battery' },
+    })
+    const bobCookie = setCookieValue(bobLogin.headers['set-cookie']) ?? ''
+
+    const r = await app.inject({
+      method: 'DELETE',
+      url: `/api/account/tokens/${createdTokenId}`,
+      headers: { cookie: bobCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(403)
+  })
+
+  it('DELETE /api/account/tokens/:id deletes own token + audits', async () => {
+    const r = await app.inject({
+      method: 'DELETE',
+      url: `/api/account/tokens/${createdTokenId}`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: createdTokenId })
+    expect(events.find((e) => e.action === 'account.token.delete')).toBeTruthy()
+    // Defensive: createdSecret was returned plaintext on mint; we
+    // don't check its contents but use it to silence the unused-var
+    // warning that vitest would otherwise emit.
+    expect(createdSecret).toBeTruthy()
+  })
+
+  it('DELETE /api/account/tokens/:id 404s for unknown id', async () => {
+    const r = await app.inject({
+      method: 'DELETE',
+      url: '/api/account/tokens/nope',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('GET /api/account/webhooks lists (initially empty)', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/account/webhooks',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(Array.isArray(body.webhooks)).toBe(true)
+  })
+
+  it('POST + DELETE /api/account/webhooks works + audits', async () => {
+    // Webhook body requires { url, events: [...] } — a `name`
+    // field is not part of the schema. Sending it 400s.
+    const create = await app.inject({
+      method: 'POST',
+      url: '/api/account/webhooks',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { url: 'https://example.test/hook', events: ['upload', 'edit'] },
+    })
+    expect(create.statusCode).toBe(200)
+    const id = create.json().webhook.id
+    expect(id).toBeTruthy()
+
+    const del = await app.inject({
+      method: 'DELETE',
+      url: `/api/account/webhooks/${id}`,
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(del.statusCode).toBe(200)
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: id })
+    const actions = events.map((e) => e.action)
+    expect(actions).toEqual(
+      expect.arrayContaining(['account.webhook.create', 'account.webhook.delete']),
+    )
+  })
+})
+
+// ── User-to-user shares ───────────────────────────────────────────
+// Per-file / per-folder share grants. Tests hit the security-
+// critical paths: path-traversal rejection, self-share rejection,
+// missing-recipient handling, and the ownership check on revoke.
+describe('integration: user shares', () => {
+  let aliceCookie = ''
+  let bobCookie = ''
+
+  it('logs in alice + bob and seeds a shareable file', async () => {
+    const alice = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(alice.statusCode).toBe(200)
+    aliceCookie = setCookieValue(alice.headers['set-cookie']) ?? ''
+
+    // bob may already exist from the account-tokens test above.
+    await app.inject({
+      method: 'POST',
+      url: '/api/auth/signup',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'bob', password: 'correct-horse-battery' },
+    })
+    const bobLogin = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'bob', password: 'correct-horse-battery' },
+    })
+    expect(bobLogin.statusCode).toBe(200)
+    bobCookie = setCookieValue(bobLogin.headers['set-cookie']) ?? ''
+
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', 'share-target.md')
+    await mkdir(path.dirname(abs), { recursive: true })
+    await writeFile(abs, '# shared with bob')
+  })
+
+  it('alice can share a file with bob', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/share-with',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'share-target.md', recipient: 'bob', canEdit: false },
+    })
+    expect(r.statusCode).toBe(201)
+    const body = r.json()
+    expect(body.share.owner).toBe('alice')
+    expect(body.share.recipient).toBe('bob')
+    expect(body.share.canEdit).toBe(false)
+  })
+
+  it('audits vault.share-with with recipient + canEdit meta', async () => {
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'share-target.md' })
+    const ev = events.find((e) => e.action === 'vault.share-with')
+    expect(ev?.actor).toBe('alice')
+    expect((ev?.meta as { recipient?: string })?.recipient).toBe('bob')
+    expect((ev?.meta as { canEdit?: boolean })?.canEdit).toBe(false)
+  })
+
+  it('refuses to share with yourself (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/share-with',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'share-target.md', recipient: 'alice' },
+    })
+    expect(r.statusCode).toBe(400)
+  })
+
+  it('refuses to share with an unknown recipient (404)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/share-with',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'share-target.md', recipient: 'ghost-user' },
+    })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('refuses path traversal in the share path', async () => {
+    // resolveUserVault rejects `..` segments — the route should
+    // surface that as a 400, not silently mint a share record
+    // pointing into another user's vault.
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/share-with',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+      payload: { path: '../bob/secret.md', recipient: 'bob' },
+    })
+    expect([400, 404]).toContain(r.statusCode)
+  })
+
+  it('refuses to share a path that does not exist in the owner\'s vault (404)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/file/share-with',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+      payload: { path: 'never-existed.md', recipient: 'bob' },
+    })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('GET /api/file/shares-from lists alice\'s outgoing grants', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/shares-from',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const shares = r.json().shares as Array<{ recipient: string }>
+    expect(shares.some((s) => s.recipient === 'bob')).toBe(true)
+  })
+
+  it('GET /api/file/shares-to lists bob\'s incoming grants', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/file/shares-to',
+      headers: { cookie: bobCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const shares = r.json().shares as Array<{ owner: string }>
+    expect(shares.some((s) => s.owner === 'alice')).toBe(true)
+  })
+
+  it('DELETE /api/file/share-with/:id refuses third-party revocation (403)', async () => {
+    // Create a doc owned by alice and shared with bob. A signed-in
+    // THIRD user (we use the locktest user from the lockout suite)
+    // must not be able to revoke that grant.
+    // First find an existing share id.
+    const fromR = await app.inject({
+      method: 'GET',
+      url: '/api/file/shares-from',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+    })
+    const share = fromR.json().shares[0] as { id: string }
+    expect(share?.id).toBeTruthy()
+    // Sign up + login a fresh third-party user.
+    const third = `third-${Date.now()}`
+    await app.inject({
+      method: 'POST',
+      url: '/api/auth/signup',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: third, password: 'third-party-secret' },
+    })
+    const tl = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: third, password: 'third-party-secret' },
+    })
+    const thirdCookie = setCookieValue(tl.headers['set-cookie']) ?? ''
+    const r = await app.inject({
+      method: 'DELETE',
+      url: `/api/file/share-with/${share.id}`,
+      headers: { cookie: thirdCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(403)
+  })
+
+  it('owner can revoke a share + audits vault.share-revoke', async () => {
+    const fromR = await app.inject({
+      method: 'GET',
+      url: '/api/file/shares-from',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+    })
+    const share = fromR.json().shares.find(
+      (s: { storageKey: string }) => s.storageKey === 'share-target.md',
+    ) as { id: string }
+    expect(share?.id).toBeTruthy()
+
+    const del = await app.inject({
+      method: 'DELETE',
+      url: `/api/file/share-with/${share.id}`,
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(del.statusCode).toBe(200)
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: 'share-target.md' })
+    const rev = events.find(
+      (e) => e.action === 'vault.share-revoke' && e.actor === 'alice',
+    )
+    expect((rev?.meta as { recipient?: string })?.recipient).toBe('bob')
+  })
+
+  it('DELETE on unknown share id 404s', async () => {
+    const r = await app.inject({
+      method: 'DELETE',
+      url: '/api/file/share-with/nope',
+      headers: { cookie: aliceCookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(404)
+  })
+
+  it('all share endpoints 401 without auth', async () => {
+    const targets = [
+      { method: 'POST', url: '/api/file/share-with', payload: { path: 'x', recipient: 'y' } },
+      { method: 'GET', url: '/api/file/shares-from' },
+      { method: 'GET', url: '/api/file/shares-to' },
+      { method: 'DELETE', url: '/api/file/share-with/anything' },
+    ] as const
+    for (const t of targets) {
+      const r = await app.inject({
+        method: t.method,
+        url: t.url,
+        headers: { 'X-Requested-With': 'fetch' },
+        payload: 'payload' in t ? t.payload : undefined,
+      })
+      expect(r.statusCode, `${t.method} ${t.url}`).toBe(401)
+    }
+  })
+})
+
 describe('integration: security headers', () => {
   it('returns the standard security header bundle on every response', async () => {
     const r = await app.inject({ method: 'GET', url: '/health' })

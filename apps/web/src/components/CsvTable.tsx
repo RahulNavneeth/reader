@@ -20,17 +20,17 @@ export function CsvTable({ text }: { text: string }) {
       </div>
       <div
         className="overflow-x-auto rounded border"
-        style={{ borderColor: 'var(--border-soft)' }}
+        style={{ borderColor: 'var(--border)' }}
       >
         <table className="w-full text-[12.5px]" style={{ borderCollapse: 'collapse' }}>
           {header && (
-            <thead style={{ background: 'var(--panel)' }}>
+            <thead style={{ background: 'var(--table-header-bg)' }}>
               <tr>
                 {header.map((h, i) => (
                   <th
                     key={i}
                     className="px-2.5 py-1.5 text-left font-semibold text-fg whitespace-nowrap"
-                    style={{ borderBottom: '1px solid var(--border-soft)' }}
+                    style={{ borderBottom: '1px solid color-mix(in srgb, var(--fg) 18%, var(--viewer))' }}
                   >
                     {h}
                   </th>
@@ -40,7 +40,13 @@ export function CsvTable({ text }: { text: string }) {
           )}
           <tbody>
             {visible.map((r, ri) => (
-              <tr key={ri} style={{ borderTop: ri === 0 ? 'none' : '1px solid var(--border-soft)' }}>
+              <tr
+                key={ri}
+                style={{
+                  borderTop: ri === 0 ? 'none' : '1px solid var(--border)',
+                  background: ri % 2 === 1 ? 'var(--table-stripe-bg)' : 'transparent',
+                }}
+              >
                 {r.map((c, ci) => (
                   <td
                     key={ci}

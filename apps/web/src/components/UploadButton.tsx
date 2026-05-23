@@ -172,7 +172,7 @@ export function UploadButton({
         // clamp the backdrop to that wrapper's narrow column.
         <div
           className="fixed inset-0 z-50 flex items-start justify-center pt-[16vh] px-4"
-          style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+          style={{ background: 'var(--scrim)' }}
           onClick={cancel}
         >
           <div
@@ -182,7 +182,7 @@ export function UploadButton({
           >
             <div
               className="flex items-center gap-2.5 px-4 h-12 border-b shrink-0"
-              style={{ borderColor: 'var(--border-soft)' }}
+              style={{ borderColor: 'var(--border)' }}
             >
               <Upload size={15} className="text-accent" />
               <div className="text-[13.5px] font-medium text-fg">
@@ -194,7 +194,7 @@ export function UploadButton({
               </button>
             </div>
 
-            <div className="px-4 py-4 border-b" style={{ borderColor: 'var(--border-soft)' }}>
+            <div className="px-4 py-4 border-b" style={{ borderColor: 'var(--border)' }}>
               <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
                 Destination folder
               </div>
@@ -221,7 +221,7 @@ export function UploadButton({
             {matches.length > 0 && (
               <div
                 className="max-h-[200px] overflow-y-auto py-1 border-b"
-                style={{ borderColor: 'var(--border-soft)' }}
+                style={{ borderColor: 'var(--border)' }}
               >
                 <div className="px-4 pt-1 pb-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
                   Folders
@@ -263,7 +263,7 @@ export function UploadButton({
 
             <div
               className="flex items-center gap-2 px-4 py-3 border-t"
-              style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+              style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
             >
               <div className="flex-1 text-[11.5px] text-subtle">
                 {busy ? 'Uploading…' : `Ready · ${pendingFiles.length} file${pendingFiles.length === 1 ? '' : 's'}`}

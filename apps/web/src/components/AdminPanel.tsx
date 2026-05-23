@@ -82,7 +82,7 @@ export function AdminPanel() {
       >
         <div
           className="h-11 px-2 flex items-center gap-1.5 border-b shrink-0"
-          style={{ borderColor: 'var(--border-soft)' }}
+          style={{ borderColor: 'var(--border)' }}
         >
           <button
             className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -349,7 +349,7 @@ function GeneralPanel() {
           )}
         </div>
 
-        <div className="border-t pt-3" style={{ borderColor: 'var(--border-soft)' }}>
+        <div className="border-t pt-3" style={{ borderColor: 'var(--border)' }}>
           <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1">
             Data dir
           </div>
@@ -410,7 +410,7 @@ function GeneralPanel() {
       {candidates && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center px-4"
-          style={{ background: 'rgba(9, 30, 66, 0.42)' }}
+          style={{ background: 'var(--scrim)' }}
           onClick={() => setCandidates(null)}
         >
           <div
@@ -420,7 +420,7 @@ function GeneralPanel() {
           >
             <div
               className="flex items-center gap-2 px-3 h-10 border-b"
-              style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+              style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
             >
               <FolderSearch size={14} className="text-accent" />
               <div className="text-[13px] font-semibold text-fg flex-1">
@@ -586,7 +586,7 @@ function EmbeddingsPanel() {
         {/* Per-document AI chat. Toggleable independently of
             embeddings so an admin can search-only by turning chat
             off (or while picking the right chat model). */}
-        <div className="flex items-center gap-3 mt-4 pt-4" style={{ borderTop: '1px solid var(--border-soft)' }}>
+        <div className="flex items-center gap-3 mt-4 pt-4" style={{ borderTop: '1px solid var(--border)' }}>
           <Toggle checked={chatEnabled} onChange={() => setChatEnabled((v) => !v)} disabled={saving} />
           <div className="flex-1 text-[12.5px]">
             <div className="font-medium text-fg">AI chat per document</div>
@@ -1301,7 +1301,7 @@ function UsersPanel() {
             <tbody>
               {users?.map((u) => (
                 <Fragment key={u.username}>
-                  <tr className="border-t border-soft" style={{ borderColor: 'var(--border-soft)' }}>
+                  <tr className="border-t border-soft" style={{ borderColor: 'var(--border)' }}>
                     <td className="px-3 py-2 font-medium text-fg">{u.username}</td>
                     <td className="px-3 py-2">
                       <select
@@ -1341,7 +1341,7 @@ function UsersPanel() {
                     </td>
                   </tr>
                   {editing === u.username && (
-                    <tr style={{ borderTop: '1px solid var(--border-soft)' }}>
+                    <tr style={{ borderTop: '1px solid var(--border)' }}>
                       <td colSpan={5} className="px-3 py-3 space-y-3" style={{ background: 'var(--panel)' }}>
                         <div className="flex items-center gap-2">
                           <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle w-[120px]">
@@ -1482,7 +1482,7 @@ function DuplicatesPanel() {
               </thead>
               <tbody>
                 {g.docs.map((d, i) => (
-                  <tr key={d.id} className="border-t" style={{ borderColor: 'var(--border-soft)' }}>
+                  <tr key={d.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
                     <td className="px-3 py-1.5 text-fg break-all">
                       {d.storageKey}
                       {i === 0 && (
@@ -1564,7 +1564,7 @@ function Modal({
       >
         <div
           className="flex items-center gap-2 px-4 h-10 border-b shrink-0"
-          style={{ borderColor: 'var(--border-soft)', background: 'var(--panel-2)' }}
+          style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
         >
           <div className="text-[13px] font-semibold text-fg flex-1">{title}</div>
           <button className="btn-ghost h-7 w-7 px-0" onClick={onClose}>
@@ -1586,7 +1586,7 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
     >
       <div
         className="px-3 h-8 flex items-center border-b text-[11.5px] uppercase tracking-wider font-semibold text-subtle"
-        style={{ background: 'var(--panel)', borderColor: 'var(--border-soft)' }}
+        style={{ background: 'var(--panel)', borderColor: 'var(--border)' }}
       >
         {title}
       </div>
@@ -1771,7 +1771,7 @@ function ExternalMountsPanel() {
 
       <section
         className="rounded-lg p-4"
-        style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+        style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
       >
         <div className="text-[13px] font-semibold text-fg mb-2.5">Add a mount</div>
         <div className="flex flex-col sm:flex-row gap-2">
@@ -1810,7 +1810,7 @@ function ExternalMountsPanel() {
               <div
                 key={m.id}
                 className="flex items-center gap-3 px-3 py-2 rounded"
-                style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+                style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
               >
                 <HardDrive size={14} className="text-muted shrink-0" />
                 <div className="flex-1 min-w-0">

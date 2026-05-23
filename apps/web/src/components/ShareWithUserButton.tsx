@@ -211,7 +211,7 @@ export function ShareWithUserButton({ paths }: Props) {
               title, status pill on the right showing current state. */}
           <div
             className="flex items-center gap-2 px-3 h-8"
-            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border-soft)' }}
+            style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
             <Users size={13} className="text-muted" />
             <span className="text-[12px] font-semibold text-fg flex-1">
@@ -223,7 +223,7 @@ export function ShareWithUserButton({ paths }: Props) {
                 : `Shared with ${aggregated.length}`}
             </span>
           </div>
-          <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border-soft)' }}>
+          <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border)' }}>
             <input
               className="input h-7 text-[12.5px]"
               placeholder="Username"
@@ -274,7 +274,7 @@ export function ShareWithUserButton({ paths }: Props) {
                   <div
                     key={`${row.recipient}-${row.canEdit ? 'e' : 'r'}`}
                     className="flex items-center gap-2 px-3 py-1.5"
-                    style={{ borderTop: '1px solid var(--border-soft)' }}
+                    style={{ borderTop: '1px solid var(--border)' }}
                   >
                     <span className="text-[12px] text-fg flex-1 truncate">
                       {row.recipient}
@@ -298,7 +298,7 @@ export function ShareWithUserButton({ paths }: Props) {
                       style={{
                         background: row.canEdit ? 'var(--selected)' : 'var(--bg)',
                         color: row.canEdit ? 'var(--accent)' : 'var(--fg)',
-                        border: '1px solid var(--border-soft)',
+                        border: '1px solid var(--border)',
                       }}
                     >
                       {row.canEdit ? 'edit' : 'read-only'}

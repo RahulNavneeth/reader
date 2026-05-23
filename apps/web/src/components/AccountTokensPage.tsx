@@ -115,7 +115,7 @@ export function AccountTokensPage() {
             <div className="flex items-center gap-2">
               <code
                 className="flex-1 px-3 py-2 rounded text-[12.5px] break-all"
-                style={{ background: 'var(--bg)', border: '1px solid var(--border-soft)' }}
+                style={{ background: 'var(--bg)', border: '1px solid var(--border)' }}
               >
                 {newSecret}
               </code>
@@ -150,7 +150,7 @@ export function AccountTokensPage() {
 
         <section
           className="rounded-xl p-4 mb-6"
-          style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+          style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
         >
           <div className="text-[13px] font-semibold text-fg mb-2.5">Create a token</div>
           <div className="flex flex-col sm:flex-row gap-2">
@@ -186,13 +186,13 @@ export function AccountTokensPage() {
           ) : (
             <div
               className="rounded-xl overflow-hidden"
-              style={{ background: 'var(--panel)', border: '1px solid var(--border-soft)' }}
+              style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
             >
               {tokens.map((t, i) => (
                 <div
                   key={t.id}
                   className="flex items-center gap-3 px-4 py-3"
-                  style={{ borderTop: i === 0 ? undefined : '1px solid var(--border-soft)' }}
+                  style={{ borderTop: i === 0 ? undefined : '1px solid var(--border)' }}
                 >
                   <div className="flex-1 min-w-0">
                     <div className="text-[13.5px] font-medium text-fg truncate">{t.name}</div>

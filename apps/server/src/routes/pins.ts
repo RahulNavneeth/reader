@@ -3,6 +3,7 @@ import { stat } from 'node:fs/promises'
 import { resolveUserVault } from '../lib/userVault.js'
 import { addPin, listPins, removePin } from '../stores/pins.js'
 import { findShareForPath } from '../stores/userShares.js'
+import { audit } from '../stores/audit.js'
 
 /**
  * Per-user pin endpoints. Pins are user-owned bookmarks — a pin on a
@@ -48,10 +49,24 @@ export async function pinsRoutes(app: FastifyInstance) {
       if (ok) live.push(p)
     }
     if (live.length !== pins.length) {
-      // Persist the cleanup so subsequent reads are O(1) in dead entries.
+      // Persist the cleanup so subsequent reads are O(1) in dead
+      // entries. Each auto-pruned pin is audited with actor:'system'
+      // + reason:'target-missing' so the owner can trace why a
+      // sidebar pin vanished (file deleted, share revoked, etc).
       for (const p of pins) {
         if (!live.find((q) => q.owner === p.owner && q.storageKey === p.storageKey)) {
           await removePin(user, p.owner, p.storageKey)
+          await audit({
+            actor: 'system',
+            action: 'pin.remove',
+            target: p.storageKey,
+            meta: {
+              owner: p.owner,
+              pinnedBy: user,
+              source: 'auto-cleanup',
+              reason: 'target-missing',
+            },
+          }).catch(() => { /* don't break listing on audit failure */ })
         }
       }
     }
@@ -96,6 +111,12 @@ export async function pinsRoutes(app: FastifyInstance) {
       isFolder,
       label: body.label?.trim() || undefined,
     })
+    await audit({
+      actor: user.username,
+      action: 'pin.add',
+      target: storageKey,
+      meta: { owner, isFolder, label: body.label?.trim() || undefined },
+    })
     return { pins }
   })
 
@@ -104,11 +125,14 @@ export async function pinsRoutes(app: FastifyInstance) {
     const body = req.body as { path?: string; owner?: string }
     if (!body?.path) return reply.code(400).send({ error: 'missing path' })
     const owner = (body.owner ?? req.currentUser.username).trim()
-    const pins = await removePin(
-      req.currentUser.username,
-      owner,
-      body.path.replace(/^\/+|\/+$/g, ''),
-    )
+    const storageKey = body.path.replace(/^\/+|\/+$/g, '')
+    const pins = await removePin(req.currentUser.username, owner, storageKey)
+    await audit({
+      actor: req.currentUser.username,
+      action: 'pin.remove',
+      target: storageKey,
+      meta: { owner },
+    })
     return { pins }
   })
 }

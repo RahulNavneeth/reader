@@ -36,7 +36,21 @@ export type VersionRecord = {
  * timestamped subdir. Called right BEFORE overwriting them with the new
  * ingest output. The ts is the source-of-truth ordering key.
  */
-export async function snapshotVersion(docId: string): Promise<void> {
+export async function snapshotVersion(
+  docId: string,
+  attribution?: {
+    /** Caller context — drives the audit entry's actor/source so
+     *  the Activity panel can attribute the snapshot to who/what
+     *  triggered it. Watcher-driven snapshots set source:'watcher'
+     *  and leave actor null; in-process callers (apply-edit, MCP
+     *  write, etc.) pass their own actor + a source tag. */
+    actor?: string | null
+    source?: 'watcher' | 'reader-ai' | 'mcp' | 'manual'
+    /** Optional cause label folded into audit meta (e.g. the
+     *  parent action that prompted the snapshot). */
+    reason?: string
+  },
+): Promise<void> {
   const docRoot = path.join(config.paths.documents, docId.replace(/[^a-zA-Z0-9_-]/g, '_'))
   const metaPath = path.join(docRoot, 'meta.json')
   const textPath = path.join(docRoot, 'text.txt')
@@ -50,9 +64,13 @@ export async function snapshotVersion(docId: string): Promise<void> {
   // confusing (same content "version" reappearing) and wastes
   // disk. The watcher can fire multiple change events for a
   // single write on some platforms; this is the catch-all.
+  let curSha = ''
+  let curBytes: number | null = null
   try {
     const rawMeta = await readFile(metaPath, 'utf8')
-    const curSha = JSON.parse(rawMeta)?.sha256 ?? ''
+    const parsed = JSON.parse(rawMeta)
+    curSha = parsed?.sha256 ?? ''
+    curBytes = typeof parsed?.bytes === 'number' ? parsed.bytes : null
     if (curSha) {
       const names = await readdir(versionsDir(docId)).catch(() => [])
       const tsList = names.filter((n) => /^\d+$/.test(n)).map(Number).sort((a, b) => b - a)
@@ -74,6 +92,26 @@ export async function snapshotVersion(docId: string): Promise<void> {
   await copyFile(textPath, path.join(dir, 'text.txt')).catch(() => null)
   await copyFile(chunksPath, path.join(dir, 'chunks.jsonl')).catch(() => null)
   await pruneOld(docId)
+
+  // Audit AFTER the snapshot actually landed (and only when the
+  // sha-dedup didn't short-circuit above). Late-import the audit
+  // store so we don't create a load-time cycle between versions.ts
+  // and stores/audit.ts.
+  try {
+    const { audit } = await import('./audit.js')
+    await audit({
+      actor: attribution?.actor ?? null,
+      action: 'version.snapshot',
+      target: docId,
+      meta: {
+        ts,
+        sha256: curSha || undefined,
+        bytes: curBytes ?? undefined,
+        source: attribution?.source ?? 'watcher',
+        reason: attribution?.reason,
+      },
+    })
+  } catch { /* swallow — audit must not break the snapshot path */ }
 }
 
 async function pruneOld(docId: string): Promise<void> {
@@ -85,9 +123,29 @@ async function pruneOld(docId: string): Promise<void> {
   }
   const numeric = names.filter((n) => /^\d+$/.test(n)).map(Number).sort((a, b) => b - a)
   const expired = numeric.slice(MAX_VERSIONS)
+  if (expired.length === 0) return
   for (const ts of expired) {
     await rm(versionDir(docId, ts), { recursive: true, force: true }).catch(() => null)
   }
+  // Audit the prune so a user puzzled by a missing old snapshot in
+  // the Versions rail can trace it to the MAX_VERSIONS cap rather
+  // than wondering if they lost it. Coalesced into a single event
+  // per prune call instead of one per ts to keep the log scannable.
+  try {
+    const { audit } = await import('./audit.js')
+    await audit({
+      actor: 'system',
+      action: 'version.prune',
+      target: docId,
+      meta: {
+        prunedCount: expired.length,
+        prunedTs: expired,
+        keptCount: Math.min(numeric.length, MAX_VERSIONS),
+        cap: MAX_VERSIONS,
+        source: 'auto-cleanup',
+      },
+    })
+  } catch { /* never break the snapshot path on an audit error */ }
 }
 
 export async function listVersions(docId: string): Promise<VersionRecord[]> {
