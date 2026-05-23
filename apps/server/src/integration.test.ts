@@ -2451,6 +2451,184 @@ describe('integration: calendar heatmap', () => {
   })
 })
 
+// ── Email-in HTTP intake ──────────────────────────────────────────
+// POST /api/intake/email lets users wire any incoming-mail webhook
+// (Cloudflare Email Worker / SendGrid Inbound / Mailgun routes) at
+// Reader. Authenticated via the same Bearer-token mechanism MCP
+// uses. Each call creates a markdown doc under Inbox/ with frontmatter.
+describe('integration: email intake', () => {
+  let cookie = ''
+  let bearer = ''
+
+  it('logs in alice + mints an intake token', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+    const mint = await app.inject({
+      method: 'POST',
+      url: '/api/account/tokens',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+      payload: { name: 'email-intake' },
+    })
+    expect(mint.statusCode).toBe(200)
+    bearer = (mint.json() as { secret: string }).secret
+  })
+
+  it('rejects calls without a Bearer token (401)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { 'content-type': 'application/json' },
+      payload: { subject: 'x', body: 'y' },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+
+  it('writes a markdown doc under Inbox/ + audits intake.email', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: {
+        subject: 'Hello world',
+        from: 'alice@example.com',
+        body: 'This is the email body.\n\nWith a second paragraph.',
+        received: new Date(2026, 4, 23, 9, 30, 0).getTime(),
+      },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(body.document.title).toBe('Hello world')
+    expect(body.document.storageKey).toMatch(/^Inbox\/2026-05-23-hello-world\.md$/)
+
+    const { readFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', body.document.storageKey)
+    const text = (await readFile(abs)).toString('utf8')
+    expect(text).toContain('subject: "Hello world"')
+    expect(text).toContain('from: "alice@example.com"')
+    expect(text).toContain('source: email-intake')
+    expect(text).toContain('This is the email body')
+
+    const { listAudit } = await import('./stores/audit.js')
+    const events = await listAudit({ target: body.document.storageKey })
+    const ev = events.find((e) => e.action === 'intake.email')
+    expect(ev?.actor).toBe('alice')
+    expect((ev?.meta as { subject?: string })?.subject).toBe('Hello world')
+  })
+
+  it('handles base64 attachments + links them from the doc', async () => {
+    const att = Buffer.from('attachment content here').toString('base64')
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: {
+        subject: 'With attachment',
+        body: 'See attached.',
+        attachments: [
+          { name: 'note.txt', mime: 'text/plain', content: att },
+        ],
+      },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(body.attachments).toHaveLength(1)
+    expect(body.attachments[0].path).toMatch(/^Inbox\/attachments\/note\.txt$/)
+
+    const { readFile, stat } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const attAbs = path.join(config.vault.root, 'alice', body.attachments[0].path)
+    expect((await stat(attAbs)).size).toBeGreaterThan(0)
+    const docAbs = path.join(config.vault.root, 'alice', body.document.storageKey)
+    const docText = (await readFile(docAbs)).toString('utf8')
+    expect(docText).toContain('## Attachments')
+    expect(docText).toContain('note.txt')
+  })
+
+  it('falls back to html when body is empty', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: { subject: 'HTML only', html: '<p>From HTML</p>' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    const { readFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const abs = path.join(config.vault.root, 'alice', body.document.storageKey)
+    const text = (await readFile(abs)).toString('utf8')
+    expect(text).toContain('From HTML')
+  })
+
+  it('refuses when neither body nor html is provided (400)', async () => {
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: { subject: 'empty' },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toMatch(/body or html/i)
+  })
+
+  it('refuses attachments larger than 20 MB (413)', async () => {
+    // Synthesize a 21 MB base64 blob — well over the cap.
+    const big = Buffer.alloc(21 * 1024 * 1024).toString('base64')
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: {
+        subject: 'too big',
+        body: 'x',
+        attachments: [{ name: 'big.bin', content: big }],
+      },
+    })
+    expect(r.statusCode).toBe(413)
+  })
+
+  it('refuses body bodies larger than 1 MB (413)', async () => {
+    const huge = 'x'.repeat(1_100_000)
+    const r = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: { subject: 'wall of text', body: huge },
+    })
+    expect(r.statusCode).toBe(413)
+  })
+
+  it('uniquifies the filename on subject collision', async () => {
+    // Same subject + same day → second call must NOT clobber the
+    // first; uniquePath appends `-1`.
+    const ts = new Date(2026, 4, 24, 10, 0, 0).getTime()
+    const a = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: { subject: 'Dup subject', body: 'first', received: ts },
+    })
+    const b = await app.inject({
+      method: 'POST',
+      url: '/api/intake/email',
+      headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+      payload: { subject: 'Dup subject', body: 'second', received: ts },
+    })
+    expect(a.statusCode).toBe(200)
+    expect(b.statusCode).toBe(200)
+    const aPath = a.json().document.storageKey
+    const bPath = b.json().document.storageKey
+    expect(aPath).not.toBe(bPath)
+    expect(bPath).toMatch(/-\d+\.md$/)
+  })
+})
+
 describe('integration: security headers', () => {
   it('returns the standard security header bundle on every response', async () => {
     const r = await app.inject({ method: 'GET', url: '/health' })
