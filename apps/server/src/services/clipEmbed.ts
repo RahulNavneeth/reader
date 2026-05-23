@@ -61,10 +61,36 @@ async function loadModel(): Promise<CLIPModel | null> {
     if (env.cacheDir !== undefined) env.cacheDir = config.clip.cacheDir
     if (env.allowLocalModels !== undefined) env.allowLocalModels = true
 
-    const [imagePipe, textPipe] = await Promise.all([
-      tx.pipeline('image-feature-extraction', config.clip.model),
-      tx.pipeline('feature-extraction', config.clip.model),
-    ])
+    // Hand the configured device + dtype to transformers.js.
+    // It tries the requested provider first and surfaces an error
+    // if the binding is missing. We catch that below and rebuild
+    // on CPU so a misconfigured GPU env doesn't sink server boot.
+    // transformers.js types device/dtype as discriminated unions;
+    // cast since our config carries the validated string already.
+    const pipelineOpts = {
+      device: config.clip.device,
+      dtype: config.clip.dtype,
+    } as unknown as Parameters<typeof tx.pipeline>[2]
+    let imagePipe: unknown
+    let textPipe: unknown
+    try {
+      ;[imagePipe, textPipe] = await Promise.all([
+        tx.pipeline('image-feature-extraction', config.clip.model, pipelineOpts),
+        tx.pipeline('feature-extraction', config.clip.model, pipelineOpts),
+      ])
+    } catch (e) {
+      if (config.clip.device !== 'cpu') {
+        console.warn(
+          `[clip] failed to load on device='${config.clip.device}' dtype='${config.clip.dtype}': ${(e as Error).message}. Falling back to CPU.`,
+        )
+        ;[imagePipe, textPipe] = await Promise.all([
+          tx.pipeline('image-feature-extraction', config.clip.model),
+          tx.pipeline('feature-extraction', config.clip.model),
+        ])
+      } else {
+        throw e
+      }
+    }
 
     return {
       async encodeImage(buffer: Buffer): Promise<number[] | null> {

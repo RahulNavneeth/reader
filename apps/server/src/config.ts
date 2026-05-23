@@ -138,6 +138,18 @@ export const config = {
     /** Where the transformers.js cache lands. Stays inside dataDir
      *  so a `rm -rf data` cleanup is sufficient. */
     cacheDir: path.join(dataDir, 'clip-cache'),
+    /** ONNX execution provider. 'cpu' (default) uses onnxruntime-
+     *  node's CPU kernels — works everywhere. 'cuda' requires
+     *  onnxruntime-node-gpu and a matching CUDA runtime; falls
+     *  back to CPU at load time if the provider isn't usable so
+     *  a missing CUDA stack doesn't break startup. 'webgpu' is
+     *  experimental in transformers.js but the cleanest GPU path
+     *  on non-NVIDIA hardware. */
+    device: envStr('CLIP_DEVICE', 'cpu') as 'cpu' | 'cuda' | 'webgpu',
+    /** Quantization. 'fp32' = best quality / heaviest. 'fp16' is
+     *  the GPU sweet spot. 'q8' / 'int8' is CPU-only and pays a
+     *  small accuracy hit for ~3x throughput. */
+    dtype: envStr('CLIP_DTYPE', 'fp32') as 'fp32' | 'fp16' | 'q8' | 'int8',
   },
   ingest: {
     chunkChars: envInt('CHUNK_CHARS', 1800),

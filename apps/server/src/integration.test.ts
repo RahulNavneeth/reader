@@ -2503,7 +2503,10 @@ describe('integration: email intake', () => {
     expect(r.statusCode).toBe(200)
     const body = r.json()
     expect(body.document.title).toBe('Hello world')
-    expect(body.document.storageKey).toMatch(/^Inbox\/2026-05-23-hello-world\.md$/)
+    // The basename uniquifies on collision (`-1`, `-2`, …) so the
+    // suite stays robust to leftover state from other test passes.
+    // The day prefix + slug stay invariant.
+    expect(body.document.storageKey).toMatch(/^Inbox\/2026-05-23-hello-world(-\d+)?\.md$/)
 
     const { readFile } = await import('node:fs/promises')
     const path = await import('node:path')
@@ -2538,7 +2541,7 @@ describe('integration: email intake', () => {
     expect(r.statusCode).toBe(200)
     const body = r.json()
     expect(body.attachments).toHaveLength(1)
-    expect(body.attachments[0].path).toMatch(/^Inbox\/attachments\/note\.txt$/)
+    expect(body.attachments[0].path).toMatch(/^Inbox\/attachments\/note(-\d+)?\.txt$/)
 
     const { readFile, stat } = await import('node:fs/promises')
     const path = await import('node:path')
