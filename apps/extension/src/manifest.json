@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Reader — Capture",
+  "version": "0.1.0",
+  "description": "Capture the current page into your Reader vault.",
+  "action": {
+    "default_title": "Capture into Reader",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  }
+}
