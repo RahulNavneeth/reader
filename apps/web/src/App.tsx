@@ -23,6 +23,7 @@ import { UploadButton } from './components/UploadButton'
 import { PublicResolver } from './components/PublicResolver'
 import { VaultContext } from './lib/vault-context'
 import { useReaderEvents } from './lib/events'
+import { useOnlineStatus } from './hooks/useOnlineStatus'
 
 type AuthState =
   | { status: 'loading' }
@@ -32,6 +33,7 @@ type AuthState =
 
 export default function App() {
   const { theme, toggle } = useTheme()
+  const isOnline = useOnlineStatus()
   const [auth, setAuth] = useState<AuthState>({ status: 'loading' })
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -249,6 +251,26 @@ export default function App() {
       }}
     >
       <div className="h-full flex flex-col surface">
+        {!isOnline && (
+          // Persistent offline banner. The service worker is still
+          // serving cached doc reads (text/meta/raw) and the SPA
+          // shell, so the user can browse cached content — but new
+          // uploads / edits / chat won't reach the server. We keep
+          // the message brief and non-modal: don't block, just warn.
+          <div
+            className="h-7 px-3 flex items-center justify-center gap-2 text-[11.5px] font-medium shrink-0"
+            style={{
+              background: 'var(--danger-bg)',
+              color: 'var(--danger-fg)',
+              borderBottom: '1px solid color-mix(in srgb, var(--danger-fg) 25%, transparent)',
+            }}
+            role="status"
+            aria-live="polite"
+          >
+            <span aria-hidden>●</span>
+            Offline — showing cached content. Edits and new uploads will fail until the server is reachable.
+          </div>
+        )}
         <header
           className="h-12 flex items-center px-3 border-b border-app shrink-0"
           style={{ background: 'var(--panel-2)' }}
