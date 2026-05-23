@@ -2373,6 +2373,84 @@ describe('integration: document templates', () => {
   })
 })
 
+// ── Calendar heatmap ──────────────────────────────────────────────
+// /api/account/calendar aggregates docs per day for a GitHub-style
+// contribution grid. Days with zero docs are omitted so a year's
+// worth of empty cells doesn't bloat the payload.
+describe('integration: calendar heatmap', () => {
+  let cookie = ''
+
+  it('logs in alice + seeds 3 docs across 2 days', async () => {
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      headers: { 'X-Requested-With': 'fetch' },
+      payload: { username: 'alice', password: 'correct-horse-battery' },
+    })
+    expect(login.statusCode).toBe(200)
+    cookie = setCookieValue(login.headers['set-cookie']) ?? ''
+
+    // Bracketed timestamps so we hit two distinct calendar days.
+    const dayA = new Date(2026, 4, 10, 12, 0, 0).getTime()
+    const dayB = new Date(2026, 4, 11, 8, 0, 0).getTime()
+    const ins = db().prepare(
+      `INSERT INTO documents
+         (id, owner, storage_key, title, original_filename, mime, bytes, sha256, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, '', ?, ?)`,
+    )
+    ins.run('cal-a-1', 'alice', 'cal-a-1.md', 'a1', 'cal-a-1.md', 'text/markdown', dayA, dayA)
+    ins.run('cal-a-2', 'alice', 'cal-a-2.md', 'a2', 'cal-a-2.md', 'text/markdown', dayA + 1000, dayA + 1000)
+    ins.run('cal-b-1', 'alice', 'cal-b-1.md', 'b1', 'cal-b-1.md', 'text/markdown', dayB, dayB)
+  })
+
+  it('returns one entry per day with counts (zero-days omitted)', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/account/calendar?from=2026-05-01&to=2026-05-31',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(200)
+    const body = r.json()
+    expect(body.from).toBe('2026-05-01')
+    const dayA = body.days.find((d: { day: string }) => d.day === '2026-05-10')
+    const dayB = body.days.find((d: { day: string }) => d.day === '2026-05-11')
+    expect(dayA?.count).toBe(2)
+    expect(dayB?.count).toBe(1)
+    expect(body.total).toBeGreaterThanOrEqual(3)
+    // Zero-days OMITTED: 2026-05-15 has nothing → no entry.
+    expect(body.days.find((d: { day: string }) => d.day === '2026-05-15')).toBeUndefined()
+  })
+
+  it('rejects from > to (400)', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/account/calendar?from=2026-05-31&to=2026-05-01',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toMatch(/from must be/i)
+  })
+
+  it('rejects > 5-year windows (400)', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/account/calendar?from=2000-01-01&to=2026-05-31',
+      headers: { cookie, 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(400)
+    expect(r.json().error).toMatch(/5 years/i)
+  })
+
+  it('401s without auth', async () => {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/api/account/calendar',
+      headers: { 'X-Requested-With': 'fetch' },
+    })
+    expect(r.statusCode).toBe(401)
+  })
+})
+
 describe('integration: security headers', () => {
   it('returns the standard security header bundle on every response', async () => {
     const r = await app.inject({ method: 'GET', url: '/health' })

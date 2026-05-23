@@ -116,4 +116,76 @@ export async function timelineRoutes(app: FastifyInstance) {
 
     return { days, nextCursor, total: docs.length }
   })
+
+  /**
+   * Calendar heatmap aggregation. Returns one row per day in the
+   * requested window with a count of docs the user created that
+   * day. Suitable for a GitHub-style contribution grid: each cell
+   * gets its color from `count`, click navigates to the timeline
+   * pinned at that day.
+   *
+   *   GET /api/account/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD
+   *
+   * Both bounds inclusive. Missing `to` defaults to today; missing
+   * `from` defaults to one year ago. Days with zero docs are
+   * omitted from the response — let the client fill those in as
+   * blanks; cuts the payload from 365 rows to ~N (where N = days
+   * with activity).
+   */
+  app.get('/api/account/calendar', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const me = req.currentUser.username
+    const q = req.query as { from?: string; to?: string }
+
+    const parseDate = (s?: string): number | null => {
+      if (!s) return null
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s)
+      if (!m) return null
+      const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+      return Number.isNaN(d.getTime()) ? null : d.getTime()
+    }
+
+    const now = new Date()
+    const toMs = parseDate(q.to) ?? new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+    const fromMs =
+      parseDate(q.from) ??
+      new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()).getTime()
+    if (fromMs > toMs) {
+      return reply.code(400).send({ error: 'from must be ≤ to' })
+    }
+    // Upper-bound the window so "from=1970, to=now" can't scan
+    // forever. 5 years is generous for an MVP heatmap.
+    const FIVE_YEARS_MS = 5 * 365 * 24 * 60 * 60 * 1000
+    if (toMs - fromMs > FIVE_YEARS_MS) {
+      return reply.code(400).send({ error: 'window exceeds 5 years' })
+    }
+    // Inclusive bound on the END day: bump to end-of-day so a doc
+    // created at 23:59 of `to` still lands inside.
+    const toEnd = toMs + 24 * 60 * 60 * 1000 - 1
+
+    const docs = await listAllDocuments()
+    const counts = new Map<string, { count: number; lastTs: number }>()
+    for (const d of docs) {
+      if (d.owner !== me) continue
+      if (d.createdAt < fromMs || d.createdAt > toEnd) continue
+      const key = dayKey(d.createdAt)
+      const cur = counts.get(key)
+      if (cur) {
+        cur.count++
+        if (d.createdAt > cur.lastTs) cur.lastTs = d.createdAt
+      } else {
+        counts.set(key, { count: 1, lastTs: d.createdAt })
+      }
+    }
+    const days = Array.from(counts.entries())
+      .map(([day, v]) => ({ day, count: v.count, lastTs: v.lastTs }))
+      .sort((a, b) => (a.day < b.day ? -1 : 1))
+    const total = days.reduce((s, d) => s + d.count, 0)
+    return {
+      from: dayKey(fromMs),
+      to: dayKey(toEnd),
+      total,
+      days,
+    }
+  })
 }
