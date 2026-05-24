@@ -59,6 +59,7 @@ export async function accountRoutes(app: FastifyInstance) {
     const all = await listAllDocuments()
     const mine = all.filter((d) => d.owner === username)
     let ok = 0
+    let embedded = 0
     let failed = 0
     let removed = 0
     const errors: Array<{ id: string; error: string }> = []
@@ -81,8 +82,13 @@ export async function accountRoutes(app: FastifyInstance) {
       try {
         const buffer = await readFile(abs)
         const updated = await ingestDocument(d, buffer)
-        if (updated.ingest.embedded) ok++
-        else failed++
+        // Ingest succeeded if it returned without throwing — the
+        // file was read, chunked, and meta was rewritten. Embedding
+        // is a separate concern: if Ollama is down the doc is still
+        // in a valid state, just without vectors, and re-running
+        // reembed once Ollama recovers will fill them in.
+        ok++
+        if (updated.ingest.embedded) embedded++
       } catch (e: any) {
         if (e?.code === 'ENOENT') {
           await deleteDocument(d.id).catch(() => null)
@@ -97,9 +103,16 @@ export async function accountRoutes(app: FastifyInstance) {
     await audit({
       actor: username,
       action: 'account.reindex',
-      meta: { total: mine.length, ok, removed, failed },
+      meta: { total: mine.length, ok, embedded, removed, failed },
     })
-    return { total: mine.length, ok, removed, failed, errors: errors.slice(0, 10) }
+    return {
+      total: mine.length,
+      ok,
+      embedded,
+      removed,
+      failed,
+      errors: errors.slice(0, 10),
+    }
   })
 
   // ─── API tokens (user-scoped) ───────────────────────────────────────────

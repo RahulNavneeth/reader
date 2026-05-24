@@ -717,6 +717,7 @@ export const api = {
     post<{
       total: number
       ok: number
+      embedded: number
       removed: number
       failed: number
       errors: { id: string; error: string }[]
@@ -901,6 +902,7 @@ export const api = {
     post<{
       total: number
       ok: number
+      embedded: number
       removed: number
       failed: number
       errors: { id: string; error: string }[]

@@ -267,6 +267,7 @@ export async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/reembed-all', async (req) => {
     const docs = await listAllDocuments()
     let ok = 0
+    let embedded = 0
     let failed = 0
     let removed = 0
     const errors: Array<{ id: string; error: string }> = []
@@ -286,8 +287,12 @@ export async function adminRoutes(app: FastifyInstance) {
       try {
         const buffer = await readFile(abs)
         const updated = await ingestDocument(d, buffer)
-        if (updated.ingest.embedded) ok++
-        else failed++
+        // See account.reembed: `ok` = ingest succeeded; `embedded`
+        // is the strict subset where vectors were also written.
+        // Lets the caller distinguish "Ollama is down" from "files
+        // are broken".
+        ok++
+        if (updated.ingest.embedded) embedded++
       } catch (e: any) {
         // Orphan: meta references a file that's no longer on disk (vault moved,
         // file deleted externally, etc.). Drop the stale record so it doesn't
@@ -305,9 +310,16 @@ export async function adminRoutes(app: FastifyInstance) {
     await audit({
       actor: req.currentUser!.username,
       action: 'admin.reindex-all',
-      meta: { total: docs.length, ok, removed, failed },
+      meta: { total: docs.length, ok, embedded, removed, failed },
     })
-    return { total: docs.length, ok, removed, failed, errors: errors.slice(0, 10) }
+    return {
+      total: docs.length,
+      ok,
+      embedded,
+      removed,
+      failed,
+      errors: errors.slice(0, 10),
+    }
   })
 
   // Walk the vault on disk and ingest any file that isn't currently
