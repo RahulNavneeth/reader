@@ -13,10 +13,16 @@ import {
   publicUser,
   saveUser,
 } from '../stores/users.js'
-import { ensureUserVault } from '../lib/userVault.js'
+import { ensureUserVault, resolveUserVault } from '../lib/userVault.js'
 import { createToken, deleteToken, listTokens } from '../stores/tokens.js'
 import { deleteAllSessionsForUser } from '../stores/sessions.js'
 import { loadSettings, saveSettings, RESTART_REQUIRED_KEYS, type WorkspaceSettings } from '../stores/settings.js'
+import {
+  encryptSecret,
+  retryDeadLetter,
+  pingHook,
+  rotateAllSecrets,
+} from '../services/webhooks.js'
 import { hashPassword } from '../services/auth.js'
 import type { Role, User } from '../types.js'
 import { isAvailable as isOllamaAvailable } from '../services/embed.js'
@@ -265,8 +271,19 @@ export async function adminRoutes(app: FastifyInstance) {
     let removed = 0
     const errors: Array<{ id: string; error: string }> = []
     for (const d of docs) {
+      // Files live under <vault_root>/<owner>/<storageKey>. Pre-fix
+      // this joined storageKey directly under the vault root which
+      // 404'd every readFile and the ENOENT branch below then
+      // deleted every doc row — same bug as account.reembed.
+      let abs: string
       try {
-        const abs = path.join(config.vault.root, d.storageKey)
+        abs = resolveUserVault(d.owner, d.storageKey)
+      } catch (e: any) {
+        failed++
+        errors.push({ id: d.id, error: e?.message ?? 'invalid path' })
+        continue
+      }
+      try {
         const buffer = await readFile(abs)
         const updated = await ingestDocument(d, buffer)
         if (updated.ingest.embedded) ok++
@@ -291,6 +308,48 @@ export async function adminRoutes(app: FastifyInstance) {
       meta: { total: docs.length, ok, removed, failed },
     })
     return { total: docs.length, ok, removed, failed, errors: errors.slice(0, 10) }
+  })
+
+  // Walk the vault on disk and ingest any file that isn't currently
+  // in the DB. Recovery action for two scenarios:
+  //   (a) Files dropped into the vault folder externally (Finder /
+  //       rsync / git pull) and the watcher hasn't seen them yet —
+  //       chokidar runs with `ignoreInitial: true` so existing-on-
+  //       boot files are never picked up.
+  //   (b) DB rows were destroyed but disk files survived — e.g. the
+  //       account.reembed bug that mass-deleted rows when paths
+  //       didn't resolve. The actual files are still there;
+  //       reconcile re-indexes them.
+  // Already-indexed files cost just a stat + sha compare (no
+  // ingestion work) so running this on a clean vault is cheap.
+  app.post('/api/admin/reconcile-vault', async (req) => {
+    const { reconcileVault } = await import('../services/watcher.js')
+    const q = req.query as { owner?: string }
+    const ownerOnly = q.owner?.trim() || undefined
+    const r = await reconcileVault(req.log, ownerOnly ? { ownerOnly } : {})
+    invalidateSearchCache()
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.reconcile-vault',
+      meta: { ...r, ownerOnly: ownerOnly ?? null },
+    })
+    return r
+  })
+
+  // Inverse of reconcile: drop SQLite rows that no longer have a
+  // matching file on disk. Catches orphans left by legacy code paths
+  // (the buggy DELETE that didn't drop the row, partial trashing,
+  // etc.) so search + chat-agent retrieval don't surface ghosts.
+  app.post('/api/admin/prune-orphan-docs', async (req) => {
+    const { pruneOrphanedDocs } = await import('../stores/documents.js')
+    const removed = await pruneOrphanedDocs()
+    invalidateSearchCache()
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.prune-orphan-docs',
+      meta: { removed },
+    })
+    return { removed }
   })
 
   app.post('/api/admin/smtp/test', async (req, reply) => {
@@ -683,18 +742,40 @@ export async function adminRoutes(app: FastifyInstance) {
   // Webhook config CRUD. Stored in workspace settings — global, not per-user.
   app.get('/api/admin/webhooks', async () => {
     const s = await loadSettings()
-    return { webhooks: s.webhooks ?? [] }
+    // Strip the encrypted secret so it never leaves the server; the
+    // UI just needs to know whether one is set.
+    const webhooks = (s.webhooks ?? []).map(({ secret, ...rest }) => ({
+      ...rest,
+      hasSecret: !!secret,
+    }))
+    return { webhooks }
   })
 
   app.post('/api/admin/webhooks', async (req, reply) => {
     const body = z
       .object({
         url: z.string().url(),
-        events: z.array(z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility', 'ingest'])).min(1),
-        // Secret is REQUIRED — without it, any third party that
-        // discovers the receiver URL can forge events. Min 16 chars
-        // because HMAC truncation isn't a meaningful attack on shorter
-        // keys but key entropy still matters.
+        events: z.array(z.enum([
+          'upload',
+          'edit',
+          'delete',
+          'trash',
+          'move',
+          'mkdir',
+          'share',
+          'tags',
+          'visibility',
+          'folder-tags',
+          'folder-visibility',
+          'pin',
+          'intake',
+          'template',
+          'export',
+          'ingest',
+        ])).min(1),
+        // Secret is REQUIRED for admin hooks — without it any third
+        // party that discovers the receiver URL can forge events.
+        // Min 16 chars matches the account-side rule.
         secret: z.string().min(16),
         enabled: z.boolean().optional(),
       })
@@ -705,14 +786,15 @@ export async function adminRoutes(app: FastifyInstance) {
       id,
       url: body.url,
       events: body.events,
-      secret: body.secret,
+      secret: encryptSecret(body.secret),
       enabled: body.enabled ?? true,
       createdAt: Date.now(),
     }
     const next = { ...s, webhooks: [...(s.webhooks ?? []), hook] }
     await saveSettings(next)
     await audit({ actor: req.currentUser!.username, action: 'admin.webhook.create', target: id })
-    return reply.code(201).send({ webhook: hook })
+    const { secret: _omit, ...sanitized } = hook
+    return reply.code(201).send({ webhook: { ...sanitized, hasSecret: true } })
   })
 
   app.delete('/api/admin/webhooks/:id', async (req, reply) => {
@@ -723,6 +805,143 @@ export async function adminRoutes(app: FastifyInstance) {
     if (after.length === before.length) return reply.code(404).send({ error: 'not found' })
     await saveSettings({ ...s, webhooks: after })
     await audit({ actor: req.currentUser!.username, action: 'admin.webhook.delete', target: id })
+    return { ok: true }
+  })
+
+  // Edit an existing admin (global) webhook.
+  app.patch('/api/admin/webhooks/:id', async (req, reply) => {
+    const { id } = req.params as { id: string }
+    const body = z
+      .object({
+        url: z.string().url().optional(),
+        events: z
+          .array(z.enum([
+          'upload',
+          'edit',
+          'delete',
+          'trash',
+          'move',
+          'mkdir',
+          'share',
+          'tags',
+          'visibility',
+          'folder-tags',
+          'folder-visibility',
+          'pin',
+          'intake',
+          'template',
+          'export',
+          'ingest',
+        ]))
+          .min(1)
+          .optional(),
+        // Empty string clears (but admin hooks REQUIRE a secret, so
+        // clearing is rejected). 16+ chars on update too.
+        secret: z.string().min(16).max(256).optional(),
+        enabled: z.boolean().optional(),
+      })
+      .parse(req.body)
+    const s = await loadSettings()
+    const hook = (s.webhooks ?? []).find((h) => h.id === id)
+    if (!hook) return reply.code(404).send({ error: 'not found' })
+    const reEnabling = body.enabled === true && hook.enabled === false
+    const next = {
+      ...hook,
+      ...(body.url !== undefined ? { url: body.url } : {}),
+      ...(body.events !== undefined ? { events: body.events } : {}),
+      ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+      ...(body.secret !== undefined ? { secret: encryptSecret(body.secret) } : {}),
+      ...(reEnabling
+        ? { consecutiveFailures: 0, circuitOpenedAt: undefined }
+        : {}),
+    }
+    await saveSettings({
+      ...s,
+      webhooks: (s.webhooks ?? []).map((h) => (h.id === id ? next : h)),
+    })
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.webhook.update',
+      target: id,
+      meta: { changed: Object.keys(body) },
+    })
+    const { secret: _omit, ...sanitized } = next
+    return { webhook: { ...sanitized, hasSecret: !!next.secret } }
+  })
+
+  // Test-ping for admin webhooks.
+  app.post('/api/admin/webhooks/:id/test', async (req, reply) => {
+    const { id } = req.params as { id: string }
+    const s = await loadSettings()
+    const hook = (s.webhooks ?? []).find((h) => h.id === id)
+    if (!hook) return reply.code(404).send({ error: 'not found' })
+    const r = await pingHook(hook)
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.webhook.test',
+      target: id,
+      meta: { status: r.status, ok: r.ok, error: r.error },
+    })
+    return r
+  })
+
+  // Re-attempt a single dead-letter entry. Used by the admin UI to
+  // replay deliveries that exhausted their retry budget the first
+  // time around.
+  /**
+   * Sweep every persisted hook's at-rest secret and re-encrypt it
+   * under the current SESSION_SECRET. Use after rotating the session
+   * secret: set SESSION_SECRET_PREVIOUS to the OLD secret, set
+   * SESSION_SECRET to the NEW one, restart the server, then POST this
+   * endpoint to rewrite every ciphertext. Once it returns failed=0,
+   * SESSION_SECRET_PREVIOUS can be unset on the next restart.
+   */
+  app.post('/api/admin/webhooks/rotate-secrets', async (req) => {
+    const result = await rotateAllSecrets()
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.webhook.rotate-secrets',
+      meta: { ...result, errors: result.errors.length },
+    })
+    return result
+  })
+
+  app.post('/api/admin/webhooks/:id/retry/:entryId', async (req, reply) => {
+    const { id, entryId } = req.params as { id: string; entryId: string }
+    const r = await retryDeadLetter(id, entryId)
+    if (!r.ok && r.error === 'hook not found') return reply.code(404).send(r)
+    if (!r.ok && r.error === 'entry not found') return reply.code(404).send(r)
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.webhook.retry',
+      target: `${id}/${entryId}`,
+      meta: { status: r.status, error: r.error, ok: r.ok },
+    })
+    return r
+  })
+
+  // ─── OAuth clients (admin view) ────────────────────────────────────
+  //
+  // DCR is open by policy so anyone can register a client. These
+  // endpoints let admins audit + delete what's been registered.
+  // Delete cascades through ON DELETE CASCADE FKs to also drop every
+  // auth code, access token, and refresh token owned by the client.
+
+  app.get('/api/admin/oauth-clients', async () => {
+    const { listClientsWithUsage } = await import('../db/oauthRepo.js')
+    return { clients: listClientsWithUsage() }
+  })
+
+  app.delete('/api/admin/oauth-clients/:clientId', async (req, reply) => {
+    const { clientId } = req.params as { clientId: string }
+    const { deleteClient } = await import('../db/oauthRepo.js')
+    const ok = deleteClient(clientId)
+    if (!ok) return reply.code(404).send({ error: 'not found' })
+    await audit({
+      actor: req.currentUser!.username,
+      action: 'admin.oauth.client.delete',
+      target: clientId,
+    })
     return { ok: true }
   })
 

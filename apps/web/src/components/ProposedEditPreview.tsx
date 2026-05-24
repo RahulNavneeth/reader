@@ -107,6 +107,10 @@ export function ProposedEditPreview({
    *  Accept / Reject buttons). Lets the user see WHICH hunk failed
    *  and why, without forcing them to read a banner at the top. */
   const [opErrors, setOpErrors] = useState<Record<number, string>>({})
+  /** Bumped when an apply-op response says the server's pending-edit
+   *  array is now stale (e.g. count shrank since we previewed) so the
+   *  preview re-fetches and renders the actual current truth. */
+  const [localRefreshTick, setLocalRefreshTick] = useState(0)
 
   // Live refs for the callbacks + seedData. The useEffect below
   // intentionally OMITS these from its deps — PathViewer passes
@@ -152,7 +156,7 @@ export function ProposedEditPreview({
     return () => {
       cancelled = true
     }
-  }, [docId, messageId, refreshKey])
+  }, [docId, messageId, refreshKey, localRefreshTick])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -294,11 +298,21 @@ export function ProposedEditPreview({
       onDocChanged?.()
       onOpMutated?.()
     } catch (e) {
-      setOpErrors((cur) => ({
-        ...cur,
-        [opIndex]: e instanceof ApiError ? e.message : String(e),
-      }))
-      onOpMutated?.()
+      const isStale =
+        e instanceof ApiError && (e.body as { code?: string })?.code === 'pending_edits_stale'
+      if (isStale) {
+        // Server's pending-edit array no longer matches what we
+        // previewed — re-fire the preview fetch so we render the
+        // current truth instead of a forever-broken Retry.
+        setLocalRefreshTick((t) => t + 1)
+        onOpMutated?.()
+      } else {
+        setOpErrors((cur) => ({
+          ...cur,
+          [opIndex]: e instanceof ApiError ? e.message : String(e),
+        }))
+        onOpMutated?.()
+      }
     } finally {
       setOpBusy(opIndex, null)
     }

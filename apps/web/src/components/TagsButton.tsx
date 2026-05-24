@@ -161,15 +161,13 @@ export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props)
     }
   }
 
-  const triggerLabel =
-    local.length === 0 ? 'Tags' : local.length === 1 ? local[0] : `${local.length} tags`
-
   return (
     <div ref={rootRef} className="relative inline-flex">
       <button
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
-        title="Edit tags"
+        title={local.length === 0 ? 'Tags' : `Tags: ${local.join(', ')}`}
+        aria-label="Tags"
         aria-expanded={open}
         style={{
           ...(local.length > 0 ? { color: 'var(--accent)' } : null),
@@ -177,7 +175,9 @@ export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props)
         }}
       >
         <Tag size={13} />
-        <span className="truncate max-w-[140px]">{triggerLabel}</span>
+        {local.length > 0 && (
+          <span className="text-[10px] font-semibold tabular-nums">{local.length}</span>
+        )}
       </button>
       {open && (
         <div

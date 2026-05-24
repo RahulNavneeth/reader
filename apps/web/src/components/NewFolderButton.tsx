@@ -185,7 +185,7 @@ export function NewFolderButton({
           onClick={() => setOpen(false)}
         >
           <div
-            className="w-full max-w-[480px] rounded-lg shadow-card overflow-hidden flex flex-col"
+            className="w-full max-w-[480px] rounded-lg shadow-card overflow-hidden flex flex-col outline-none"
             style={{ background: 'var(--panel)' }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -231,8 +231,7 @@ export function NewFolderButton({
 
             {matches.length > 0 && (
               <div
-                className="max-h-[220px] overflow-y-auto py-1 border-b"
-                style={{ borderColor: 'var(--border)' }}
+                className="max-h-[220px] overflow-y-auto py-1"
               >
                 <div className="px-4 pt-1 pb-1 text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
                   Folders

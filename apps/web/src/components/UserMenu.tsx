@@ -1,7 +1,24 @@
 import { useEffect, useRef, useState } from 'react'
-import { LogOut, Shield, User as UserIcon, Settings, Trash2, MapPin, Clock, Layers } from 'lucide-react'
+import {
+  LogOut,
+  Shield,
+  User as UserIcon,
+  Settings,
+  Trash2,
+  MapPin,
+  Clock,
+  Layers,
+  KeyRound,
+  Send,
+  Plug,
+  Download,
+  RefreshCw,
+  Check,
+  AlertCircle,
+  Loader2,
+} from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import type { PublicUser } from '../lib/api'
+import { ApiError, api, type PublicUser } from '../lib/api'
 
 type Props = {
   user: PublicUser
@@ -13,6 +30,35 @@ export function UserMenu({ user, onLogout }: Props) {
   const ref = useRef<HTMLDivElement>(null)
   const navigate = useNavigate()
   const isAdmin = user.role === 'admin'
+  const [reindexing, setReindexing] = useState(false)
+  const [reindexResult, setReindexResult] = useState<{
+    ok: boolean
+    msg: string
+  } | null>(null)
+
+  const runReindex = async () => {
+    if (reindexing) return
+    setReindexing(true)
+    setReindexResult(null)
+    try {
+      const r = await api.accountReembed()
+      const ok = r.failed === 0
+      const parts = [`${r.ok}/${r.total} ok`]
+      if (r.failed > 0) parts.push(`${r.failed} failed`)
+      if (r.removed > 0) parts.push(`${r.removed} stale removed`)
+      setReindexResult({ ok, msg: parts.join(' · ') })
+      // Auto-clear the status after a few seconds so the dropdown
+      // returns to a clean state next time it's opened.
+      setTimeout(() => setReindexResult(null), 5_000)
+    } catch (e) {
+      setReindexResult({
+        ok: false,
+        msg: e instanceof ApiError ? e.message : String(e),
+      })
+    } finally {
+      setReindexing(false)
+    }
+  }
 
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
@@ -45,16 +91,6 @@ export function UserMenu({ user, onLogout }: Props) {
               {user.role}
             </div>
           </div>
-          <button
-            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
-            onClick={() => {
-              setOpen(false)
-              navigate('/account')
-            }}
-          >
-            <UserIcon size={13} className="text-muted" />
-            Account
-          </button>
           <button
             className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
             onClick={() => {
@@ -95,9 +131,75 @@ export function UserMenu({ user, onLogout }: Props) {
             <Trash2 size={13} className="text-muted" />
             Trash
           </button>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors border-t"
+            style={{ borderColor: 'var(--border)' }}
+            onClick={() => {
+              setOpen(false)
+              navigate('/account/tokens')
+            }}
+          >
+            <KeyRound size={13} className="text-muted" />
+            API tokens
+          </button>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+            onClick={() => {
+              setOpen(false)
+              navigate('/account/webhooks')
+            }}
+          >
+            <Send size={13} className="text-muted" />
+            Webhooks
+          </button>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+            onClick={() => {
+              setOpen(false)
+              navigate('/account/connected-apps')
+            }}
+          >
+            <Plug size={13} className="text-muted" />
+            Connected apps
+          </button>
+          <a
+            href={api.exportUrl()}
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors no-underline"
+            onClick={() => setOpen(false)}
+          >
+            <Download size={13} className="text-muted" />
+            Export vault
+          </a>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors disabled:opacity-60"
+            onClick={runReindex}
+            disabled={reindexing}
+          >
+            {reindexing ? (
+              <Loader2 size={13} className="text-muted animate-spin" />
+            ) : reindexResult?.ok ? (
+              <Check size={13} className="text-accent" />
+            ) : reindexResult ? (
+              <AlertCircle size={13} style={{ color: '#BF2600' }} />
+            ) : (
+              <RefreshCw size={13} className="text-muted" />
+            )}
+            <span className="flex-1">
+              {reindexing ? 'Re-indexing…' : 'Re-index my files'}
+            </span>
+          </button>
+          {reindexResult && !reindexing && (
+            <div
+              className="px-3 pb-2 text-[11px]"
+              style={{ color: reindexResult.ok ? 'var(--fg-subtle)' : '#BF2600' }}
+            >
+              {reindexResult.msg}
+            </div>
+          )}
           {isAdmin && (
             <button
-              className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+              className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors border-t"
+              style={{ borderColor: 'var(--border)' }}
               onClick={() => {
                 setOpen(false)
                 navigate('/settings')
@@ -108,7 +210,8 @@ export function UserMenu({ user, onLogout }: Props) {
             </button>
           )}
           <button
-            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors border-t"
+            style={{ borderColor: 'var(--border)' }}
             onClick={() => {
               setOpen(false)
               onLogout()
@@ -122,3 +225,4 @@ export function UserMenu({ user, onLogout }: Props) {
     </div>
   )
 }
+

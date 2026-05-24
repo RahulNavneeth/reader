@@ -129,11 +129,11 @@ export function BulkTagsButton({ paths }: { paths: string[] }) {
         disabled={paths.length === 0}
         onClick={() => setOpen((v) => !v)}
         title={`Tag ${paths.length} item${paths.length === 1 ? '' : 's'}`}
+        aria-label="Tag selected"
         aria-expanded={open}
         style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
       >
         <Tag size={13} />
-        Tags
       </button>
       {open && (
         <div

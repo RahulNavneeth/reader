@@ -81,8 +81,27 @@ export type WebhookConfig = {
   id: string
   url: string
   /** Bitmask of events the hook subscribes to. */
-  events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
-  /** Optional shared secret — sent as `X-Reader-Signature` (HMAC-SHA256 hex). */
+  events: Array<
+    | 'upload'
+    | 'edit'
+    | 'delete'
+    | 'trash'
+    | 'move'
+    | 'mkdir'
+    | 'share'
+    | 'tags'
+    | 'visibility'
+    | 'folder-tags'
+    | 'folder-visibility'
+    | 'pin'
+    | 'intake'
+    | 'template'
+    | 'export'
+    | 'ingest'
+  >
+  /** Shared secret in encrypted form (AES-256-GCM, prefixed `enc:v1:`).
+   *  Legacy hooks written before encryption shipped may still hold
+   *  plaintext — the dispatcher's `decryptSecret` handles both. */
   secret?: string
   enabled?: boolean
   createdAt: number
@@ -91,6 +110,40 @@ export type WebhookConfig = {
    *  the hook for events on that user's files (event.actor === owner).
    *  Legacy hooks without an owner fire for every event. */
   owner?: string
+  /** Persisted failures after all retry attempts were exhausted. The
+   *  admin UI can replay these one-by-one (`POST /api/admin/webhooks/
+   *  :id/retry/:entryId`). Capped at 50 entries per hook. */
+  deadLetter?: Array<{
+    id: string
+    ts: number
+    /** The original WebhookEvent payload that failed. */
+    event: unknown
+    lastStatus: number | null
+    lastError?: string
+  }>
+  /** Circuit-breaker bookkeeping. After N consecutive failed
+   *  deliveries we flip `enabled` to false and stamp
+   *  `circuitOpenedAt` so the UI can explain WHY the hook is off.
+   *  Resets to 0 on any successful delivery (including a
+   *  test-ping or DLQ retry). */
+  consecutiveFailures?: number
+  circuitOpenedAt?: number
+  /** Ring buffer of the most-recent delivery attempts (success +
+   *  failure). The UI surfaces this so receivers can confirm "yes,
+   *  my hook fired three times in the last hour" without needing
+   *  log access on the receiving side. Capped at 20 entries — older
+   *  attempts roll off. */
+  recentDeliveries?: Array<{
+    ts: number
+    /** HTTP status or null if the request never landed (timeout, DNS, etc.) */
+    status: number | null
+    /** undefined on success, message string on failure */
+    error?: string
+    /** Event type that fired (for the UI's per-event filter). */
+    eventType: string
+    /** "test" for synthetic pings, "retry" for DLQ replays, "dispatch" otherwise. */
+    kind: 'dispatch' | 'retry' | 'test'
+  }>
 }
 
 const FILE = config.paths.settings

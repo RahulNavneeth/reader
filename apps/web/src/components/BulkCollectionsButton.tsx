@@ -140,11 +140,11 @@ export function BulkCollectionsButton({ paths }: { paths: string[] }) {
         disabled={paths.length === 0}
         onClick={() => setOpen((v) => !v)}
         title={`Add ${paths.length} file${paths.length === 1 ? '' : 's'} to a collection`}
+        aria-label="Add to collection"
         aria-expanded={open}
         style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
       >
         <Layers size={13} />
-        Collections
       </button>
       {open && (
         <div

@@ -46,11 +46,11 @@ export function ActivityButton({
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
         title="Activity"
+        aria-label="Activity"
         aria-expanded={open}
         style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
       >
         <History size={13} />
-        Activity
       </button>
       {open && (
         <div

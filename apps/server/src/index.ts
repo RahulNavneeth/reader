@@ -2,6 +2,7 @@ import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
+import formbody from '@fastify/formbody'
 import fastifyStatic from '@fastify/static'
 import path from 'node:path'
 import { config } from './config.js'
@@ -12,10 +13,11 @@ import authPlugin from './plugins/auth.js'
 import errorPlugin from './plugins/error.js'
 import { healthRoutes } from './routes/health.js'
 import { authRoutes } from './routes/auth.js'
-import { vaultRoutes } from './routes/vault.js'
+import { vaultRoutes, serveVaultFileBytes } from './routes/vault.js'
 import { searchRoutes } from './routes/search.js'
 import { adminRoutes } from './routes/admin.js'
 import { mcpRoutes } from './routes/mcp.js'
+import { oauthRoutes } from './routes/oauth.js'
 import { eventsRoutes } from './routes/events.js'
 import { viewsRoutes } from './routes/views.js'
 import { templatesRoutes } from './routes/templates.js'
@@ -48,6 +50,88 @@ export type BuildAppOptions = {
   skipBackground?: boolean
   /** Disable Pino logging — keeps test output clean. */
   silent?: boolean
+}
+
+/**
+ * Reserved URL prefixes that must NOT be treated as vault paths even
+ * when no route matched. These are app/admin/asset namespaces — never
+ * vault files. Kept in sync with the React Router's RESERVED list +
+ * the API/MCP/OAuth route surface.
+ */
+const RESERVED_URL_PREFIXES = [
+  '/api/',
+  '/mcp',
+  '/oauth/',
+  '/.well-known/',
+  '/health',
+  '/assets/',
+  '/icons/',
+  '/sw.js',
+  '/manifest.webmanifest',
+  '/favicon',
+  '/settings',
+  '/account/',
+  '/trash',
+  '/map',
+  '/timeline',
+  '/collections',
+  '/c/',
+  '/pc/',
+  '/library/',
+  '/tags/',
+  '/login',
+]
+
+/**
+ * Attempt to serve a vault file's bytes for the bare-path URL form
+ * `GET /<path>`. Returns true if a response was sent.
+ *
+ *   - Browser navigations (Accept includes text/html) are skipped so
+ *     they land on the SPA viewer instead of a raw download.
+ *   - Reserved prefixes (API, app routes, static assets) skip too.
+ *   - All other GETs are tried as vault paths. Access checks honour
+ *     public/shared/owned just like /api/file/raw.
+ *
+ * Caller (`setNotFoundHandler`) falls back to SPA / 404 when this
+ * returns false.
+ */
+async function tryServeBarePath(
+  req: import('fastify').FastifyRequest,
+  reply: import('fastify').FastifyReply,
+): Promise<boolean> {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false
+  const accept = String(req.headers.accept ?? '')
+  if (accept.includes('text/html')) return false
+  const url = req.url.split('?')[0]
+  if (!url || url === '/') return false
+  for (const p of RESERVED_URL_PREFIXES) {
+    if (url === p || url.startsWith(p)) return false
+  }
+  let rel: string
+  try {
+    rel = decodeURIComponent(url.replace(/^\/+/, ''))
+  } catch {
+    return false
+  }
+  // Disallow path traversal up-front; serveVaultFileBytes also guards
+  // but a quick reject keeps the per-request audit log cleaner.
+  if (!rel || rel.includes('..')) return false
+  const q = (req.query as Record<string, string | undefined>) ?? {}
+  const publicPassword = typeof q.p === 'string' ? q.p : undefined
+  const ownerHint = typeof q.owner === 'string' ? q.owner : undefined
+  try {
+    await serveVaultFileBytes(req.server, req, reply, {
+      rel,
+      publicPassword,
+      ownerHint,
+    })
+  } catch {
+    // The helper may have started setting headers before throwing.
+    // Either way we treat as "did not produce a usable response" and
+    // let the caller decide what to do.
+    return reply.sent
+  }
+  return true
 }
 
 /**
@@ -97,6 +181,15 @@ export async function buildApp(opts: BuildAppOptions = {}) {
     secret: config.session.secret,
     parseOptions: {},
   })
+
+  // application/x-www-form-urlencoded body parser. Required for the
+  // OAuth /token endpoint (RFC 6749 §3.2 mandates form-encoded), and
+  // the only reason real MCP clients (Claude Code, Cursor, Inspector)
+  // can complete the OAuth flow at all — without this plugin, Fastify
+  // returns 415 Unsupported Media Type before our handler even sees
+  // the request, which is why integration tests passing JSON didn't
+  // surface this gap.
+  await app.register(formbody)
 
   // CORS — in production, only the configured origin(s) are allowed
   // with credentials. ALLOWED_ORIGINS is a comma-separated list. In
@@ -242,6 +335,7 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await app.register(searchRoutes)
   await app.register(adminRoutes)
   await app.register(mcpRoutes)
+  await app.register(oauthRoutes)
   await app.register(eventsRoutes)
   await app.register(viewsRoutes)
   await app.register(userSharesRoutes)
@@ -278,12 +372,20 @@ export async function buildApp(opts: BuildAppOptions = {}) {
       if (req.url.startsWith('/api') || req.url.startsWith('/mcp') || req.url === '/health') {
         return reply.code(404).send({ error: `not found: ${req.method} ${req.url}` })
       }
+      // Try byte-serve for non-browser GETs on bare vault paths so
+      // agents (curl, MCP, etc.) can fetch the file directly from its
+      // human-readable URL instead of /api/file/raw?path=…. Browsers
+      // navigating to the same URL still get the SPA viewer.
+      if (await tryServeBarePath(req, reply)) return
       return reply.sendFile('index.html', webRoot)
     })
     app.log.info({ webDir: webRoot }, 'serving web bundle')
   } else {
-    // API-only build: plain JSON 404 for unmatched routes.
-    app.setNotFoundHandler((req, reply) => {
+    // API-only build: plain JSON 404 for unmatched routes. Still try
+    // the bare-path byte-serve first so dev callers (e.g. cloudflared
+    // → :3001) can fetch vault files by their bare URL.
+    app.setNotFoundHandler(async (req, reply) => {
+      if (await tryServeBarePath(req, reply)) return
       reply.code(404).send({ error: `not found: ${req.method} ${req.url}` })
     })
   }
@@ -307,6 +409,61 @@ export async function buildApp(opts: BuildAppOptions = {}) {
         .catch((err) => app.log.warn({ err }, 'trash sweep failed'))
     runTrashSweep()
     setInterval(runTrashSweep, 60 * 60 * 1000).unref()
+
+    // Orphan-doc sweep — drop SQLite rows that no longer have a
+    // matching file on disk. Historically the web UI's DELETE path
+    // moved files to trash without dropping the index row, so search
+    // / list_documents / chat-agent retrieval kept returning ghosts.
+    // The DELETE path is now fixed (drops the row inline) but we
+    // still run this at boot to clean up rows left from the buggy
+    // era. Hourly to also catch anything that slips past the inline
+    // cleanup (e.g. a future code path that bypasses it).
+    const runOrphanDocsSweep = async () => {
+      try {
+        const { pruneOrphanedDocs } = await import('./stores/documents.js')
+        const n = await pruneOrphanedDocs()
+        if (n > 0) app.log.info({ removed: n }, 'orphan-doc sweep')
+      } catch (err) {
+        app.log.warn({ err }, 'orphan-doc sweep failed')
+      }
+    }
+    runOrphanDocsSweep()
+    setInterval(runOrphanDocsSweep, 60 * 60 * 1000).unref()
+
+    // Audit log retention — drop shards older than 180 days so the
+    // audit dir doesn't grow unboundedly on long-running deployments.
+    // 180d is generous for forensic look-back without being a real
+    // disk-usage concern (a typical day is well under a MB).
+    const runAuditSweep = async () => {
+      try {
+        const { pruneAuditOlderThan } = await import('./stores/audit.js')
+        const n = await pruneAuditOlderThan(180)
+        if (n > 0) app.log.info({ shards: n }, 'audit retention sweep')
+      } catch (err) {
+        app.log.warn({ err }, 'audit retention sweep failed')
+      }
+    }
+    runAuditSweep()
+    setInterval(runAuditSweep, 24 * 60 * 60 * 1000).unref()
+
+    // OAuth client GC — DCR is open by policy so any third-party app
+    // can register; without this, the oauth_clients table grows
+    // forever. We delete clients that:
+    //   - were registered >30 days ago, AND
+    //   - have zero live access tokens, AND
+    //   - have zero live refresh tokens.
+    // FK cascades take care of orphan codes/tokens just in case.
+    const runOauthClientGc = async () => {
+      try {
+        const { pruneStaleClients } = await import('./db/oauthRepo.js')
+        const n = pruneStaleClients(30 * 24 * 60 * 60 * 1000)
+        if (n > 0) app.log.info({ clients: n }, 'oauth client gc')
+      } catch (err) {
+        app.log.warn({ err }, 'oauth client gc failed')
+      }
+    }
+    runOauthClientGc()
+    setInterval(runOauthClientGc, 24 * 60 * 60 * 1000).unref()
 
     // Auto-flip expired public links to private — file metas + folder
     // metas both. Runs at boot and every minute so an owner who looks

@@ -116,7 +116,10 @@ export function CollectionDetailPage() {
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden surface">
+    <div
+      className="flex-1 flex flex-col overflow-hidden"
+      style={{ background: 'var(--rail)' }}
+    >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
         style={{ background: 'var(--panel-2)' }}
@@ -207,10 +210,10 @@ export function CollectionDetailPage() {
             className="btn-ghost"
             onClick={deleteCollection}
             title="Delete collection"
+            aria-label="Delete collection"
             style={{ color: '#BF2600' }}
           >
             <Trash2 size={13} />
-            Delete
           </button>
         )}
       </header>
@@ -230,7 +233,7 @@ export function CollectionDetailPage() {
           <div className="h-full flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
             >
               <Layers size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No items yet</div>

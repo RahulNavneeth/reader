@@ -104,10 +104,10 @@ export function CollectionShareButton({
     }
   }
 
-  const triggerLabel = useMemo(() => {
-    if (shares.length === 0) return 'Share'
-    if (shares.length === 1) return `Shared · ${shares[0].recipient}`
-    return `Shared · ${shares.length}`
+  const tooltip = useMemo(() => {
+    if (shares.length === 0) return 'Share with another user'
+    if (shares.length === 1) return `Shared with ${shares[0].recipient}`
+    return `Shared with ${shares.length} users`
   }, [shares])
 
   return (
@@ -115,7 +115,8 @@ export function CollectionShareButton({
       <button
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
-        title="Share with another user"
+        title={tooltip}
+        aria-label="Share collection"
         aria-expanded={open}
         style={{
           ...(shares.length > 0 ? { color: 'var(--accent)' } : null),
@@ -123,7 +124,9 @@ export function CollectionShareButton({
         }}
       >
         <Users size={13} />
-        <span className="truncate max-w-[160px]">{triggerLabel}</span>
+        {shares.length > 1 && (
+          <span className="text-[10px] font-semibold tabular-nums">{shares.length}</span>
+        )}
       </button>
       {open && (
         <div

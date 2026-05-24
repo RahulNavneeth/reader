@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { readdir, readFile } from 'node:fs/promises'
+import { readdir, readFile, unlink } from 'node:fs/promises'
 import { config } from '../config.js'
 import { appendLine } from '../lib/fs.js'
 import type { AuditEvent } from '../types.js'
@@ -14,6 +14,49 @@ function dailyFile(d = new Date()): string {
 export async function audit(ev: Omit<AuditEvent, 'ts'>): Promise<void> {
   const event: AuditEvent = { ts: Date.now(), ...ev }
   await appendLine(dailyFile(), JSON.stringify(event))
+}
+
+/**
+ * Drop daily audit shards older than `retentionDays`. The store
+ * partitions by UTC day so retention is just "delete files whose
+ * date prefix is too old" — no need to parse or rewrite anything.
+ * Returns the number of shards deleted (for logging).
+ *
+ * 180 days is the default in index.ts — long enough for any
+ * realistic forensic look-back, bounded so the file count stays
+ * predictable on long-running deployments.
+ */
+export async function pruneAuditOlderThan(retentionDays: number): Promise<number> {
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+  // Compare lexically against ISO-style YYYY-MM-DD prefixes. That
+  // sort order matches chronological order for this format.
+  const y = cutoff.getUTCFullYear()
+  const m = String(cutoff.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(cutoff.getUTCDate()).padStart(2, '0')
+  const cutoffKey = `${y}-${m}-${d}`
+  let files: string[]
+  try {
+    files = await readdir(config.paths.audit)
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return 0
+    throw e
+  }
+  let n = 0
+  for (const name of files) {
+    if (!name.endsWith('.jsonl')) continue
+    // Filename is `<YYYY-MM-DD>.jsonl`. Anything strictly less than
+    // the cutoff key is older than the retention window.
+    const key = name.slice(0, 10)
+    if (key < cutoffKey) {
+      try {
+        await unlink(path.join(config.paths.audit, name))
+        n += 1
+      } catch {
+        /* swallow — next sweep will retry */
+      }
+    }
+  }
+  return n
 }
 
 /**

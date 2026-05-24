@@ -4,6 +4,7 @@ import { resolveUserVault } from '../lib/userVault.js'
 import { addPin, listPins, removePin } from '../stores/pins.js'
 import { findShareForPath } from '../stores/userShares.js'
 import { audit } from '../stores/audit.js'
+import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 
 /**
  * Per-user pin endpoints. Pins are user-owned bookmarks — a pin on a
@@ -117,6 +118,15 @@ export async function pinsRoutes(app: FastifyInstance) {
       target: storageKey,
       meta: { owner, isFolder, label: body.label?.trim() || undefined },
     })
+    // Fire as the file's OWNER so a per-user subscription on the
+    // owner's hook sees the pin even when a share-recipient pinned it.
+    dispatchWebhook({
+      type: 'pin',
+      path: storageKey,
+      actor: owner,
+      pinned: true,
+      isFolder,
+    }).catch(() => null)
     return { pins }
   })
 
@@ -133,6 +143,16 @@ export async function pinsRoutes(app: FastifyInstance) {
       target: storageKey,
       meta: { owner },
     })
+    dispatchWebhook({
+      type: 'pin',
+      path: storageKey,
+      actor: owner,
+      pinned: false,
+      // We don't carry the file/folder flag on remove (no stat at
+      // this point), so report a sensible default; receivers can
+      // re-check from their mirror if it matters.
+      isFolder: false,
+    }).catch(() => null)
     return { pins }
   })
 }

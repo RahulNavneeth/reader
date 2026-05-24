@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, Clock, AlertCircle, Play, FileText } from 'lucide-react'
+import { ArrowLeft, Clock, AlertCircle, Play, FileText, ArrowUp } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+import { CalendarHeatmap } from './CalendarHeatmap'
 
 type DayGroup = Awaited<ReturnType<typeof api.accountTimeline>>['days'][number]
 
@@ -19,6 +20,10 @@ export function TimelinePage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState(false)
+  /** Shown once the user has scrolled past a couple viewports —
+   *  jumping back to today is one click instead of a long flick. */
+  const [showScrollTop, setShowScrollTop] = useState(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
 
   // Merge incoming days into the existing list, deduping by both
   // day key and per-item docId. Originally we only checked the seam
@@ -81,6 +86,15 @@ export function TimelinePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Show/hide the "back to top" button based on scroll position.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const onScroll = () => setShowScrollTop(el.scrollTop > 400)
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [])
+
   // Infinite scroll sentinel.
   const sentinelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -104,7 +118,10 @@ export function TimelinePage() {
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden surface">
+    <div
+      className="flex-1 flex flex-col overflow-hidden relative"
+      style={{ background: 'var(--rail)' }}
+    >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
         style={{ background: 'var(--panel-2)' }}
@@ -125,10 +142,10 @@ export function TimelinePage() {
         )}
       </header>
 
-      <div className="flex-1 overflow-y-auto px-6 py-6">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6">
         {error && (
           <div
-            className="mb-4 px-3 py-2 rounded text-[12.5px] inline-flex items-center gap-2"
+            className="mb-4 px-3 py-2 rounded text-[12.5px] inline-flex items-center gap-2 max-w-[1080px] mx-auto"
             style={{ background: '#FFEBE6', color: '#BF2600' }}
           >
             <AlertCircle size={13} /> {error}
@@ -139,7 +156,7 @@ export function TimelinePage() {
           <div className="h-full flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
             >
               <Clock size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No documents yet</div>
@@ -151,8 +168,24 @@ export function TimelinePage() {
         )}
 
         <div className="max-w-[1080px] mx-auto space-y-6">
+          {/* Heatmap renders inline with day sections — same max
+              width, same px offset, no card chrome — so it reads
+              as the first item in the timeline list rather than a
+              separate panel sitting above it. Hidden when there's
+              nothing to summarise: an empty 365-cell grid in an
+              otherwise blank page is pure visual noise. */}
+          {days.length > 0 && (
+            <CalendarHeatmap
+              onDayClick={(day) => {
+                const el = document.querySelector(`[data-day="${day}"]`)
+                if (el) {
+                  el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                }
+              }}
+            />
+          )}
           {days.map((g) => (
-            <section key={g.day}>
+            <section key={g.day} data-day={g.day}>
               <div className="px-1 mb-2 text-[12px] uppercase tracking-wider font-semibold text-subtle">
                 {formatDay(g.day)}
                 <span className="ml-1.5 normal-case font-normal">
@@ -181,9 +214,13 @@ export function TimelinePage() {
                       // Non-media doc — no thumbnail to show; render a
                       // generic file tile with truncated filename so the
                       // grid stays visually uniform alongside media tiles.
+                      // Uses --viewer so the tile stays white in light
+                      // mode (pops against the --rail canvas) but keeps
+                      // its panel-tint in dark mode (where pure --bg
+                      // would be the deepest base and read as a hole).
                       <div
                         className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-2"
-                        style={{ background: 'var(--panel)' }}
+                        style={{ background: 'var(--viewer)' }}
                       >
                         <FileText size={28} className="text-subtle" strokeWidth={1.4} />
                         <div className="text-[11px] text-fg text-center leading-tight line-clamp-3 break-all">
@@ -232,6 +269,27 @@ export function TimelinePage() {
           {!done && <div ref={sentinelRef} className="h-12" aria-hidden />}
         </div>
       </div>
+      {/* Back to top — appears after the user has scrolled a bit.
+          Smooth-scrolls the timeline pane (not window) since the
+          scroll container is the inner div. */}
+      {showScrollTop && (
+        <button
+          type="button"
+          onClick={() =>
+            scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+          }
+          className="absolute bottom-5 right-5 h-9 w-9 rounded-full shadow-card inline-flex items-center justify-center transition-opacity hover:opacity-90"
+          style={{
+            background: 'var(--accent)',
+            color: 'white',
+            border: '1px solid var(--accent)',
+          }}
+          title="Back to top"
+          aria-label="Back to top"
+        >
+          <ArrowUp size={16} />
+        </button>
+      )}
     </div>
   )
 }

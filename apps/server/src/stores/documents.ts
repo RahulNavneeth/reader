@@ -267,6 +267,47 @@ export async function listAllDocuments(): Promise<DocumentMeta[]> {
   return docsRepo.listAll()
 }
 
+/**
+ * Drop SQLite rows that no longer correspond to a file on disk. Fixes
+ * the long-standing gap where the web UI's `DELETE /api/file` moved a
+ * file to trash but kept the index row alive — so search / list /
+ * chat-agent retrieval kept returning hits for files the user had
+ * already deleted.
+ *
+ * Use cases:
+ *   - Boot-time housekeeping (one-shot sweep on startup so a fresh
+ *     server doesn't surface ghosts left by a previous version).
+ *   - Manual cleanup via the admin reconcile endpoint.
+ *   - After any code path that bypassed the orphan cleanup (legacy
+ *     callers, partial cleanup paths, etc.).
+ *
+ * Returns the number of rows removed. Cheap on small vaults; for
+ * large vaults it's bounded by `stat()` calls per row.
+ */
+export async function pruneOrphanedDocs(): Promise<number> {
+  const { stat } = await import('node:fs/promises')
+  const { resolveUserVault } = await import('../lib/userVault.js')
+  const docs = await listAllDocuments()
+  let removed = 0
+  for (const d of docs) {
+    let abs: string
+    try {
+      abs = resolveUserVault(d.owner, d.storageKey)
+    } catch {
+      // Bad storageKey — can't resolve, definitely orphan.
+      await deleteDocument(d.id).catch(() => null)
+      removed += 1
+      continue
+    }
+    const exists = await stat(abs).then((s) => s.isFile()).catch(() => false)
+    if (!exists) {
+      await deleteDocument(d.id).catch(() => null)
+      removed += 1
+    }
+  }
+  return removed
+}
+
 export function userCanRead(meta: DocumentMeta, username: string, role: string): boolean {
   if (role === 'admin') return true
   if (meta.owner === username) return true

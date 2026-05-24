@@ -127,6 +127,13 @@ export default defineConfig({
   server: {
     port: 5174,
     strictPort: false,
+    // Dev only: accept Host headers from ANY origin. Vite 5 added a
+    // host allowlist that blocks tunnel hosts (trycloudflare,
+    // ngrok-free.app, etc.) by default with 403 "Blocked request".
+    // We're already behind a separate auth layer + this only runs in
+    // `npm run dev`, never in production, so disabling the allowlist
+    // is the right tradeoff for local tunneling.
+    allowedHosts: true,
     proxy: {
       '/api': {
         target: `http://localhost:${SERVER_PORT}`,
@@ -135,6 +142,73 @@ export default defineConfig({
       '/mcp': {
         target: `http://localhost:${SERVER_PORT}`,
         changeOrigin: true,
+      },
+      // OAuth endpoints + RFC 8414 / 9728 discovery docs. These MUST
+      // hit the backend; the SPA only owns /oauth/consent.
+      '/oauth/register': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+      },
+      '/oauth/authorize': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+      },
+      '/oauth/authorize/decide': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+      },
+      '/oauth/consent-context': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+      },
+      '/oauth/token': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+      },
+      '/oauth/revoke': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+      },
+      '/.well-known': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+      },
+      // Catch-all for bare vault-path requests. In prod the backend
+      // serves these via setNotFoundHandler's tryServeBarePath; in
+      // dev we need Vite to forward them so `<img src="/photo.jpg">`,
+      // `<video src="/clip.mp4">`, and `fetch('/notes/foo.md')` work.
+      //
+      // bypass() rules:
+      //   - Vite internals (HMR, /src/, /node_modules/, /@vite/, etc.)
+      //     stay on Vite — they don't have a backend counterpart.
+      //   - Top-level browser navigations (Accept: text/html) stay on
+      //     Vite so the SPA viewer renders, NOT the raw bytes.
+      //   - Everything else forwards to the backend.
+      //
+      // Keep this LAST so the more specific proxy keys above match first.
+      '/': {
+        target: `http://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+        bypass(req) {
+          const url = req.url || '/'
+          if (url === '/') return url
+          if (
+            url.startsWith('/@') ||
+            url.startsWith('/src/') ||
+            url.startsWith('/node_modules/') ||
+            url.startsWith('/__vite_') ||
+            url.startsWith('/icons/') ||
+            url.startsWith('/assets/') ||
+            url === '/favicon.ico' ||
+            url === '/manifest.webmanifest' ||
+            url === '/sw.js'
+          ) {
+            return url
+          }
+          const accept = String(req.headers.accept ?? '')
+          if (accept.includes('text/html')) return url
+          // undefined → forward to backend
+        },
       },
     },
   },

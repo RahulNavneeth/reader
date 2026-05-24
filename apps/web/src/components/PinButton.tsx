@@ -65,6 +65,7 @@ export function PinButton({ path, owner, isFolder, onChanged }: Props) {
       className="btn-ghost"
       onClick={toggle}
       title={pinned ? 'Unpin' : 'Pin to sidebar'}
+      aria-label={pinned ? 'Unpin' : 'Pin to sidebar'}
       disabled={pinned == null}
       style={
         pinned
@@ -77,7 +78,6 @@ export function PinButton({ path, owner, isFolder, onChanged }: Props) {
         fill={pinned ? 'currentColor' : 'none'}
         strokeWidth={1.8}
       />
-      {pinned ? 'Pinned' : 'Pin'}
     </button>
   )
 }

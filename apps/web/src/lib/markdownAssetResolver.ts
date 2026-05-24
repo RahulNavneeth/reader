@@ -111,7 +111,10 @@ export function resolveImageSrc(
   const rel = resolveRelative(parentDir, src)
   // Strip a fragment if any — meaningless for an image.
   const cleanRel = rel.split('#')[0]
-  const url = `/api/file/raw?path=${encodeVaultPath(cleanRel)}`
+  // Bare path — see api.rawUrl for the rationale. The backend's
+  // setNotFoundHandler routes non-text/html GETs through the same
+  // file-bytes pipeline as /api/file/raw.
+  const url = '/' + encodeVaultPath(cleanRel)
   return appendCaller(url, callerOpts)
 }
 

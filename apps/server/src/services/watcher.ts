@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 import chokidar, { type FSWatcher } from 'chokidar'
 import { nanoid } from 'nanoid'
@@ -65,7 +65,7 @@ function isSupported(rel: string): boolean {
   return SUPPORTED_EXTS.has(ext)
 }
 
-async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<void> {
+export async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<void> {
   // Derive the owner from the path's leading username segment. Loose files
   // sitting directly under the shared root (no owner segment) are ignored —
   // they're either marker files or pre-migration leftovers.
@@ -137,6 +137,37 @@ async function reingestPath(absPath: string, log: FastifyBaseLogger): Promise<vo
     target: rel,
     meta: { source: 'watcher', bytes: buffer.length },
   })
+  // Outbound webhook. Audit attributes to "system" (we don't know
+  // who saved the file on disk), but for webhook routing we use the
+  // file's `owner` so per-user subscriptions still get notified when
+  // their own files change.
+  //
+  // Skip the dispatch if an in-app writer (chat apply-edit, MCP edit
+  // op) registered this exact sha as an expected write — they
+  // already fired the webhook themselves and we don't want
+  // subscribers to see two events for one user action.
+  const { dispatch: dispatchWebhook, consumeExpectedWrite } = await import(
+    './webhooks.js'
+  )
+  const dedup = consumeExpectedWrite(absPath, sha)
+  if (existing) {
+    if (!dedup) {
+      dispatchWebhook({
+        type: 'edit',
+        path: rel,
+        actor: owner,
+        bytes: buffer.length,
+        source: 'watcher',
+      }).catch(() => null)
+    }
+  } else if (!dedup) {
+    dispatchWebhook({
+      type: 'upload',
+      path: rel,
+      actor: owner,
+      bytes: buffer.length,
+    }).catch(() => null)
+  }
   try {
     await ingestDocument(meta, buffer)
     log.info({ rel }, 'watcher: re-ingested')
@@ -201,4 +232,86 @@ export async function stopVaultWatcher(): Promise<void> {
 /** Restart the watcher; call after the vault-root setting changes. */
 export function restartVaultWatcher(log: FastifyBaseLogger): void {
   startVaultWatcher(log).catch((err) => log.warn({ err }, 'vault watcher restart failed'))
+}
+
+/**
+ * One-shot full reconcile: walk the vault root, find every supported
+ * file on disk, and re-ingest anything the documents table doesn't
+ * have. Mirrors what `ignoreInitial: false` would do at watcher boot
+ * but as an explicit user action — useful for recovering from
+ * external file drops (Finder, rsync, git clone) or recovering after
+ * a buggy bulk-delete (the previous `/api/account/reembed` path bug
+ * that nuked rows for files still on disk).
+ *
+ * Optionally scoped to a single owner so an admin can reconcile one
+ * user's vault without scanning everyone's tree.
+ */
+export async function reconcileVault(
+  log: FastifyBaseLogger,
+  opts: { ownerOnly?: string } = {},
+): Promise<{ scanned: number; ingested: number; updated: number; skipped: number }> {
+  const root = config.vault.root
+  const counts = { scanned: 0, ingested: 0, updated: 0, skipped: 0 }
+
+  // Pre-snapshot the documents table so we can detect new-on-disk
+  // files vs. already-indexed without a per-file SQL hit.
+  const existing = new Map<string, DocumentMeta>()
+  for (const d of await listAllDocuments()) {
+    existing.set(`${d.owner}::${d.storageKey}`, d)
+  }
+
+  // Walk top-level user folders. The vault root holds one directory
+  // per username; loose files under root aren't owned by anyone and
+  // are ignored (matches `ownerFromAbs` semantics).
+  let topEntries: import('node:fs').Dirent[]
+  try {
+    topEntries = await readdir(root, { withFileTypes: true })
+  } catch {
+    return counts
+  }
+
+  const walk = async (
+    dir: string,
+    owner: string,
+  ): Promise<void> => {
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue
+      const abs = path.join(dir, e.name)
+      if (e.isDirectory()) {
+        await walk(abs, owner)
+        continue
+      }
+      if (!e.isFile()) continue
+      const rel = path.relative(path.join(root, owner), abs)
+      if (!isSupported(rel)) continue
+      counts.scanned++
+      const key = `${owner}::${rel}`
+      const hadRow = existing.has(key)
+      try {
+        // reingestPath is a no-op when on-disk sha matches stored sha,
+        // so already-indexed files cost just a stat + read + sha
+        // compare. Missing rows get a fresh ingest.
+        await reingestPath(abs, log)
+        if (hadRow) counts.updated++
+        else counts.ingested++
+      } catch (err) {
+        log.warn({ err, rel }, 'reconcile: ingest failed')
+        counts.skipped++
+      }
+    }
+  }
+
+  for (const top of topEntries) {
+    if (!top.isDirectory()) continue
+    if (top.name.startsWith('.')) continue
+    if (opts.ownerOnly && top.name !== opts.ownerOnly) continue
+    await walk(path.join(root, top.name), top.name)
+  }
+  return counts
 }

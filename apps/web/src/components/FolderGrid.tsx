@@ -329,7 +329,7 @@ export function FolderGrid({
   }
 
   return (
-    <div ref={rootRef} className="h-full flex flex-col" style={{ background: 'var(--bg)' }}>
+    <div ref={rootRef} className="h-full flex flex-col" style={{ background: 'var(--rail)' }}>
       <div
         data-grid-toolbar=""
         className="flex items-center gap-2 px-3 min-h-11 py-1.5 border-b shrink-0 flex-wrap"
@@ -389,13 +389,17 @@ export function FolderGrid({
                 ? 'Clear selection'
                 : `Select all ${items.length} item${items.length === 1 ? '' : 's'}`
             }
+            aria-label={
+              selection.size === items.length
+                ? 'Clear selection'
+                : 'Select all'
+            }
           >
             {selection.size === items.length ? (
               <CheckSquare size={13} className="text-accent" />
             ) : (
               <Square size={13} />
             )}
-            {selection.size === items.length ? 'Selected' : 'Select all'}
           </button>
         )}
         {selection.size > 0 && showEditControls ? (
@@ -432,9 +436,14 @@ export function FolderGrid({
                     className="btn-ghost"
                     disabled={!!busy}
                     title={`Publish ${privateTargets.length} private item${privateTargets.length === 1 ? '' : 's'}`}
+                    aria-label="Publish selected"
                   >
                     <Lock size={13} />
-                    Private ({privateTargets.length})
+                    {privateTargets.length > 1 && (
+                      <span className="text-[10px] font-semibold tabular-nums">
+                        {privateTargets.length}
+                      </span>
+                    )}
                   </button>
                 }
               />
@@ -483,13 +492,18 @@ export function FolderGrid({
                   }
                 }}
                 title={`Pin ${pinTargets.length} item${pinTargets.length === 1 ? '' : 's'}`}
+                aria-label="Pin selected"
               >
                 {busy === 'pin' ? (
                   <Loader2 size={13} className="animate-spin" />
                 ) : (
                   <Star size={13} />
                 )}
-                Pin ({pinTargets.length})
+                {pinTargets.length > 1 && (
+                  <span className="text-[10px] font-semibold tabular-nums">
+                    {pinTargets.length}
+                  </span>
+                )}
               </button>
             )}
             {unpinTargets.length > 0 && (
@@ -513,6 +527,7 @@ export function FolderGrid({
                   }
                 }}
                 title={`Unpin ${unpinTargets.length} item${unpinTargets.length === 1 ? '' : 's'}`}
+                aria-label="Unpin selected"
                 style={{ color: 'var(--accent)', background: 'var(--selected)' }}
               >
                 {busy === 'unpin' ? (
@@ -520,7 +535,11 @@ export function FolderGrid({
                 ) : (
                   <Star size={13} fill="currentColor" strokeWidth={1.6} />
                 )}
-                Unpin ({unpinTargets.length})
+                {unpinTargets.length > 1 && (
+                  <span className="text-[10px] font-semibold tabular-nums">
+                    {unpinTargets.length}
+                  </span>
+                )}
               </button>
             )}
             <button
@@ -528,10 +547,10 @@ export function FolderGrid({
               disabled={!!busy}
               onClick={runBulkDelete}
               title="Move to Trash"
+              aria-label="Move to Trash"
               style={{ color: '#BF2600' }}
             >
               {busy === 'delete' ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
-              Delete
             </button>
             <button
               className="btn-ghost h-7 w-7 px-0"
@@ -612,9 +631,14 @@ export function FolderGrid({
                       <button
                         className="btn-ghost"
                         title={`Publish ${folderSummary.priv} private item${folderSummary.priv === 1 ? '' : 's'}`}
+                        aria-label="Publish folder"
                       >
                         <Lock size={13} />
-                        Private ({folderSummary.priv})
+                        {folderSummary.priv > 1 && (
+                          <span className="text-[10px] font-semibold tabular-nums">
+                            {folderSummary.priv}
+                          </span>
+                        )}
                       </button>
                     }
                   />

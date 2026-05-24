@@ -99,9 +99,15 @@ export function outline(text: string): SectionRef[] {
 
 /** Find the first section whose heading text matches exactly. */
 export function findSection(text: string, heading: string): SectionRef | null {
-  const target = heading.trim()
+  // Whitespace-tolerant match: collapse runs of whitespace + trim,
+  // both sides. Forgives agents and humans that submit "Section  A"
+  // (double space) or stray newlines while still rejecting genuine
+  // typos in the heading text. Matches the chat agent's pre-check
+  // semantics so MCP `replace_section` + the chat dock agree.
+  const norm = (s: string) => s.replace(/\s+/g, ' ').trim()
+  const target = norm(heading)
   for (const s of outline(text)) {
-    if (s.heading === target) return s
+    if (norm(s.heading) === target) return s
   }
   return null
 }

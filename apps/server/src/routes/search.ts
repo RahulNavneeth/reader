@@ -50,10 +50,15 @@ export async function searchRoutes(app: FastifyInstance) {
   // user can read; the source doc itself is always excluded.
   app.get<{ Params: { docId: string } }>('/api/search/similar/:docId', async (req, reply) => {
     const user = req.currentUser!
-    const limit = Math.min(50, Number((req.query as { limit?: string }).limit ?? 10))
+    const q = req.query as { limit?: string; path?: string }
+    const limit = Math.min(50, Number(q.limit ?? 10))
     try {
       const hits = await findSimilarDocs({
         docId: req.params.docId,
+        // `path` is a fallback hint sent by the viewer so a stale
+        // docId (e.g. after the file was re-ingested under a new id)
+        // can be resolved by storageKey instead of failing.
+        pathHint: q.path?.trim() || undefined,
         user: { username: user.username, role: user.role },
         limit,
       })

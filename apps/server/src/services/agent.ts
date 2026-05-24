@@ -57,7 +57,13 @@ import type { ChatMessage, ProposedEditOp } from '../db/chatRepo.js'
  *  6 wasn't enough headroom for them to finish, hence 12. The
  *  prompt nudges the model to finalize with answer() as iterations
  *  approach the cap (see lastChanceNote). */
-const MAX_ITER = 12
+// 20 iterations covers multi-section workflows (e.g. "update all
+// gold mentions across the document") that need list_sections +
+// N×read_section + N×propose_edit + answer. 12 was tight enough that
+// the agent would burn the budget on reads before committing to any
+// propose_edit calls. Each iteration is bounded by NUM_PREDICT
+// tokens so total wall time is still capped by the 5-min stream cap.
+const MAX_ITER = 20
 
 /** Per-iteration generation cap. Higher than legacy 1536 because
  *  some iterations produce a small text + a tool_call payload and
@@ -113,6 +119,16 @@ export type AgentInput = {
    *  is included verbatim in the system prompt so the agent can
    *  cite them even when RAG didn't surface them on its own. */
   attachedDocs?: Array<{ title: string; path: string; text: string }>
+  /** Semantically-retrieved older turns from THIS thread that fell
+   *  outside the recent-window budget but are similar to the current
+   *  query. Injected as a separate system note so the model can
+   *  reference what was discussed long ago without us having to
+   *  re-send the entire transcript. Empty / undefined disables. */
+  relevantPast?: Array<{
+    role: 'user' | 'assistant'
+    content: string
+    createdAt: number
+  }>
 }
 
 /** Public entry point. The route consumes this generator and forwards
@@ -125,18 +141,54 @@ export async function* runAgent(
     return
   }
 
-  const tools = buildToolCatalog()
+  // Tool surface is mime-aware: markdown docs get section-oriented
+  // tools, non-markdown (CSV/JSON/YAML/txt) get the full-text /
+  // rewrite_file path. Mixing them confuses the model on either side
+  // — a 27B will happily call `get_full_text` then `rewrite_file` on
+  // a 5K-line markdown doc when a surgical `replace_section` would
+  // suffice, blowing the iteration budget.
+  const isMarkdown =
+    /markdown|mdx/i.test(input.anchor.mime ?? '') ||
+    /\.(md|markdown|mdx)$/i.test(input.anchor.storageKey)
+  const tools = buildToolCatalog({ isMarkdown })
   const sectionHeadings = outline(input.docText).map((s) => s.heading)
-  const systemPrompt = buildSystemPrompt(input.anchor, sectionHeadings, input.attachedDocs ?? [])
+  const systemPrompt = buildSystemPrompt(input.anchor, sectionHeadings, input.attachedDocs ?? [], isMarkdown)
 
   const messages: OllamaMessage[] = [
     { role: 'system', content: systemPrompt },
   ]
-  // Recent conversation history for follow-up coherence. We trim
-  // to the last 4 turns — agent loops re-establish doc context on
-  // their own via tool calls, so long history matters less here
-  // than it does in the legacy single-shot path.
-  for (const m of input.history.slice(-4)) {
+  // Conversation continuity. Old code trimmed to the last 4 turns
+  // flat; this loses thread context once a conversation gets long.
+  // Hybrid policy:
+  //   1. Token-budget the recent window so the prompt fits comfortably
+  //      regardless of how long the last message is.
+  //   2. Anything that falls outside the window gets compressed into
+  //      a one-line bullet summary so the model can still reference
+  //      "you asked about X earlier" without us re-sending the full
+  //      text.
+  const { inWindow, summary } = packHistory(input.history)
+  if (summary) {
+    messages.push({ role: 'system', content: summary })
+  }
+  // Semantically-retrieved older turns. Render as a compact
+  // mini-transcript so the model can quote/refer to it. Skip
+  // entirely when the route didn't supply any (Ollama down, fresh
+  // thread, all relevant turns already in the recent window, etc.).
+  if (input.relevantPast && input.relevantPast.length > 0) {
+    const rendered = input.relevantPast
+      .map((m) => {
+        const label = m.role === 'user' ? 'User' : 'Assistant'
+        const flat = m.content.replace(/\s+/g, ' ').trim()
+        const clipped = flat.length > 600 ? flat.slice(0, 600) + '…' : flat
+        return `${label}: ${clipped}`
+      })
+      .join('\n\n')
+    messages.push({
+      role: 'system',
+      content: `Possibly relevant earlier turns from this same thread (similarity match, may or may not be useful):\n\n${rendered}`,
+    })
+  }
+  for (const m of inWindow) {
     messages.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })
   }
   messages.push({ role: 'user', content: input.query })
@@ -144,6 +196,12 @@ export async function* runAgent(
   // Collected proposed_edit ops — the route persists these on the
   // assistant turn at the end.
   const proposedEdits: ProposedEditOp[] = []
+  // Tally of read-side tool calls (list_sections / read_section /
+  // search_doc / get_full_text). Surfaced in the fallback message
+  // so a user who hit the iteration cap sees what the agent DID do
+  // ("I read 4 sections but ran out…") instead of a flat "couldn't
+  // finish". A bigger / more honest signal than the canned message.
+  let readToolCalls = 0
   let finalAnswer: string | null = null
   /** Most recent non-empty assistantContent the model emitted
    *  alongside tool_calls. Used as a graceful fallback if we hit
@@ -153,18 +211,35 @@ export async function* runAgent(
   let lastThinking: string | null = null
 
   for (let iter = 0; iter < MAX_ITER; iter++) {
-    // Last-chance nudge: 3 iterations before the cap, inject a
-    // system-role reminder that the model should be wrapping up.
-    // Without this, larger models (qwen3 27B etc.) tend to keep
-    // gathering sources past the budget and we end up firing the
-    // "could not finish" fallback even on questions that have
-    // plenty of context already.
+    // Two-stage nudge — large models (qwen3 27B etc.) often keep
+    // gathering sources past the budget. Mid-loop we remind them they
+    // can BATCH propose_edits (multiple tool_calls in one assistant
+    // turn); near the end we force a finalize. Without these nudges
+    // multi-section workflows fall off the cliff at MAX_ITER without
+    // ever calling propose_edit.
+    if (iter === Math.floor(MAX_ITER / 2)) {
+      messages.push({
+        role: 'system',
+        content:
+          "You're halfway through your iteration budget. If the user asked you to edit multiple sections, STOP reading and start proposing. You can emit MULTIPLE propose_edit tool_calls in a single assistant turn — one per section. Don't read every section before committing; read the next one, propose its edit, then move on.",
+      })
+    }
     if (iter === MAX_ITER - 3) {
       messages.push({
         role: 'system',
-        content: 'You are approaching the iteration budget. Finalize your answer with answer({text: "..."}) on this or the next turn — you have enough context already. Do not call any more search/read tools unless absolutely critical.',
+        content:
+          "You are approaching the iteration budget. STOP exploring. If you have pending edits to propose, emit them NOW (batched if multiple). Then call answer({text: '...'}). If you have nothing to propose, call answer with whatever partial result you have. Do NOT call any more search/read tools.",
       })
     }
+    // Tool-result context editing. The previous iteration's tool
+    // payloads pile up across iterations — by iter 5 we may be
+    // re-sending ~10k tokens of tool output the model already
+    // distilled into its next tool_call. Mirrors Anthropic's
+    // `clear_tool_uses_20250919` strategy: keep the tool *call*
+    // (so the model sees what it asked for) but replace older tool
+    // *result* payloads with a short placeholder. The most recent
+    // iteration's results stay verbatim so the model can chain.
+    pruneStaleToolResults(messages)
     let assistantContent = ''
     let toolCalls: OllamaToolCall[] = []
     try {
@@ -217,6 +292,17 @@ export async function* runAgent(
       const id = `${iter}.${ti}`
       yield { kind: 'tool_call_start', id, name: tc.function.name, args: tc.function.arguments }
       const result = await dispatchTool(tc, input, proposedEdits)
+      // Count read-side calls so the fallback message can be honest
+      // about what the agent did before hitting the iteration cap.
+      if (
+        tc.function.name === 'list_sections' ||
+        tc.function.name === 'read_section' ||
+        tc.function.name === 'search_doc' ||
+        tc.function.name === 'search_vault' ||
+        tc.function.name === 'get_full_text'
+      ) {
+        readToolCalls += 1
+      }
       yield { kind: 'tool_call_result', id, ok: result.ok, summary: result.summary }
       messages.push({
         role: 'tool',
@@ -254,9 +340,16 @@ export async function* runAgent(
       // one-line "I will now…" preambles that aren't really
       // answers.
       finalAnswer = lastThinking
+    } else if (readToolCalls > 0) {
+      // Agent did real exploration but never reached propose_edit
+      // or answer. Be honest about it — the user can decide whether
+      // to retry with a narrower ask or accept the partial result.
+      finalAnswer =
+        `I explored ${readToolCalls} section${readToolCalls === 1 ? '' : 's'} but ran out of iterations before proposing an edit. ` +
+        `Try a more targeted ask (e.g. naming the specific section) or break the change into smaller steps.`
     } else {
       finalAnswer =
-        'I could not finish the reasoning loop in time. Try a simpler question or break it into steps.'
+        "I couldn't make progress on this. Try rephrasing — naming a specific section or quoting the passage to change usually helps."
     }
     for (const chunk of chunkForStreaming(finalAnswer)) {
       yield { kind: 'token', token: chunk }
@@ -264,6 +357,126 @@ export async function* runAgent(
   }
 
   yield { kind: 'done', answer: finalAnswer, proposedEdits }
+}
+
+// ── History packing ──────────────────────────────────────────────
+// Each Ollama request is stateless; the model has no memory between
+// calls. We rebuild the chat context every turn. To keep prompts
+// affordable yet preserve thread continuity, we split the history
+// into a recent token-budgeted window (sent verbatim as turns) plus
+// an older bucket we compress into a single one-line-per-turn
+// summary that rides as a system note.
+
+/** Cheap LLM-agnostic token estimate. Real BPE is ~3–5 chars/token
+ *  for English; 4 is a safe overestimate for budget gating. */
+function approxTokens(s: string): number {
+  return Math.ceil(s.length / 4)
+}
+
+/** How many tokens of recent turns to send verbatim. ~3000 tokens
+ *  ≈ 12k chars of conversation history — enough room for a ~20-turn
+ *  active thread without crowding the doc context the agent's tools
+ *  fetch on top. */
+const HISTORY_WINDOW_TOKENS = 3_000
+
+/** How many tokens the older-history summary may consume. Hard cap
+ *  so a 100-turn-old thread can't slowly blow up the prompt. */
+const HISTORY_SUMMARY_TOKENS = 400
+
+export function packHistory(
+  history: Pick<ChatMessage, 'role' | 'content'>[],
+): {
+  inWindow: Pick<ChatMessage, 'role' | 'content'>[]
+  summary: string | null
+} {
+  if (history.length === 0) return { inWindow: [], summary: null }
+  // Walk newest → oldest, accumulating until the budget is spent.
+  // Always include at least the last turn even if it's huge — losing
+  // the most recent exchange entirely would defeat the purpose.
+  let used = 0
+  const inWindowReversed: Pick<ChatMessage, 'role' | 'content'>[] = []
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i]
+    const t = approxTokens(m.content)
+    if (inWindowReversed.length > 0 && used + t > HISTORY_WINDOW_TOKENS) break
+    used += t
+    inWindowReversed.push(m)
+  }
+  const inWindow = inWindowReversed.reverse()
+  const older = history.slice(0, history.length - inWindow.length)
+  const summary = summariseOlderHistory(older)
+  return { inWindow, summary }
+}
+
+/** Extractive one-line-per-turn condensation. Bullet format keeps it
+ *  scannable by the model and by humans reading prompts in logs.
+ *  We cap each bullet at ~120 chars and the whole block at
+ *  HISTORY_SUMMARY_TOKENS, dropping oldest first if we go over. */
+function summariseOlderHistory(
+  msgs: Pick<ChatMessage, 'role' | 'content'>[],
+): string | null {
+  if (msgs.length === 0) return null
+  const PER_BULLET_CHARS = 120
+  const toBullet = (m: Pick<ChatMessage, 'role' | 'content'>): string => {
+    const flat = m.content.replace(/\s+/g, ' ').trim()
+    const clipped =
+      flat.length > PER_BULLET_CHARS ? flat.slice(0, PER_BULLET_CHARS) + '…' : flat
+    const label = m.role === 'user' ? 'User' : 'You'
+    return `• ${label}: ${clipped}`
+  }
+  let bullets = msgs.map(toBullet)
+  const render = (truncated: boolean) =>
+    (truncated ? 'Earlier in this conversation (older turns truncated):' : 'Earlier in this conversation:') +
+    '\n' +
+    bullets.join('\n')
+  let truncated = false
+  while (approxTokens(render(truncated)) > HISTORY_SUMMARY_TOKENS && bullets.length > 1) {
+    bullets.shift()
+    truncated = true
+  }
+  return render(truncated)
+}
+
+// ── Tool-result pruning ─────────────────────────────────────────
+// Across agent iterations we accumulate `tool` messages whose
+// `content` is the full JSON-stringified payload of every tool
+// dispatch. By iter N that array can hold many KB of section text,
+// search hits, and outline dumps that the model has already used
+// to decide its next move. We keep recent results verbatim and
+// replace older payloads with a one-line placeholder so the model
+// still sees the call chain but doesn't pay tokens for stale data.
+//
+// Constants picked to leave room for: the system prompt + recent
+// conversation window + one fresh batch of tool calls + the answer.
+// On Ollama context windows (typically 8k for default qwen builds)
+// this leaves ~5k tokens free for the model.
+const TOOL_RESULT_BUDGET_TOKENS = 2_500
+const TOOL_RESULT_KEEP_TAIL = 4 // never prune the last N tool messages
+
+export function pruneStaleToolResults(messages: OllamaMessage[]): void {
+  // Find tool-role indices in order. The protected tail is the
+  // most recent TOOL_RESULT_KEEP_TAIL messages — those almost
+  // certainly drove the upcoming iteration's reasoning.
+  const toolIdxs: number[] = []
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'tool') toolIdxs.push(i)
+  }
+  if (toolIdxs.length <= TOOL_RESULT_KEEP_TAIL) return
+  const prunableIdxs = toolIdxs.slice(0, toolIdxs.length - TOOL_RESULT_KEEP_TAIL)
+
+  // Sum bytes across ALL tool messages first; only prune if the
+  // total exceeds the budget. Below threshold, leave the agent's
+  // working memory intact.
+  const totalChars = toolIdxs.reduce((n, i) => n + messages[i].content.length, 0)
+  if (totalChars / 4 < TOOL_RESULT_BUDGET_TOKENS) return
+
+  for (const i of prunableIdxs) {
+    const m = messages[i]
+    if (m.content.startsWith('[result cleared')) continue // already pruned
+    const name = m.tool_name ?? 'tool'
+    const sizeKb = (m.content.length / 1024).toFixed(1)
+    m.content = `[result cleared — ${name} returned ${sizeKb} KB, already used in subsequent reasoning]`
+  }
 }
 
 /** Default user-visible message when the agent terminates with one
@@ -290,6 +503,7 @@ function buildSystemPrompt(
   anchor: DocumentMeta,
   sectionHeadings: string[],
   attachedDocs: Array<{ title: string; path: string; text: string }>,
+  isMarkdown = true,
 ): string {
   // Deliberately compact. The agent doesn't need 60 lines of rules
   // when the tools enforce structure on their own.
@@ -313,18 +527,43 @@ function buildSystemPrompt(
         .join('\n\n')
     + '\n\n(The user @-mentioned these additional documents — treat them as authoritative reference material. You can quote and cite them in answer() by title.)'
     : ''
-  return [
-    `You are Reader AI, a document-grounded assistant for the document titled "${anchor.title}".`,
-    ``,
-    `Decide what to do next by calling one of the available tools.`,
-    `Tools available:`,
+  // Two prompt variants — keeps each one tight so a 27B model isn't
+  // tempted to pick a tool that's hidden from its catalog anyway.
+  const mdTools = [
     `  • list_sections — get the document's outline (headings + levels).`,
     `  • read_section — read the full body text of a specific heading.`,
     `  • search_doc — semantic search inside this document for a topic.`,
     `  • search_vault — semantic search across the user's other documents.`,
     `  • propose_edit — propose a structured edit to the document (does not apply; the user reviews and clicks Apply).`,
     `  • answer — deliver the final answer to the user. Always call this once you have enough information.`,
-    ``,
+  ]
+  const nonMdTools = [
+    `  • get_full_text — return the full file content. This document is non-markdown so there are no sections to read individually.`,
+    `  • search_doc — semantic search inside this document for a topic.`,
+    `  • search_vault — semantic search across the user's other documents.`,
+    `  • propose_edit — propose a rewrite of the file (does not apply; the user reviews and clicks Apply). Only the rewrite_file op is valid.`,
+    `  • answer — deliver the final answer to the user. Always call this once you have enough information.`,
+  ]
+  const mdHowTo = [
+    `How to work:`,
+    `  1. If the question is general (about the doc or vault), call list_sections or search_doc first to ground yourself.`,
+    `  2. If the question quotes a passage and asks to rephrase/rewrite/edit, look up the section that contains it via search_doc, then call propose_edit with op="replace_section" and the matched heading.`,
+    `  3. Multi-section edits ("update all X to Y", "do this in every section that mentions Z"): for each affected section, call read_section then immediately call propose_edit for that section. You can emit MULTIPLE propose_edit calls in a SINGLE assistant turn (one tool_calls array with multiple entries) — prefer this over interleaving reads + edits. Don't try to read every section before proposing any edits.`,
+    `  4. Cite sections by their heading text in your answer.`,
+    `  5. ALWAYS call answer({text: "..."}) exactly once as your LAST step. Every conversation ends with answer — even after propose_edit, you must follow up with answer in the same turn or a follow-up turn. The text is rendered verbatim to the user — do NOT include meta-commentary, tool-call traces, JSON, or your own internal reasoning.`,
+    `  6. After propose_edit, your answer can simply say what you proposed (e.g. "Proposed a tightened version of the Risks section.") — keep it brief; the diff card carries the actual content.`,
+    `  7. If you cannot answer from the document, call answer with the text "That isn't in the document."`,
+    `  8. If the question is off-topic (greetings, unrelated facts), call answer with a brief refusal.`,
+  ]
+  const nonMdHowTo = [
+    `How to work:`,
+    `  1. Call get_full_text ONCE to read the full file content.`,
+    `  2. If the user asks to edit (update/replace/transform/filter rows/etc.), construct the COMPLETE modified file in your head, then call propose_edit({op:"rewrite_file", content:<full new content>}). Do NOT call propose_edit before get_full_text.`,
+    `  3. For analytical questions (count/summary/lookup), reason over the text from get_full_text and call answer with the result.`,
+    `  4. ALWAYS call answer({text: "..."}) exactly once as your LAST step.`,
+    `  5. After propose_edit, your answer can simply say what you proposed (e.g. "Rewrote the file to update team values from platform to rahul.").`,
+  ]
+  const mdQuoted = [
     `IMPORTANT — Reply-popover format:`,
     `  When the user's message starts with a blockquoted line in this exact shape:`,
     `      > "<some text copied from the document>"`,
@@ -336,14 +575,25 @@ function buildSystemPrompt(
     `    3. If the instruction is "remove this / delete this / drop this", call read_section to get the current body, then call propose_edit with op="replace_section" and the same heading, with content = the body with the quoted line(s) removed.`,
     `    4. If the instruction is "explain / what does this mean", just call answer with a plain-English explanation of the quoted passage. Do NOT propose an edit.`,
     ``,
-    `How to work:`,
-    `  1. If the question is general (about the doc or vault), call list_sections or search_doc first to ground yourself.`,
-    `  2. If the question quotes a passage and asks to rephrase/rewrite/edit, look up the section that contains it via search_doc, then call propose_edit with op="replace_section" and the matched heading.`,
-    `  3. Cite sections by their heading text in your answer.`,
-    `  4. ALWAYS call answer({text: "..."}) exactly once as your LAST step. Every conversation ends with answer — even after propose_edit, you must follow up with answer in the same turn or a follow-up turn. The text is rendered verbatim to the user — do NOT include meta-commentary, tool-call traces, JSON, or your own internal reasoning.`,
-    `  5. After propose_edit, your answer can simply say what you proposed (e.g. "Proposed a tightened version of the Risks section.") — keep it brief; the diff card carries the actual content.`,
-    `  6. If you cannot answer from the document, call answer with the text "That isn't in the document."`,
-    `  7. If the question is off-topic (greetings, unrelated facts), call answer with a brief refusal.`,
+  ]
+  const nonMdQuoted = [
+    `IMPORTANT — Reply-popover format:`,
+    `  When the user's message starts with a blockquoted line in this exact shape:`,
+    `      > "<some text>"`,
+    ``,
+    `      <user's instruction>`,
+    `  ...the quoted text is what the user is pointing at inside the file. Use get_full_text to read the file, locate the quoted region, then construct a rewrite_file edit that applies the user's instruction to that region while keeping the rest of the file unchanged.`,
+    ``,
+  ]
+  return [
+    `You are Reader AI, a document-grounded assistant for the document titled "${anchor.title}" (mime: ${anchor.mime || 'unknown'}).`,
+    ``,
+    `Decide what to do next by calling one of the available tools.`,
+    `Tools available:`,
+    ...(isMarkdown ? mdTools : nonMdTools),
+    ``,
+    ...(isMarkdown ? mdQuoted : nonMdQuoted),
+    ...(isMarkdown ? mdHowTo : nonMdHowTo),
     headingsHint,
     attachedBlock,
   ].join('\n')
@@ -351,7 +601,57 @@ function buildSystemPrompt(
 
 // ── Tool catalog ───────────────────────────────────────────────
 
-function buildToolCatalog(): OllamaTool[] {
+/**
+ * Mime-aware tool surface. Markdown docs get section-oriented tools
+ * (list_sections / read_section / section ops); non-markdown docs
+ * get full-text + rewrite_file. We deliberately HIDE the unused set
+ * for each kind so the model isn't tempted to take the wrong path:
+ *   - a 27B model handed both `get_full_text` and `read_section` on a
+ *     long markdown doc will often fetch the whole text and then try
+ *     to `rewrite_file` it (blowing the iteration budget) when the
+ *     surgical answer was a single `replace_section`.
+ *   - conversely, exposing `read_section` on a CSV is meaningless and
+ *     the model wastes turns calling it before realising.
+ */
+function buildToolCatalog(opts: { isMarkdown: boolean }): OllamaTool[] {
+  const all = buildAllTools()
+  if (opts.isMarkdown) {
+    // Hide non-markdown writers/readers.
+    return all.filter((t) => {
+      const name = t.function.name
+      if (name === 'get_full_text') return false
+      return true
+    })
+  }
+  // Non-markdown: hide list_sections/read_section (no headings) and
+  // drop the section ops from propose_edit's enum via a swap below.
+  return all
+    .filter((t) => t.function.name !== 'list_sections' && t.function.name !== 'read_section')
+    .map((t) => {
+      if (t.function.name !== 'propose_edit') return t
+      // Re-author propose_edit so its enum advertises ONLY
+      // rewrite_file. Section ops on a CSV / JSON / YAML would fail
+      // validation anyway; hiding them prevents wasted tool turns.
+      return {
+        type: 'function',
+        function: {
+          ...t.function,
+          description:
+            "Propose a structured edit to the current document. The edit is NOT applied immediately — it is shown to the user as a card they can Apply or Discard.\n\nThis document is non-markdown, so the only valid op is `rewrite_file`: pass the COMPLETE new file content as `content`. The original file is fully replaced on Apply.",
+          parameters: {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['rewrite_file'], description: 'Only `rewrite_file` is valid here.' },
+              content: { type: 'string', description: 'The COMPLETE new file content.' },
+            },
+            required: ['op', 'content'],
+          },
+        },
+      }
+    })
+}
+
+function buildAllTools(): OllamaTool[] {
   return [
     {
       type: 'function',
@@ -375,6 +675,15 @@ function buildToolCatalog(): OllamaTool[] {
           },
           required: ['heading'],
         },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'get_full_text',
+        description:
+          "Return the full extracted text of the current document. Use for non-markdown files (CSV, JSON, YAML, plain text) where there are no sections to read individually, or when you need the exact full-file content before a `rewrite_file` edit.",
+        parameters: { type: 'object', properties: {}, required: [] },
       },
     },
     {
@@ -412,14 +721,14 @@ function buildToolCatalog(): OllamaTool[] {
       function: {
         name: 'propose_edit',
         description:
-          "Propose a structured edit to the current document. The edit is NOT applied immediately — it is shown to the user as a card they can Apply or Discard. Use this when the user asks to rewrite, rephrase, edit, fix, add, remove, or replace content in the document.",
+          "Propose a structured edit to the current document. The edit is NOT applied immediately — it is shown to the user as a card they can Apply or Discard. Use this when the user asks to rewrite, rephrase, edit, fix, add, remove, or replace content in the document.\n\nOp selection:\n  • Markdown docs with headings → `replace_section` / `insert_after` / `delete_section` (preferred — surgical) or `append_text` / `prepend_text` for whole-file tail/head additions.\n  • CSV / JSON / YAML / TOML / any non-markdown text file → `rewrite_file` with the FULL new content (no section semantics apply).",
         parameters: {
           type: 'object',
           properties: {
             op: {
               type: 'string',
-              enum: ['replace_section', 'insert_after', 'delete_section', 'append_text', 'prepend_text'],
-              description: 'The kind of edit. For "replace_section"/"insert_after"/"delete_section" provide heading. For "append_text"/"prepend_text" omit heading and provide content.',
+              enum: ['replace_section', 'insert_after', 'delete_section', 'append_text', 'prepend_text', 'rewrite_file'],
+              description: 'Edit kind. Section ops need `heading`. `append_text`/`prepend_text`/`rewrite_file` need just `content`.',
             },
             heading: {
               type: 'string',
@@ -427,7 +736,7 @@ function buildToolCatalog(): OllamaTool[] {
             },
             content: {
               type: 'string',
-              description: 'The new content (omit for delete_section). For replace_section, this is the BODY only — do NOT include the heading line, it is preserved automatically.',
+              description: 'The new content (omit for delete_section). For replace_section: BODY only, heading preserved. For rewrite_file: the COMPLETE new file content.',
             },
           },
           required: ['op'],
@@ -482,6 +791,17 @@ async function dispatchTool(
           ok: true,
           summary: `outline (${sections.length} headings)`,
           payload: { sections },
+        }
+      }
+      case 'get_full_text': {
+        // Full extracted text of the current document. Use sparingly
+        // — for non-markdown files (CSV, JSON, YAML) where there are
+        // no sections to read individually, or when you need an
+        // exact full-file view before a `rewrite_file` edit.
+        return {
+          ok: true,
+          summary: `full text (${input.docText.length} chars)`,
+          payload: { text: input.docText },
         }
       }
       case 'read_section': {
@@ -581,7 +901,7 @@ async function dispatchTool(
         return {
           ok: false,
           summary: `unknown tool: ${name}`,
-          payload: { error: `No such tool: ${name}. Available: list_sections, read_section, search_doc, search_vault, propose_edit, answer.` },
+          payload: { error: `No such tool: ${name}. Available: list_sections, read_section, get_full_text, search_doc, search_vault, propose_edit, answer.` },
         }
     }
   } catch (e) {
@@ -601,6 +921,7 @@ function describeOp(op: ProposedEditOp): string {
     case 'delete_section': return `delete_section "${op.heading}"`
     case 'append_text': return 'append_text'
     case 'prepend_text': return 'prepend_text'
+    case 'rewrite_file': return `rewrite_file (${op.content.length} chars)`
   }
 }
 
@@ -643,8 +964,12 @@ function validateProposedEdit(
       if (!content) return { error: `${op} requires a "content" argument.` }
       return { op: { op, content } }
     }
+    case 'rewrite_file': {
+      if (content == null) return { error: `rewrite_file requires a "content" argument.` }
+      return { op: { op: 'rewrite_file', content } }
+    }
     default:
-      return { error: `Unknown op: "${op}". Valid ops: replace_section, insert_after, delete_section, append_text, prepend_text.` }
+      return { error: `Unknown op: "${op}". Valid ops: replace_section, insert_after, delete_section, append_text, prepend_text, rewrite_file.` }
   }
 }
 

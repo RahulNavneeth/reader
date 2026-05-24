@@ -32,7 +32,6 @@ type Props = {
  * folder popovers to be visually identical.
  */
 export function RevokePublicPopover({
-  triggerLabel,
   publicCount = 1,
   folderPublic,
   folderExpiresAt,
@@ -87,9 +86,10 @@ export function RevokePublicPopover({
         onClick={() => setOpen((v) => !v)}
         title={
           publicCount > 1
-            ? `Revoke ${publicCount} public items`
-            : 'Public — configure'
+            ? `Public · ${publicCount} items · click to manage`
+            : 'Public — click to manage'
         }
+        aria-label="Public link"
         aria-expanded={open}
         // The Public button always tints accent-green; when the
         // popover is open we deepen the background so the active
@@ -97,7 +97,9 @@ export function RevokePublicPopover({
         style={{ color: '#00875A', ...(open ? { background: 'var(--selected)' } : null) }}
       >
         <Globe size={13} />
-        {triggerLabel ?? `Public (${publicCount})`}
+        {publicCount > 1 && (
+          <span className="text-[10px] font-semibold tabular-nums">{publicCount}</span>
+        )}
       </button>
       {open && (
         <div

@@ -14,9 +14,10 @@
  *     --out /backups
  */
 import { spawn } from 'node:child_process'
-import { mkdir, stat } from 'node:fs/promises'
+import { mkdir, stat, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import process from 'node:process'
+import Database from 'better-sqlite3'
 
 function arg(flag: string, fallback?: string): string | undefined {
   const i = process.argv.indexOf(flag)
@@ -82,16 +83,48 @@ async function main(): Promise<void> {
   }
   await mkdir(out, { recursive: true })
 
+  // ── Hot snapshot of reader.db ───────────────────────────────────
+  // In WAL mode, raw-copying the .db + .db-wal + .db-shm while
+  // writes are in flight can yield a torn snapshot. Use SQLite's
+  // `VACUUM INTO` (since 3.27) which is internally
+  // transaction-protected and produces a clean, vacuumed copy
+  // safe to ship as part of the archive. We point the archive at
+  // the snapshot file rather than the live DB.
+  const liveDb = path.join(dataDir, 'reader.db')
+  let snapshot: string | null = null
+  if (await exists(liveDb)) {
+    snapshot = path.join(dataDir, `.reader-backup-${process.pid}.db`)
+    console.log(`[backup] vacuuming DB → ${snapshot}`)
+    const conn = new Database(liveDb, { readonly: true })
+    try {
+      // Drop any previous half-written snapshot from a crashed run —
+      // VACUUM INTO refuses to overwrite an existing file.
+      await unlink(snapshot).catch(() => null)
+      conn.prepare(`VACUUM INTO ?`).run(snapshot)
+    } finally {
+      conn.close()
+    }
+  }
+
   const file = path.join(out, `reader-backup-${timestamp()}.tar.gz`)
   // Tar with parent paths so the archive restores cleanly: each dir
   // is recorded relative to its own parent, preserving leaf names.
-  // We can't use --transform on macOS tar, so we just store absolute-ish
-  // paths and document the restore in the README.
+  // We can't use --transform on macOS tar, so we just store
+  // absolute-ish paths and document the restore in the README.
+  //
+  // Exclude the live WAL/SHM/journal sidecars and the live .db
+  // itself — the snapshot we just took replaces it. The receiver
+  // restores by renaming `.reader-backup-*.db` → `reader.db` after
+  // unpacking (also documented in the README).
   const dataParent = path.dirname(dataDir)
   const vaultParent = path.dirname(vaultDir)
   const args = [
     '-czf',
     file,
+    '--exclude=reader.db-wal',
+    '--exclude=reader.db-shm',
+    '--exclude=reader.db-journal',
+    ...(snapshot ? ['--exclude=reader.db'] : []),
     '-C',
     dataParent,
     path.basename(dataDir),
@@ -112,9 +145,19 @@ async function main(): Promise<void> {
     })
   })
 
+  // Best-effort cleanup of the snapshot. If this fails, the next
+  // run's `unlink` above will drop it.
+  if (snapshot) await unlink(snapshot).catch(() => null)
+
   const s = await stat(file)
   const mb = (s.size / (1024 * 1024)).toFixed(1)
   console.log(`[backup] done — ${mb} MB`)
+  if (snapshot) {
+    console.log(
+      `[backup] note: restore by extracting the archive, then renaming` +
+        `\n               .reader-backup-*.db → reader.db inside the data dir.`,
+    )
+  }
 }
 
 main().catch((err) => {

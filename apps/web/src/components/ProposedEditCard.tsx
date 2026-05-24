@@ -97,15 +97,20 @@ export function ProposedEditCard({
     }
   }
 
-  // Applied state — compact pill, no actions.
+  // Applied state — compact pill, no actions. Uses flex (not
+  // inline-flex) + min-w-0 + truncate on the heading so a long
+  // section title doesn't break "Applied to" across two lines.
   if (state === 'applied') {
+    const target = describeTarget(edit)
     return (
       <div
-        className="mt-2 inline-flex items-center gap-1.5 px-2 py-1 rounded text-[11.5px]"
+        className="mt-2 flex items-center gap-1.5 px-2 py-1 rounded text-[11.5px] max-w-full"
         style={{ background: 'var(--selected)', color: 'var(--accent)' }}
+        title={target}
       >
-        <Check size={11} />
-        Applied to <span className="font-medium">{describeTarget(edit)}</span>
+        <Check size={11} className="shrink-0" />
+        <span className="shrink-0 whitespace-nowrap">Applied to</span>
+        <span className="font-medium truncate min-w-0">{target}</span>
       </div>
     )
   }
@@ -248,12 +253,15 @@ function opLabel(op: ProposedEditOpDTO['op']): string {
     case 'delete_section': return 'Delete section'
     case 'append_text': return 'Append to document'
     case 'prepend_text': return 'Prepend to document'
+    case 'rewrite_file': return 'Rewrite file'
   }
 }
 
 function describeTarget(edit: ProposedEditOpDTO): string {
   if ('heading' in edit) return edit.heading
-  return edit.op === 'append_text' ? 'end of document' : 'start of document'
+  if (edit.op === 'append_text') return 'end of document'
+  if (edit.op === 'prepend_text') return 'start of document'
+  return 'entire file'
 }
 
 function OpIcon({ op, inConflict }: { op: ProposedEditOpDTO['op']; inConflict?: boolean }) {

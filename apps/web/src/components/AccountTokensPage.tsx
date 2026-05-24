@@ -2,13 +2,13 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   ArrowLeft,
-  KeyRound,
   Plus,
   Loader2,
   Trash2,
   Copy,
   Check,
   AlertCircle,
+  KeyRound,
 } from 'lucide-react'
 import { ApiError, api, type ApiTokenInfo } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
@@ -74,47 +74,61 @@ export function AccountTokensPage() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto surface">
-      <div className="max-w-[1080px] mx-auto px-8 py-10">
-        <button className="btn-ghost mb-4" onClick={() => navigate('/account')}>
-          <ArrowLeft size={13} /> Back to account
+    <div
+      className="flex-1 flex flex-col overflow-hidden"
+      style={{ background: 'var(--rail)' }}
+    >
+      <header
+        className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
+        style={{ background: 'var(--panel-2)' }}
+      >
+        <button
+          className="btn-ghost h-7 w-7 px-0 shrink-0"
+          onClick={() => navigate('/')}
+          title="Back to vault"
+          aria-label="Back to vault"
+        >
+          <ArrowLeft size={14} />
         </button>
-
-        <header className="mb-6">
-          <div className="text-[26px] font-semibold text-fg leading-tight inline-flex items-center gap-2.5">
-            <KeyRound size={20} className="text-accent" />
-            API tokens
-          </div>
-          <div className="text-[13px] text-muted mt-1.5">
-            Bearer tokens for the MCP endpoint at <code>/mcp</code> and the
-            REST API. Each token acts as you — same role, same vault.
-            Revoke any time.
-          </div>
-        </header>
+        <KeyRound size={13} className="text-accent shrink-0" />
+        <div className="text-[13.5px] font-semibold text-fg">API tokens</div>
+        {tokens && tokens.length > 0 && (
+          <span className="text-[11.5px] text-subtle ml-1.5">
+            {tokens.length} {tokens.length === 1 ? 'token' : 'tokens'}
+          </span>
+        )}
+      </header>
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-[1080px] mx-auto px-8 py-6 space-y-10">
 
         {error && (
           <div
-            className="mb-4 px-3 py-2 rounded text-[12.5px] inline-flex items-center gap-2"
-            style={{ background: '#FFEBE6', color: '#BF2600' }}
+            className="px-3 py-2 rounded text-[12.5px] inline-flex items-start gap-2"
+            style={{
+              background: 'var(--danger-bg)',
+              color: 'var(--danger-fg)',
+              border: '1px solid color-mix(in srgb, var(--danger-fg) 25%, transparent)',
+            }}
           >
-            <AlertCircle size={13} /> {error}
+            <AlertCircle size={13} className="shrink-0 mt-0.5" />
+            <span>{error}</span>
           </div>
         )}
 
         {newSecret && (
           <section
-            className="mb-6 rounded-xl p-4"
+            className="rounded-md p-3 space-y-2"
             style={{
-              background: 'rgba(76, 110, 245, 0.08)',
+              background: 'var(--selected)',
               border: '1px solid var(--accent)',
             }}
           >
-            <div className="text-[13px] font-semibold text-fg mb-2">
+            <div className="text-[12.5px] font-semibold text-fg">
               Copy your new token — you won't see it again.
             </div>
             <div className="flex items-center gap-2">
               <code
-                className="flex-1 px-3 py-2 rounded text-[12.5px] break-all"
+                className="flex-1 px-2 py-1.5 rounded text-[12.5px] break-all"
                 style={{ background: 'var(--bg)', border: '1px solid var(--border)' }}
               >
                 {newSecret}
@@ -133,14 +147,14 @@ export function AccountTokensPage() {
                   setCopied(true)
                   setTimeout(() => setCopied(false), 1500)
                 }}
+                title={copied ? 'Copied' : 'Copy'}
+                aria-label="Copy token"
               >
                 {copied ? <Check size={12} className="text-accent" /> : <Copy size={12} />}
-                {copied ? 'Copied' : 'Copy'}
               </button>
               <button
                 className="btn-ghost shrink-0"
                 onClick={() => setNewSecret(null)}
-                title="Dismiss"
               >
                 Done
               </button>
@@ -148,14 +162,10 @@ export function AccountTokensPage() {
           </section>
         )}
 
-        <section
-          className="rounded-xl p-4 mb-6"
-          style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
-        >
-          <div className="text-[13px] font-semibold text-fg mb-2.5">Create a token</div>
+        <Section title="Create a token">
           <div className="flex flex-col sm:flex-row gap-2">
             <input
-              className="input flex-1 h-8 text-[12.5px]"
+              className="input flex-1 h-8 text-[13px]"
               placeholder="Token name (e.g., claude-mcp, ci-job)"
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -164,47 +174,35 @@ export function AccountTokensPage() {
               }}
               disabled={busy}
             />
-            <button className="btn-ghost" onClick={create} disabled={busy || !name.trim()}>
+            <button className="btn-primary h-8" onClick={create} disabled={busy || !name.trim()}>
               {busy ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
               Create
             </button>
           </div>
-        </section>
+        </Section>
 
-        <section>
-          <div className="text-[13px] font-semibold text-fg mb-2">Your tokens</div>
+        <Section title={`Your tokens${tokens && tokens.length > 0 ? ` · ${tokens.length}` : ''}`}>
           {!tokens ? null : tokens.length === 0 ? (
-            <div
-              className="rounded-xl p-6 text-center"
-              style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
-            >
-              <div className="text-[13px] text-fg font-medium">No tokens yet</div>
-              <div className="text-[12px] text-muted mt-1">
-                Create one above to call the MCP / REST API as yourself.
-              </div>
+            <div className="text-[12.5px] text-subtle py-2">
+              No tokens yet. Create one above to call the MCP / REST API as yourself.
             </div>
           ) : (
-            <div
-              className="rounded-xl overflow-hidden"
-              style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
-            >
-              {tokens.map((t, i) => (
-                <div
+            <ul className="divide-y" style={{ borderColor: 'var(--border)' }}>
+              {tokens.map((t) => (
+                <li
                   key={t.id}
-                  className="flex items-center gap-3 px-4 py-3"
-                  style={{ borderTop: i === 0 ? undefined : '1px solid var(--border)' }}
+                  className="flex items-center gap-3 py-3 first:pt-0"
                 >
                   <div className="flex-1 min-w-0">
-                    <div className="text-[13.5px] font-medium text-fg truncate">{t.name}</div>
+                    <div className="text-[13px] font-medium text-fg truncate">{t.name}</div>
                     <div className="text-[11.5px] text-subtle mt-0.5">
-                      <code>{t.id}…</code> · {t.role} ·{' '}
-                      {t.lastUsedAt
-                        ? `last used ${timeAgo(t.lastUsedAt)}`
-                        : 'never used'}{' '}
-                      ·{' '}
-                      {t.expiresAt
-                        ? `expires ${new Date(t.expiresAt).toLocaleDateString()}`
-                        : 'no expiry'}
+                      {t.id}…
+                      <span className="mx-1.5 opacity-60">·</span>
+                      {t.role}
+                      <span className="mx-1.5 opacity-60">·</span>
+                      {t.lastUsedAt ? `last used ${timeAgo(t.lastUsedAt)}` : 'never used'}
+                      <span className="mx-1.5 opacity-60">·</span>
+                      {t.expiresAt ? `expires ${new Date(t.expiresAt).toLocaleDateString()}` : 'no expiry'}
                     </div>
                   </div>
                   <button
@@ -212,16 +210,38 @@ export function AccountTokensPage() {
                     onClick={() => remove(t)}
                     style={{ color: '#BF2600' }}
                     title="Revoke token"
+                    aria-label="Revoke token"
                   >
                     <Trash2 size={12} />
                   </button>
-                </div>
+                </li>
               ))}
-            </div>
+            </ul>
           )}
-        </section>
+        </Section>
+        </div>
       </div>
     </div>
+  )
+}
+
+function Section({
+  title,
+  children,
+}: {
+  title: string
+  children: React.ReactNode
+}) {
+  return (
+    <section className="space-y-4">
+      <div
+        className="text-[14px] font-semibold text-fg pb-2"
+        style={{ borderBottom: '1px solid var(--border)' }}
+      >
+        {title}
+      </div>
+      <div className="pl-0.5">{children}</div>
+    </section>
   )
 }
 

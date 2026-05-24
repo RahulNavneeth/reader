@@ -60,7 +60,7 @@ async function getCache(): Promise<Cache> {
   return building.then((c) => (building = null, c))
 }
 
-function cosine(a: Float32Array, b: Float32Array, normA: number): number {
+export function cosine(a: Float32Array, b: Float32Array, normA: number): number {
   if (a.length !== b.length || normA === 0) return 0
   let dot = 0
   let nb = 0
@@ -464,12 +464,22 @@ export async function preheat(): Promise<void> {
  */
 export async function findSimilarDocs(opts: {
   docId: string
+  /** Optional storage-key fallback. When the supplied docId doesn't
+   *  resolve (e.g. the viewer is holding an id that was reaped by
+   *  a re-ingest and the file now lives under a new id), we look up
+   *  by `owner=caller + storageKey=pathHint` so the popover still
+   *  works without the user having to refresh. */
+  pathHint?: string
   user: { username: string; role: string }
   limit?: number
 }): Promise<SearchHit[]> {
   const limit = opts.limit ?? 10
   const c = await getCache()
-  const source = c.docs.find((d) => d.id === opts.docId)
+  let source = c.docs.find((d) => d.id === opts.docId)
+  if (!source && opts.pathHint) {
+    const key = opts.pathHint.replace(/^\/+|\/+$/g, '')
+    source = c.docs.find((d) => d.storageKey === key && d.owner === opts.user.username)
+  }
   if (!source) {
     throw Object.assign(new Error('source document not found'), { status: 404 })
   }

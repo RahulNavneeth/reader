@@ -45,7 +45,7 @@ export function VaultSidebar() {
   const location = useLocation()
   const openPath = (params['*'] || '').trim() || null
   const activeTag = location.pathname.startsWith('/tags/') ? params.tag ?? null : null
-  const { uploadFiles, refreshNonce, vaultError, clearError, currentFolder, currentUsername, mobileSidebarOpen, setMobileSidebarOpen } = useVault()
+  const { uploadFiles, refreshNonce, vaultError, clearError, currentFolder, currentUsername, mobileSidebarOpen, setMobileSidebarOpen, refresh: refreshVault, setVaultError } = useVault()
   const confirm = useConfirm()
   const prompt = usePrompt()
   const activePath = openPath ?? (currentFolder || null)
@@ -763,16 +763,58 @@ export function VaultSidebar() {
           })()
         ) : !tree ? (
           <div className="px-3 py-2 text-[12.5px] text-muted">Loading…</div>
-        ) : tree.length === 0 ? null : (
-          tree.map((node) => (
-            <VaultTree
-              key={node.path}
-              node={node}
-              depth={0}
-              selectedPath={openPath}
-              activePath={activePath}
-            />
-          ))
+        ) : (
+          /* Root drop zone — wraps the top-level tree so files
+             dragged onto the empty space below land at the vault
+             root. Individual folder rows in VaultTree call
+             stopPropagation on their own drops, so this only
+             fires for drops outside any folder. */
+          <div
+            /* pt-2 / pb-12 give the wrapper a top and bottom
+               "lane" the user can drop into for vault-root moves.
+               Without the top padding, the first folder row claims
+               the entire top area and dropping above it is
+               impossible. */
+            className="pt-2 pb-12 min-h-[60px]"
+            onDragOver={(e) => {
+              if (!e.dataTransfer.types.includes('application/x-reader-path')) return
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'move'
+            }}
+            onDrop={async (e) => {
+              const src = e.dataTransfer.getData('application/x-reader-path')
+              if (!src) return
+              e.preventDefault()
+              const filename = src.split('/').pop()
+              if (!filename) return
+              // Already at root — nothing to move.
+              if (!src.includes('/')) return
+              try {
+                await api.move(src, filename)
+                refreshVault()
+              } catch (err) {
+                if (!(err instanceof ApiError && err.status === 401)) {
+                  setVaultError(err instanceof ApiError ? err.message : String(err))
+                }
+              }
+            }}
+          >
+            {tree.length === 0 ? (
+              <div className="px-3 py-6 text-[12px] text-muted text-center">
+                Drop files here to add to your vault root.
+              </div>
+            ) : (
+              tree.map((node) => (
+                <VaultTree
+                  key={node.path}
+                  node={node}
+                  depth={0}
+                  selectedPath={openPath}
+                  activePath={activePath}
+                />
+              ))
+            )}
+          </div>
         )}
 
         {(vaultError || error) && (

@@ -23,6 +23,12 @@ export type User = {
   /** Optional contact address — used for outbound notifications
    *  (share invites, quota warnings) when SMTP is configured. */
   email?: string
+  /** When true, signing out of the web session also revokes every
+   *  OAuth grant this user has issued to third-party MCP clients.
+   *  Opt-in because the default (independent grants) matches Notion /
+   *  Jira behavior; enabling this is the "sign out everywhere"
+   *  workflow for users with sensitive vaults. */
+  revokeOauthOnSignout?: boolean
 }
 
 export type Session = {

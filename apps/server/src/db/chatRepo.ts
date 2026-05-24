@@ -94,6 +94,10 @@ export type ProposedEditOp =
   | (ProposedEditCommon & { op: 'delete_section'; heading: string })
   | (ProposedEditCommon & { op: 'append_text'; content: string })
   | (ProposedEditCommon & { op: 'prepend_text'; content: string })
+  // Full-file replace — for non-markdown formats (CSV, JSON, YAML,
+  // any text file) where section-level edits don't apply. The card
+  // UX shows a unified diff just like the section ops.
+  | (ProposedEditCommon & { op: 'rewrite_file'; content: string })
 
 export type ChatMessage = {
   id: string
@@ -251,15 +255,23 @@ export function findMessageByIdScoped(
   return r ? rowToMessage(r) : null
 }
 
-/** Append a single message. Returns the persisted row. */
-export function appendMessage(m: ChatMessage): void {
+/** Append a single message. Returns the persisted row. The optional
+ *  `embedding` argument lets the dispatcher attach a nomic-embed-text
+ *  vector (768-dim float32) so we can semantic-search older messages
+ *  on future turns. NULL embedding is fine — messages just won't
+ *  surface in the relevance retrieval. */
+export function appendMessage(
+  m: ChatMessage,
+  embedding?: Float32Array | null,
+): void {
   db()
     .prepare(
       `INSERT INTO chat_messages
          (id, doc_id, user_id, thread_id, role, content, citations,
           memories_used, error_text, pending_edit, edit_applied_at,
-          edit_target_sha256, tool_trace, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          edit_target_sha256, tool_trace, created_at,
+          embedding, embed_dim)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       m.id,
@@ -276,7 +288,74 @@ export function appendMessage(m: ChatMessage): void {
       m.editTargetSha256 ?? null,
       m.toolTrace ? JSON.stringify(m.toolTrace) : null,
       m.createdAt,
+      embedding && embedding.length > 0 ? encodeEmbedding(embedding) : null,
+      embedding && embedding.length > 0 ? embedding.length : null,
     )
+}
+
+/** Stream messages within a thread that carry an embedding. Used
+ *  by the dispatcher's similarity scan to find semantically
+ *  relevant older turns once a thread exceeds the recent-window
+ *  budget. Returns enough metadata to dedupe against the verbatim
+ *  window the caller already plans to send. */
+export type EmbeddedChatMessage = {
+  id: string
+  role: ChatRole
+  content: string
+  createdAt: number
+  embedding: Float32Array
+}
+
+export function listEmbeddedMessages(
+  docId: string,
+  userId: string,
+  threadId: string,
+): EmbeddedChatMessage[] {
+  const rows = db()
+    .prepare(
+      `SELECT id, role, content, created_at, embedding, embed_dim
+         FROM chat_messages
+        WHERE doc_id = ? AND user_id = ? AND thread_id = ?
+          AND embedding IS NOT NULL`,
+    )
+    .all(docId, userId, threadId) as Array<{
+    id: string
+    role: ChatRole
+    content: string
+    created_at: number
+    embedding: Buffer
+    embed_dim: number
+  }>
+  const out: EmbeddedChatMessage[] = []
+  for (const r of rows) {
+    const f = decodeEmbedding(r.embedding)
+    if (f.length === 0) continue
+    out.push({
+      id: r.id,
+      role: r.role,
+      content: r.content,
+      createdAt: r.created_at,
+      embedding: f,
+    })
+  }
+  return out
+}
+
+function encodeEmbedding(f: Float32Array): Buffer {
+  // Zero-copy view into the underlying ArrayBuffer; SQLite/better-
+  // sqlite3 binds the bytes verbatim.
+  return Buffer.from(f.buffer, f.byteOffset, f.byteLength)
+}
+
+function decodeEmbedding(b: Buffer): Float32Array {
+  // Float32Array needs a 4-byte-aligned offset. better-sqlite3 hands
+  // us a fresh Buffer per row so this is normally fine, but we copy
+  // when alignment is off as a safety belt.
+  if (b.byteOffset % 4 === 0) {
+    return new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4)
+  }
+  const copy = Buffer.from(b)
+  return new Float32Array(copy.buffer, copy.byteOffset, copy.byteLength / 4)
 }
 
 /** Mark this assistant turn's pending edits as applied. Returns

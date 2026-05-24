@@ -1,9 +1,9 @@
 import type { FastifyInstance } from 'fastify'
-import path from 'node:path'
+import type { User } from '../types.js'
 import { readFile } from 'node:fs/promises'
 import { nanoid } from 'nanoid'
 import { z } from 'zod'
-import { config } from '../config.js'
+import { resolveUserVault } from '../lib/userVault.js'
 import { audit } from '../stores/audit.js'
 import {
   deleteDocument,
@@ -16,6 +16,7 @@ import { couldHaveGps, extractGps } from '../services/gps.js'
 import { getUser, saveUser } from '../stores/users.js'
 import { createToken, deleteToken, listTokens } from '../stores/tokens.js'
 import { loadSettings, saveSettings, type WebhookConfig } from '../stores/settings.js'
+import { encryptSecret, retryDeadLetter, pingHook, EVENT_SHAPES } from '../services/webhooks.js'
 
 /**
  * Per-user account endpoints — the user-facing twin of the admin
@@ -62,8 +63,22 @@ export async function accountRoutes(app: FastifyInstance) {
     let removed = 0
     const errors: Array<{ id: string; error: string }> = []
     for (const d of mine) {
+      // Files live under <vault_root>/<owner>/<storageKey>. The
+      // previous `path.join(config.vault.root, d.storageKey)` was
+      // missing the owner segment, so EVERY readFile 404'd and the
+      // ENOENT branch below deleted the doc row — re-index nuked
+      // the index. Resolve through the per-user vault helper so
+      // the path is correct AND a malicious storageKey can't
+      // escape the user's directory.
+      let abs: string
       try {
-        const abs = path.join(config.vault.root, d.storageKey)
+        abs = resolveUserVault(d.owner, d.storageKey)
+      } catch (e: any) {
+        failed++
+        errors.push({ id: d.id, error: e?.message ?? 'invalid path' })
+        continue
+      }
+      try {
         const buffer = await readFile(abs)
         const updated = await ingestDocument(d, buffer)
         if (updated.ingest.embedded) ok++
@@ -143,6 +158,69 @@ export async function accountRoutes(app: FastifyInstance) {
     return { ok: true }
   })
 
+  // ─── Account preferences ───────────────────────────────────────────────
+  //
+  // Settings that live on the User record (as opposed to workspace-wide
+  // settings under /api/admin/settings). Currently just the
+  // "revoke OAuth on signout" toggle; intentionally a single endpoint
+  // we can extend rather than one route per preference.
+
+  app.patch('/api/account/preferences', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const body = z
+      .object({
+        revokeOauthOnSignout: z.boolean().optional(),
+      })
+      .parse(req.body)
+    const me = req.currentUser
+    const next: User = {
+      ...me,
+      ...(body.revokeOauthOnSignout !== undefined
+        ? { revokeOauthOnSignout: body.revokeOauthOnSignout }
+        : {}),
+    }
+    await saveUser(next)
+    await audit({
+      actor: me.username,
+      action: 'account.preferences.update',
+      meta: body as Record<string, unknown>,
+    })
+    return { user: app.publicUser(next) }
+  })
+
+  // ─── OAuth grants (third-party MCP connections) ────────────────────────
+
+  /**
+   * Active OAuth grants — one row per (this user, client) pair with at
+   * least one unexpired access token. Powers the "Connected Apps" page
+   * so users can audit + revoke MCP client connections.
+   */
+  app.get('/api/account/oauth-grants', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const { listGrantsForUser } = await import('../db/oauthRepo.js')
+    return { grants: listGrantsForUser(req.currentUser.username) }
+  })
+
+  /**
+   * Drop every access + refresh token for the (caller, client) pair.
+   * The client app keeps running but its next /mcp call gets 401 and
+   * its refresh attempt gets `invalid_grant`. To reconnect, the user
+   * walks through the OAuth flow again.
+   */
+  app.delete('/api/account/oauth-grants/:clientId', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const { clientId } = req.params as { clientId: string }
+    const { revokeGrant } = await import('../db/oauthRepo.js')
+    const out = revokeGrant(req.currentUser.username, clientId)
+    await audit({
+      actor: req.currentUser.username,
+      action: 'oauth.grant.revoke',
+      target: clientId,
+      meta: out,
+    })
+    return { ok: true }
+  })
+
   // ─── Map (geotagged photos) ─────────────────────────────────────────────
   //
   // Returns the caller's image docs that have GPS coords. Lazily
@@ -164,7 +242,7 @@ export async function accountRoutes(app: FastifyInstance) {
       if (backfilled >= BACKFILL_LIMIT) break
       pinsTried.add(d.id)
       try {
-        const abs = path.join(config.vault.root, d.storageKey)
+        const abs = resolveUserVault(d.owner, d.storageKey)
         const buf = await readFile(abs)
         const gps = await extractGps(buf, d.originalFilename)
         if (gps !== undefined) {
@@ -241,11 +319,40 @@ export async function accountRoutes(app: FastifyInstance) {
   // tagging each entry with `owner`. The dispatcher (services/webhooks.ts)
   // only fires a hook to its owner's events; legacy hooks without an
   // owner fire for everyone (back-compat with workspace-global hooks).
+  // Static schema doc — no auth needed because it just describes the
+  // public event shapes (no per-tenant data). The picker UI links here
+  // so receivers know exactly what JSON will hit their endpoint.
+  app.get('/api/account/webhooks/event-shapes', async () => {
+    return {
+      envelope: {
+        description: 'Every dispatched payload (except test pings) is wrapped with these envelope fields in addition to the per-event keys.',
+        fields: {
+          ts: 'Number — unix-ms when dispatch ran.',
+          appUrl: 'String — the public Reader URL (from APP_URL env).',
+          itemUrl: 'String — deep link to the affected path in Reader.',
+        },
+        headers: {
+          'X-Reader-Event': 'Event type, e.g. "upload".',
+          'X-Reader-Delivery': 'UUID per delivery attempt — use for idempotency.',
+          'X-Reader-Attempt': 'Attempt number ("1"–"4") or "retry" / "test".',
+          'X-Reader-Signature': 'HMAC-SHA256(secret, raw body) hex digest. Only present when a secret is configured.',
+        },
+      },
+      events: EVENT_SHAPES,
+    }
+  })
+
   app.get('/api/account/webhooks', async (req, reply) => {
     if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
     const s = await loadSettings()
     const me = req.currentUser.username
-    return { webhooks: (s.webhooks ?? []).filter((h) => h.owner === me) }
+    // Strip the encrypted secret from API responses — the UI only
+    // needs to know whether one is set (`hasSecret`), never the
+    // ciphertext itself.
+    const webhooks = (s.webhooks ?? [])
+      .filter((h) => h.owner === me)
+      .map(({ secret, ...rest }) => ({ ...rest, hasSecret: !!secret }))
+    return { webhooks }
   })
 
   app.post('/api/account/webhooks', async (req, reply) => {
@@ -256,10 +363,34 @@ export async function accountRoutes(app: FastifyInstance) {
     const body = z
       .object({
         url: z.string().url(),
-        events: z.array(
-          z.enum(['upload', 'edit', 'delete', 'share', 'tags', 'visibility', 'ingest']),
-        ),
-        secret: z.string().max(256).optional(),
+        events: z
+          .array(z.enum([
+            'upload',
+            'edit',
+            'delete',
+            'trash',
+            'move',
+            'mkdir',
+            'share',
+            'tags',
+            'visibility',
+            'folder-tags',
+            'folder-visibility',
+            'pin',
+            'intake',
+            'template',
+            'export',
+            'ingest',
+          ]))
+          .min(1),
+        // Secret is optional, but when present we enforce a 16-char
+        // minimum (same as admin) — anything shorter doesn't add
+        // meaningful entropy to the HMAC.
+        secret: z
+          .string()
+          .min(16, 'secret must be at least 16 characters')
+          .max(256)
+          .optional(),
         enabled: z.boolean().optional(),
       })
       .parse(req.body)
@@ -267,7 +398,7 @@ export async function accountRoutes(app: FastifyInstance) {
       id: nanoid(),
       url: body.url,
       events: body.events,
-      secret: body.secret,
+      secret: body.secret ? encryptSecret(body.secret) : undefined,
       enabled: body.enabled ?? true,
       createdAt: Date.now(),
       owner: req.currentUser.username,
@@ -280,7 +411,8 @@ export async function accountRoutes(app: FastifyInstance) {
       target: hook.id,
       meta: { url: hook.url, events: hook.events },
     })
-    return { webhook: hook }
+    const { secret: _omit, ...sanitized } = hook
+    return { webhook: { ...sanitized, hasSecret: !!hook.secret } }
   })
 
   app.delete('/api/account/webhooks/:id', async (req, reply) => {
@@ -302,5 +434,134 @@ export async function accountRoutes(app: FastifyInstance) {
       target: id,
     })
     return { ok: true }
+  })
+
+  // Edit an existing hook. Any combination of url/events/secret/
+  // enabled can be supplied. Omitted fields stay as-is. Passing an
+  // empty-string secret clears the existing one.
+  app.patch('/api/account/webhooks/:id', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    if (req.currentUser.role === 'viewer') {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const { id } = req.params as { id: string }
+    const body = z
+      .object({
+        url: z.string().url().optional(),
+        events: z
+          .array(z.enum([
+            'upload',
+            'edit',
+            'delete',
+            'trash',
+            'move',
+            'mkdir',
+            'share',
+            'tags',
+            'visibility',
+            'folder-tags',
+            'folder-visibility',
+            'pin',
+            'intake',
+            'template',
+            'export',
+            'ingest',
+          ]))
+          .min(1)
+          .optional(),
+        secret: z
+          .union([z.literal(''), z.string().min(16).max(256)])
+          .optional(),
+        enabled: z.boolean().optional(),
+      })
+      .parse(req.body)
+    const s = await loadSettings()
+    const hook = (s.webhooks ?? []).find((h) => h.id === id)
+    if (!hook) return reply.code(404).send({ error: 'not found' })
+    if (hook.owner !== req.currentUser.username) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    // Manually re-enabling clears the circuit breaker — user is
+    // asserting the receiver is healthy now, so we should start
+    // counting from zero rather than auto-disabling again on the
+    // next failure.
+    const reEnabling = body.enabled === true && hook.enabled === false
+    const next: WebhookConfig = {
+      ...hook,
+      ...(body.url !== undefined ? { url: body.url } : {}),
+      ...(body.events !== undefined ? { events: body.events } : {}),
+      ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+      ...(body.secret !== undefined
+        ? { secret: body.secret ? encryptSecret(body.secret) : undefined }
+        : {}),
+      ...(reEnabling
+        ? { consecutiveFailures: 0, circuitOpenedAt: undefined }
+        : {}),
+    }
+    await saveSettings({
+      ...s,
+      webhooks: (s.webhooks ?? []).map((h) => (h.id === id ? next : h)),
+    })
+    await audit({
+      actor: req.currentUser.username,
+      action: 'account.webhook.update',
+      target: id,
+      meta: {
+        changed: Object.keys(body),
+        url: next.url,
+        events: next.events,
+        enabled: next.enabled,
+      },
+    })
+    const { secret: _omit, ...sanitized } = next
+    return { webhook: { ...sanitized, hasSecret: !!next.secret } }
+  })
+
+  // Synthetic test event — fires a hand-crafted `upload` payload to
+  // the hook so the user can verify reachability without creating a
+  // real file. Returns the resulting delivery status synchronously so
+  // the UI can show success/failure inline.
+  app.post('/api/account/webhooks/:id/test', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const { id } = req.params as { id: string }
+    const s = await loadSettings()
+    const hook = (s.webhooks ?? []).find((h) => h.id === id)
+    if (!hook) return reply.code(404).send({ error: 'not found' })
+    if (hook.owner !== req.currentUser.username) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const r = await pingHook(hook)
+    await audit({
+      actor: req.currentUser.username,
+      action: 'account.webhook.test',
+      target: id,
+      meta: { status: r.status, ok: r.ok, error: r.error },
+    })
+    return r
+  })
+
+  // Owner-scoped wrapper around the dispatcher's DLQ retry so a user
+  // can replay one of THEIR own failed deliveries (admins use the
+  // admin-route variant for global hooks).
+  app.post('/api/account/webhooks/:id/retry/:entryId', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const { id, entryId } = req.params as { id: string; entryId: string }
+    const s = await loadSettings()
+    const hook = (s.webhooks ?? []).find((h) => h.id === id)
+    if (!hook) return reply.code(404).send({ error: 'not found' })
+    if (hook.owner !== req.currentUser.username) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const r = await retryDeadLetter(id, entryId)
+    if (!r.ok && (r.error === 'hook not found' || r.error === 'entry not found')) {
+      return reply.code(404).send(r)
+    }
+    await audit({
+      actor: req.currentUser.username,
+      action: 'account.webhook.retry',
+      target: `${id}/${entryId}`,
+      meta: { status: r.status, ok: r.ok, error: r.error },
+    })
+    return r
   })
 }

@@ -8,6 +8,7 @@ import { listSharesFrom, listSharesTo } from '../stores/userShares.js'
 import { listPins } from '../stores/pins.js'
 import { resolveUserVault } from '../lib/userVault.js'
 import { zipStream } from '../lib/zipStream.js'
+import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 import { audit } from '../stores/audit.js'
 
 /**
@@ -128,6 +129,11 @@ export async function exportRoutes(app: FastifyInstance) {
           action: 'account.export',
           meta: { files: filesToZip.length },
           ip: req.ip,
+        }).catch(() => null)
+        dispatchWebhook({
+          type: 'export',
+          path: '',
+          actor: user.username,
         }).catch(() => null)
       })
       readable.on('error', (err) => {

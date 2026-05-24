@@ -88,11 +88,11 @@ export function PublicButton({
       trigger={
         <button
           className="btn-ghost"
-          title="Make public"
+          title={triggerLabel ? `${triggerLabel} · click to make public` : 'Private — click to make public'}
+          aria-label="Make public"
           style={forceActiveStyle ? { color: '#00875A' } : undefined}
         >
           <Lock size={13} />
-          {triggerLabel ?? 'Private'}
         </button>
       }
     />

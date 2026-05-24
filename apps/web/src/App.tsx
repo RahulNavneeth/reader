@@ -7,9 +7,10 @@ import { AuthScreen } from './components/AuthScreen'
 import { UserMenu } from './components/UserMenu'
 import { VaultView } from './components/VaultView'
 import { AdminPanel } from './components/AdminPanel'
-import { AccountPage } from './components/AccountPage'
 import { AccountTokensPage } from './components/AccountTokensPage'
 import { AccountWebhooksPage } from './components/AccountWebhooksPage'
+import { OAuthConsentPage } from './components/OAuthConsentPage'
+import { AccountConnectedAppsPage } from './components/AccountConnectedAppsPage'
 import { MountBrowser } from './components/MountBrowser'
 import { MapPage } from './components/MapPage'
 import { TimelinePage } from './components/TimelinePage'
@@ -17,6 +18,7 @@ import { CollectionsPage } from './components/CollectionsPage'
 import { CollectionDetailPage } from './components/CollectionDetailPage'
 import { PublicCollectionPage } from './components/PublicCollectionPage'
 import { NewFolderButton } from './components/NewFolderButton'
+import { TemplatesButton } from './components/TemplatesButton'
 import { TrashPage } from './components/TrashPage'
 import { SearchPalette } from './components/SearchPalette'
 import { UploadButton } from './components/UploadButton'
@@ -29,7 +31,7 @@ type AuthState =
   | { status: 'loading' }
   | { status: 'anonymous' }
   | { status: 'anonymous-locked' }
-  | { status: 'authed'; user: PublicUser }
+  | { status: 'authed'; user: PublicUser; workspace: { chatEnabled: boolean } }
 
 export default function App() {
   const { theme, toggle } = useTheme()
@@ -101,7 +103,16 @@ export default function App() {
   useEffect(() => {
     api
       .me()
-      .then((r) => setAuth({ status: 'authed', user: r.user }))
+      .then((r) =>
+        setAuth({
+          status: 'authed',
+          user: r.user,
+          // `workspace` may be absent on older servers (cross-version
+          // upgrade window) — default chat to ON to match the
+          // historical UX in that case.
+          workspace: { chatEnabled: r.workspace?.chatEnabled ?? true },
+        }),
+      )
       .catch(() => setAuth({ status: 'anonymous' }))
   }, [])
 
@@ -113,6 +124,26 @@ export default function App() {
   useEffect(() => {
     if (auth.status === 'authed') setVaultError(null)
   }, [auth.status])
+
+  // Inline auth flows (login form, signup, OAuth consent) hand back
+  // the authed `user` but don't know the workspace toggles. Re-fetch
+  // `/me` to pick up `workspace.chatEnabled` so the chat dock doesn't
+  // render on the first post-login page-view when chat is off.
+  const onAuthed = useCallback((user: PublicUser) => {
+    setAuth({ status: 'authed', user, workspace: { chatEnabled: true } })
+    api
+      .me()
+      .then((r) =>
+        setAuth({
+          status: 'authed',
+          user: r.user,
+          workspace: { chatEnabled: r.workspace?.chatEnabled ?? true },
+        }),
+      )
+      .catch(() => {
+        /* keep optimistic state; next mount will retry */
+      })
+  }, [])
 
   const handleLogout = async () => {
     try {
@@ -201,7 +232,7 @@ export default function App() {
     // Bare-path public URLs: `/` for a public vault root, `/<path>` for
     // any public file or folder. Reserved root segments are app routes
     // that can't be vault items.
-    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline', 'collections', 'c', 'pc'])
+    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline', 'collections', 'c', 'pc', 'oauth'])
     const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
     const firstSeg = rawPath.split('/')[0] ?? ''
     const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
@@ -211,7 +242,19 @@ export default function App() {
       return (
         <Routes>
           <Route path="/pc/:slug" element={<PublicCollectionPage />} />
-          <Route path="*" element={<AuthScreen onAuthed={(user) => setAuth({ status: 'authed', user })} />} />
+          <Route path="*" element={<AuthScreen onAuthed={(user) => onAuthed(user)} />} />
+        </Routes>
+      )
+    }
+    // Consent page must render whether or not we're authed — it shows
+    // an inline login prompt for anonymous visitors and re-fetches
+    // context on success. Routing it through AuthScreen would lose the
+    // ?client_id&scope... query string on redirect.
+    if (firstSeg === 'oauth') {
+      return (
+        <Routes>
+          <Route path="/oauth/consent" element={<OAuthConsentPage onAuthed={(user) => onAuthed(user)} />} />
+          <Route path="*" element={<AuthScreen onAuthed={(user) => onAuthed(user)} />} />
         </Routes>
       )
     }
@@ -224,11 +267,11 @@ export default function App() {
         />
       )
     }
-    return <AuthScreen onAuthed={(user) => setAuth({ status: 'authed', user })} />
+    return <AuthScreen onAuthed={(user) => onAuthed(user)} />
   }
 
   if (auth.status === 'anonymous-locked') {
-    return <AuthScreen onAuthed={(user) => setAuth({ status: 'authed', user })} />
+    return <AuthScreen onAuthed={(user) => onAuthed(user)} />
   }
 
   return (
@@ -246,6 +289,7 @@ export default function App() {
         currentFolder,
         setCurrentFolder,
         currentUsername: auth.user.username,
+        chatEnabled: auth.workspace.chatEnabled,
         mobileSidebarOpen,
         setMobileSidebarOpen,
       }}
@@ -271,6 +315,12 @@ export default function App() {
             Offline — showing cached content. Edits and new uploads will fail until the server is reachable.
           </div>
         )}
+        {/* OAuth consent pages are intentionally chrome-free — the
+            user is mid-flow handing access to a third-party app, and
+            the search bar / theme toggle / user menu are distractions
+            that also blur the trust boundary. We render the consent
+            card standalone on these routes. */}
+        {!location.pathname.startsWith('/oauth/') && (
         <header
           className="h-12 flex items-center px-3 border-b border-app shrink-0"
           style={{ background: 'var(--panel-2)' }}
@@ -340,6 +390,10 @@ export default function App() {
                   currentDir={currentFolder}
                   onCreated={() => setRefreshNonce((n) => n + 1)}
                 />
+                <TemplatesButton
+                  currentDir={currentFolder}
+                  onCreated={() => setRefreshNonce((n) => n + 1)}
+                />
                 <UploadButton
                   pendingFiles={pendingFiles}
                   setPendingFiles={setPendingFiles}
@@ -397,13 +451,15 @@ export default function App() {
             <UserMenu user={auth.user} onLogout={handleLogout} />
           </div>
         </header>
+        )}
 
         <Routes>
           <Route path="/" element={<VaultView />} />
           <Route path="/tags/:tag" element={<VaultView />} />
-          <Route path="/account" element={<AccountPage />} />
           <Route path="/account/tokens" element={<AccountTokensPage />} />
           <Route path="/account/webhooks" element={<AccountWebhooksPage />} />
+          <Route path="/account/connected-apps" element={<AccountConnectedAppsPage />} />
+          <Route path="/oauth/consent" element={<OAuthConsentPage onAuthed={(user) => onAuthed(user)} />} />
           <Route path="/trash" element={<TrashPage />} />
           <Route path="/map" element={<MapPage />} />
           <Route path="/timeline" element={<TimelinePage />} />

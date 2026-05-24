@@ -111,7 +111,6 @@ export function CollectionPublicButton({
   }
 
   const Icon = isPublic ? Globe : Lock
-  const triggerLabel = isPublic ? 'Public' : 'Private'
 
   return (
     <div ref={rootRef} className="relative inline-flex">
@@ -119,6 +118,7 @@ export function CollectionPublicButton({
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
         title={isPublic ? 'Public link is on' : 'Publish a public link'}
+        aria-label={isPublic ? 'Public link settings' : 'Make collection public'}
         aria-expanded={open}
         style={{
           // Open default: accent text. Public state overrides with
@@ -130,7 +130,6 @@ export function CollectionPublicButton({
         }}
       >
         <Icon size={13} />
-        {triggerLabel}
       </button>
       {open && (
         <div

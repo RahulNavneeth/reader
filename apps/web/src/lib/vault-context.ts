@@ -40,6 +40,10 @@ export type VaultContextValue = {
    *  desktop (md+); on small screens it slides in over the content. */
   mobileSidebarOpen: boolean
   setMobileSidebarOpen: (open: boolean) => void
+  /** Workspace-level Reader AI toggle (admin → Settings → Ollama).
+   *  When false, the doc viewer hides the chat dock + open button so
+   *  users can't open a panel that will only 503 on send. */
+  chatEnabled: boolean
 }
 
 export const VaultContext = createContext<VaultContextValue | null>(null)

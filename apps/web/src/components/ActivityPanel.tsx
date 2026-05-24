@@ -209,11 +209,10 @@ export function ActivityPanel({
       {dayGroups?.map((bucket) => (
         <div key={bucket.key} className="py-1">
           <div
-            className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider font-semibold flex items-center gap-2"
+            className="px-3 pt-2 pb-1 text-[10px] uppercase tracking-wider font-semibold"
             style={{ color: 'var(--fg-subtle)' }}
           >
-            <span>{bucket.label}</span>
-            <span className="flex-1 h-px" style={{ background: 'var(--border)' }} />
+            {bucket.label}
           </div>
           <ul className="px-1.5 py-0.5">
             {bucket.rows.map((row, i) => (
@@ -260,8 +259,8 @@ function FilterRow({
   if (visible.length <= 1) return null
   return (
     <div
-      className="flex flex-wrap gap-1 px-2.5 py-2 border-b"
-      style={{ borderColor: 'var(--border)' }}
+      className="flex flex-wrap gap-1 px-2.5 py-2 border-b sticky top-0 z-10"
+      style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
     >
       {visible.map((f) => {
         const active = filter === f.id
@@ -270,7 +269,8 @@ function FilterRow({
             key={f.id}
             type="button"
             onClick={() => setFilter(f.id)}
-            className="px-1.5 h-5 rounded text-[10.5px] font-medium inline-flex items-center gap-1 transition-colors"
+            className="px-1.5 h-5 rounded text-[10.5px] font-medium inline-flex items-center transition-colors"
+            title={`${f.label} · ${counts[f.id]} ${counts[f.id] === 1 ? 'event' : 'events'}`}
             style={{
               background: active ? 'var(--selected)' : 'transparent',
               color: active ? 'var(--accent)' : 'var(--fg-muted)',
@@ -283,16 +283,6 @@ function FilterRow({
             }}
           >
             {f.label}
-            <span
-              className="px-1 rounded tabular-nums"
-              style={{
-                background: active ? 'color-mix(in srgb, var(--accent) 18%, transparent)' : 'var(--hover)',
-                color: active ? 'var(--accent)' : 'var(--fg-subtle)',
-                fontSize: 9,
-              }}
-            >
-              {counts[f.id]}
-            </span>
           </button>
         )
       })}

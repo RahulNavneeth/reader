@@ -73,7 +73,10 @@ export function CollectionsPage() {
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden surface">
+    <div
+      className="flex-1 flex flex-col overflow-hidden"
+      style={{ background: 'var(--rail)' }}
+    >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
         style={{ background: 'var(--panel-2)' }}
@@ -203,7 +206,7 @@ export function CollectionsPage() {
           <div className="h-full flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
             >
               <Layers size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No collections yet</div>
@@ -275,14 +278,21 @@ function CollectionCard({
   return (
     <Link
       to={`/c/${c.id}`}
-      className="group block rounded-md overflow-hidden no-underline transition-colors"
+      /* No `transition-colors`: the card's bg + border come from
+         CSS vars that flip on theme swap; a colour transition would
+         animate the card ~150ms behind the rest of the chrome.
+         Hover-affordance lives on the inner cover/title via their
+         own subtle treatments instead. */
+      className="group block rounded-md overflow-hidden no-underline"
       style={{
         background: 'var(--panel)',
         border: '1px solid var(--border)',
       }}
     >
-      <CoverArt preview={c.preview} memberCount={c.memberCount} />
-      <div className="px-2.5 py-2">
+      <div style={{ borderBottom: '1px solid var(--border)' }}>
+        <CoverArt preview={c.preview} memberCount={c.memberCount} />
+      </div>
+      <div className="px-2.5 py-2" style={{ background: 'var(--viewer)' }}>
         <div className="text-[12.5px] font-medium text-fg truncate" title={c.name}>
           {c.name}
         </div>
@@ -334,7 +344,7 @@ function CoverArt({
     return (
       <div
         className="w-full aspect-square flex items-center justify-center"
-        style={{ background: 'var(--bg)' }}
+        style={{ background: 'var(--viewer)' }}
       >
         <Layers size={26} className="text-subtle" strokeWidth={1.4} />
       </div>
@@ -345,7 +355,7 @@ function CoverArt({
     return (
       <div
         className="relative w-full aspect-square overflow-hidden"
-        style={{ background: 'var(--bg)' }}
+        style={{ background: 'var(--viewer)' }}
       >
         <CoverTile item={it} mode="single" />
         {memberCount > 1 && (
@@ -370,7 +380,7 @@ function CoverArt({
       }}
     >
       {preview.slice(0, 4).map((it) => (
-        <div key={it.docId} className="relative overflow-hidden" style={{ background: 'var(--bg)' }}>
+        <div key={it.docId} className="relative overflow-hidden" style={{ background: 'var(--viewer)' }}>
           <CoverTile item={it} mode="mosaic" />
         </div>
       ))}
@@ -394,7 +404,7 @@ function CoverTile({
       return (
         <div
           className="absolute inset-0 flex items-center justify-center"
-          style={{ background: 'var(--panel)' }}
+          style={{ background: 'var(--viewer)' }}
         >
           <FileText size={18} className="text-subtle" strokeWidth={1.4} />
         </div>
@@ -407,7 +417,7 @@ function CoverTile({
     return (
       <div
         className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-3"
-        style={{ background: 'var(--bg)' }}
+        style={{ background: 'var(--viewer)' }}
       >
         <FileText size={36} className="text-subtle" strokeWidth={1.3} />
         <div className="text-[11.5px] text-fg text-center font-medium leading-tight line-clamp-2 break-all">

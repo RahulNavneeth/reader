@@ -20,6 +20,7 @@ import { setFaviconForFile } from '../lib/favicon'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
+import { FindSimilarButton } from './FindSimilarButton'
 import { CollectionsToolbarButton } from './CollectionsToolbarButton'
 import { DocRail } from './DocRail'
 import { VersionDiffView } from './VersionDiffView'
@@ -50,7 +51,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
   // resolve under the right namespace instead of the requester's.
   const ownerOpt = searchParams.get('owner') || undefined
   const callerOpts = ownerOpt ? { owner: ownerOpt } : undefined
-  const { setCurrentFolder, refresh } = useVault()
+  const { setCurrentFolder, refresh, chatEnabled } = useVault()
   const confirm = useConfirm()
   const [copyBusy, setCopyBusy] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -387,10 +388,14 @@ export function PathViewer({ path, canEdit = true }: Props) {
             className="btn-ghost"
             disabled={indexing}
             onClick={indexNow}
-            title="Run extraction + embedding so this file is searchable"
+            title={`${reindexLabel} — run extraction + embedding so this file is searchable`}
+            aria-label={reindexLabel}
           >
             {indexing ? <RefreshCw size={13} className="animate-spin" /> : <Sparkles size={13} />}
-            {indexing ? 'Indexing…' : reindexLabel}
+            {/* Label stays visible only while indexing so the user
+                gets progress feedback; idle state is icon-only to
+                keep the toolbar compact. */}
+            {indexing && <span>Indexing…</span>}
           </button>
         )}
         {(!ownerOpt || canEdit) && (
@@ -401,7 +406,8 @@ export function PathViewer({ path, canEdit = true }: Props) {
               owner={ownerOpt}
               onSaved={(next) => meta && setMeta({ ...meta, tags: next })}
             />
-            {meta && <CollectionsToolbarButton docId={meta.id} />}
+            {meta && <CollectionsToolbarButton docId={meta.id} path={meta.storageKey} />}
+            {meta && <FindSimilarButton docId={meta.id} path={meta.storageKey} ownerHint={ownerOpt} />}
             <ActivityButton path={path} />
           </>
         )}
@@ -426,9 +432,8 @@ export function PathViewer({ path, canEdit = true }: Props) {
                 }
               />
             ) : (
-              <button className="btn-ghost" disabled>
+              <button className="btn-ghost" disabled title="Private" aria-label="Private">
                 <Lock size={13} />
-                Private
               </button>
             )}
           </>
@@ -496,13 +501,17 @@ export function PathViewer({ path, canEdit = true }: Props) {
               ) : (
                 <CopyIcon size={13} />
               )}
-              {copied ? 'Copied' : 'Copy'}
             </button>
           )
         })()}
-        <a className="btn-ghost" href={api.rawUrl(path, callerOpts)} download={filename}>
+        <a
+          className="btn-ghost"
+          href={api.rawUrl(path, callerOpts)}
+          download={filename}
+          title="Download"
+          aria-label="Download"
+        >
           <Download size={14} />
-          Download
         </a>
         {/* Move to Trash (30-day retention; user can restore). Hidden
             for share-recipients — they can't delete in the owner's
@@ -539,7 +548,6 @@ export function PathViewer({ path, canEdit = true }: Props) {
             ) : (
               <Trash2 size={13} />
             )}
-            Delete
           </button>
         )}
         <button className="btn-ghost" onClick={() => navigate('/')} title="Close">
@@ -782,8 +790,10 @@ export function PathViewer({ path, canEdit = true }: Props) {
         </div>
         {/* Floating Chat button — sits in the bottom-right of the doc
             pane (above the doc, not inside its scroll), opens the
-            sidebar. Hidden when the sidebar is already open. */}
-        {!chatOpen && meta && (
+            sidebar. Hidden when the sidebar is already open OR when
+            the workspace has Reader AI turned off (admin → Ollama →
+            Chat toggle / CHAT_ENABLED=false). */}
+        {chatEnabled && !chatOpen && meta && (
           <button
             className="absolute bottom-5 right-5 z-30 h-11 w-11 rounded-full inline-flex items-center justify-center transition-transform hover:scale-105"
             style={{
@@ -803,8 +813,9 @@ export function PathViewer({ path, canEdit = true }: Props) {
             selections in the chat sidebar / outline don't trigger
             it. The handler opens the chat and queues the selection
             as a pending message — ChatDock consumes it and auto-
-            sends "Explain this: …" once mounted. */}
-        {meta && (
+            sends "Explain this: …" once mounted. Hidden alongside
+            the chat dock when Reader AI is off. */}
+        {chatEnabled && meta && (
           <SelectionPopover
             containerRef={contentRef}
             onExplain={(text) => {
@@ -831,7 +842,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
            adjacent to the content. The natural reading flow is left
            → right; the active "ask" surface belongs next to the doc,
            not pushed past navigation chrome. */}
-       {chatOpen && chatMeta && (
+       {chatEnabled && chatOpen && chatMeta && (
          <ChatDock
            meta={chatMeta}
            onClose={() => setChatOpen(false)}

@@ -16,6 +16,8 @@ export type PublicUser = {
   quotaBytes?: number
   /** Optional contact address for notifications. */
   email?: string
+  /** When true, /api/auth/logout also revokes all OAuth grants. */
+  revokeOauthOnSignout?: boolean
 }
 
 
@@ -242,7 +244,10 @@ const q = (params: Record<string, string | number | undefined>): string => {
 export const api = {
   // bootstrap / auth
   bootstrap: () => get<{ hasAdmin: boolean; allowOpenSignup: boolean }>('/api/bootstrap'),
-  me: () => get<{ user: PublicUser }>('/api/auth/me'),
+  me: () =>
+    get<{ user: PublicUser; workspace?: { chatEnabled?: boolean } }>(
+      '/api/auth/me',
+    ),
   accountStats: () =>
     get<{
       user: PublicUser
@@ -304,8 +309,17 @@ export const api = {
     get<{ meta: DocumentMeta | null }>(
       `/api/file/meta${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
     ),
-  rawUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
-    `/api/file/raw${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
+  /** Bytes URL for a file. Bare path so users see a clean URL in the
+   *  address bar (no `?path=…` exposing /api/file/raw); the backend's
+   *  setNotFoundHandler picks it up and runs the same access checks
+   *  as /api/file/raw. Browsers navigating directly get the SPA viewer
+   *  (Accept: text/html negotiation), media tags / fetch get the raw
+   *  bytes. `?p=` and `?owner=` still apply for public-password +
+   *  cross-owner lookup. */
+  rawUrl: (rel: string, opts?: { password?: string; owner?: string }) => {
+    const segs = rel.split('/').filter(Boolean).map(encodeURIComponent).join('/')
+    return `/${segs}${q({ p: opts?.password, owner: opts?.owner })}`
+  },
   thumbnailUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
     `/api/file/thumbnail${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
   previewUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
@@ -502,6 +516,59 @@ export const api = {
       return r.json() as Promise<{ ok: true }>
     }),
 
+  // templates
+  listTemplates: () =>
+    get<{
+      templates: {
+        path: string
+        name: string
+        title: string
+        bytes: number
+        updatedAt: number
+        preview: string
+      }[]
+    }>('/api/templates'),
+  instantiateTemplate: (b: {
+    template: string
+    target: string
+    title?: string
+    vars?: Record<string, string>
+  }) =>
+    post<{ ok: true; document: DocumentMeta }>('/api/templates/instantiate', b),
+
+  // calendar heatmap
+  accountCalendar: (from?: string, to?: string) => {
+    const params = new URLSearchParams()
+    if (from) params.set('from', from)
+    if (to) params.set('to', to)
+    const qs = params.toString()
+    return get<{
+      from: string
+      to: string
+      total: number
+      days: { day: string; count: number; lastTs: number }[]
+    }>(`/api/account/calendar${qs ? '?' + qs : ''}`)
+  },
+
+  // find-similar
+  findSimilarDocs: (docId: string, limit?: number, opts?: { path?: string }) =>
+    get<{
+      hits: {
+        docId: string
+        title: string
+        path: string
+        owner: string
+        score: number
+        snippet: string
+        source: string
+      }[]
+    }>(
+      `/api/search/similar/${encodeURIComponent(docId)}${q({
+        limit: limit != null ? String(limit) : undefined,
+        path: opts?.path,
+      })}`,
+    ),
+
   // saved views
   listViews: () =>
     get<{ views: { id: string; name: string; query?: string; tag?: string; createdAt: number }[] }>(
@@ -584,8 +651,27 @@ export const api = {
   move: (from: string, to: string) => post<{ ok: true }>('/api/file/move', { from, to }),
 
   // search
-  searchKnowledge: (qstr: string, limit = 20) =>
-    get<{ query: string; hits: SearchHit[] }>(`/api/search/knowledge${q({ q: qstr, limit })}`),
+  searchKnowledge: (
+    qstr: string,
+    limit = 20,
+    filters?: {
+      mime?: string[]
+      tags?: string[]
+      folder?: string
+      after?: number
+      before?: number
+    },
+  ) => {
+    const params: Record<string, string | number | undefined> = { q: qstr, limit }
+    if (filters?.mime && filters.mime.length > 0) params.mime = filters.mime.join(',')
+    if (filters?.tags && filters.tags.length > 0) params.tags = filters.tags.join(',')
+    if (filters?.folder) params.folder = filters.folder
+    if (typeof filters?.after === 'number') params.after = filters.after
+    if (typeof filters?.before === 'number') params.before = filters.before
+    return get<{ query: string; hits: SearchHit[] }>(
+      `/api/search/knowledge${q(params)}`,
+    )
+  },
 
   // admin — users
   adminUsers: () => get<{ users: PublicUser[] }>('/api/admin/users'),
@@ -635,6 +721,10 @@ export const api = {
       failed: number
       errors: { id: string; error: string }[]
     }>('/api/admin/reembed-all'),
+  adminReconcileVault: () =>
+    post<{ scanned: number; ingested: number; updated: number; skipped: number }>(
+      '/api/admin/reconcile-vault',
+    ),
   adminStats: () =>
     get<{
       totals: { documents: number; bytes: number; users: number; publicDocs: number; embeddedDocs: number }
@@ -659,25 +749,92 @@ export const api = {
       counts: { pending: number; running: number; completed: number; failed: number }
     }>('/api/admin/jobs'),
 
+  /** Sweep every hook secret and re-encrypt under the current
+   *  SESSION_SECRET. Use after rotating the env-derived key. */
+  // ── Admin: OAuth clients ────────────────────────────────────────
+  adminOauthClients: () =>
+    get<{
+      clients: Array<{
+        clientId: string
+        clientName: string
+        redirectUris: string[]
+        softwareId?: string
+        softwareVersion?: string
+        hasSecret: boolean
+        createdAt: number
+        createdBy?: string
+        activeGrants: number
+        lastUsedAt?: number
+      }>
+    }>('/api/admin/oauth-clients'),
+  adminDeleteOauthClient: (clientId: string) =>
+    request<{ ok: true }>('DELETE', `/api/admin/oauth-clients/${encodeURIComponent(clientId)}`),
+  adminRotateWebhookSecrets: () =>
+    post<{
+      total: number
+      rotated: number
+      failed: number
+      errors: Array<{ id: string; error: string }>
+    }>('/api/admin/webhooks/rotate-secrets'),
   adminWebhooks: () =>
     get<{
       webhooks: {
         id: string
         url: string
-        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
+        events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
         secret?: string
+        hasSecret?: boolean
         enabled?: boolean
         createdAt: number
+        owner?: string
         lastDelivery?: { ts: number; status: number | null; error?: string }
+        deadLetter?: Array<{
+          id: string
+          ts: number
+          event: unknown
+          lastStatus: number | null
+          lastError?: string
+        }>
+        consecutiveFailures?: number
+        circuitOpenedAt?: number
+        recentDeliveries?: Array<{
+          ts: number
+          status: number | null
+          error?: string
+          eventType: string
+          kind: 'dispatch' | 'retry' | 'test'
+        }>
       }[]
     }>('/api/admin/webhooks'),
   adminCreateWebhook: (body: {
     url: string
-    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
+    events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
     secret?: string
     enabled?: boolean
   }) =>
     post<{ webhook: any }>('/api/admin/webhooks', body),
+  adminUpdateWebhook: (
+    id: string,
+    body: {
+      url?: string
+      events?: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+      secret?: string
+      enabled?: boolean
+    },
+  ) =>
+    request<{ webhook: any }>(
+      'PATCH',
+      `/api/admin/webhooks/${encodeURIComponent(id)}`,
+      body,
+    ),
+  adminTestWebhook: (id: string) =>
+    post<{ ok: boolean; status: number | null; error?: string }>(
+      `/api/admin/webhooks/${encodeURIComponent(id)}/test`,
+    ),
+  adminRetryWebhook: (id: string, entryId: string) =>
+    post<{ ok: boolean; status: number | null; error?: string }>(
+      `/api/admin/webhooks/${encodeURIComponent(id)}/retry/${encodeURIComponent(entryId)}`,
+    ),
   adminDeleteWebhook: (id: string) =>
     fetch(`/api/admin/webhooks/${id}`, { method: 'DELETE', credentials: 'include', headers: { 'X-Requested-With': 'fetch' } }).then(
       async (r) => {
@@ -756,26 +913,140 @@ export const api = {
     }),
   accountDeleteToken: (id: string) =>
     request<{ ok: true }>('DELETE', `/api/account/tokens/${encodeURIComponent(id)}`),
+  // ── OAuth (third-party MCP connections) ─────────────────────────
+  /** Read what a third-party MCP client is asking for. Used by the
+   *  consent page to render the client name + scope checkboxes. */
+  oauthConsentContext: (params: { client_id: string; scope?: string; redirect_uri?: string }) =>
+    get<{
+      client: {
+        clientId: string
+        clientName: string
+        softwareId?: string
+        createdAt: number
+      }
+      redirect: { host: string; isLoopback: boolean } | null
+      requested: string[]
+      catalog: Array<{ scope: string; label: string; description: string; write: boolean }>
+    }>(
+      '/oauth/consent-context?' +
+        new URLSearchParams(params as Record<string, string>).toString(),
+    ),
+  /** Submit consent decision. Server returns the final client redirect
+   *  URL (with code/state on approve, or error/state on deny). */
+  oauthDecide: (body: {
+    client_id: string
+    redirect_uri: string
+    state: string
+    code_challenge: string
+    code_challenge_method: 'S256'
+    /** Original scope set as advertised on the consent URL. The server
+     *  uses this as the upper bound for what the user may grant. */
+    scope: string
+    /** HMAC over the authorize-request tuple, signed at GET /authorize. */
+    req: string
+    scopes: string[]
+    approve: boolean
+  }) => post<{ redirect: string }>('/oauth/authorize/decide', body),
+  /** List all third-party apps the user has granted access to. */
+  accountOauthGrants: () =>
+    get<{
+      grants: Array<{
+        clientId: string
+        clientName: string
+        scopes: string[]
+        createdAt: number
+        lastUsedAt?: number
+      }>
+    }>('/api/account/oauth-grants'),
+  accountRevokeOauthGrant: (clientId: string) =>
+    request<{ ok: true }>(
+      'DELETE',
+      `/api/account/oauth-grants/${encodeURIComponent(clientId)}`,
+    ),
+  accountUpdatePreferences: (body: { revokeOauthOnSignout?: boolean }) =>
+    request<{ user: PublicUser }>('PATCH', '/api/account/preferences', body),
+  /** Static documentation of every webhook event shape. The picker
+   *  UI links to this so receivers know what JSON to expect. */
+  accountWebhookEventShapes: () =>
+    get<{
+      envelope: {
+        description: string
+        fields: Record<string, string>
+        headers: Record<string, string>
+      }
+      events: Array<{
+        type: string
+        description: string
+        sample: Record<string, unknown>
+      }>
+    }>('/api/account/webhooks/event-shapes'),
   accountWebhooks: () =>
     get<{
       webhooks: Array<{
         id: string
         url: string
-        events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
-        secret?: string
+        events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+        hasSecret?: boolean
         enabled?: boolean
         createdAt: number
         owner?: string
         lastDelivery?: { ts: number; status: number | null; error?: string }
+        deadLetter?: Array<{
+          id: string
+          ts: number
+          event: unknown
+          lastStatus: number | null
+          lastError?: string
+        }>
+        /** Circuit breaker state. When the dispatcher trips it after
+         *  too many consecutive failures, `enabled` is flipped to
+         *  false AND `circuitOpenedAt` gets a timestamp so the UI
+         *  can explain WHY the hook is off. */
+        consecutiveFailures?: number
+        circuitOpenedAt?: number
+        /** Ring-buffered log of the last 20 delivery attempts
+         *  (success + failure). Rendered as the "Recent activity"
+         *  list under each hook. */
+        recentDeliveries?: Array<{
+          ts: number
+          status: number | null
+          error?: string
+          eventType: string
+          kind: 'dispatch' | 'retry' | 'test'
+        }>
       }>
     }>('/api/account/webhooks'),
   accountCreateWebhook: (body: {
     url: string
-    events: Array<'upload' | 'edit' | 'delete' | 'share' | 'tags' | 'visibility' | 'ingest'>
+    events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
     secret?: string
     enabled?: boolean
   }) =>
     post<{ webhook: any }>('/api/account/webhooks', body),
+  accountUpdateWebhook: (
+    id: string,
+    body: {
+      url?: string
+      events?: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+      secret?: string
+      enabled?: boolean
+    },
+  ) =>
+    request<{ webhook: any }>(
+      'PATCH',
+      `/api/account/webhooks/${encodeURIComponent(id)}`,
+      body,
+    ),
+  accountTestWebhook: (id: string) =>
+    post<{ ok: boolean; status: number | null; error?: string }>(
+      `/api/account/webhooks/${encodeURIComponent(id)}/test`,
+      {},
+    ),
+  accountRetryWebhook: (id: string, entryId: string) =>
+    post<{ ok: boolean; status: number | null; error?: string }>(
+      `/api/account/webhooks/${encodeURIComponent(id)}/retry/${encodeURIComponent(entryId)}`,
+      {},
+    ),
   accountDeleteWebhook: (id: string) =>
     request<{ ok: true }>('DELETE', `/api/account/webhooks/${encodeURIComponent(id)}`),
 
@@ -1224,6 +1495,9 @@ export type ProposedEditOpDTO =
   | (ProposedEditOpStateDTO & { op: 'delete_section'; heading: string })
   | (ProposedEditOpStateDTO & { op: 'append_text'; content: string })
   | (ProposedEditOpStateDTO & { op: 'prepend_text'; content: string })
+  // Full-file replace (non-markdown): the whole document becomes
+  // `content`. Card shows a diff against the original.
+  | (ProposedEditOpStateDTO & { op: 'rewrite_file'; content: string })
 
 export type ChatThreadDTO = {
   id: string

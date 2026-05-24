@@ -20,7 +20,16 @@ import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
  * — re-fetched after each mutation so the chip field stays in sync
  * with the server's view.
  */
-export function CollectionsToolbarButton({ docId }: { docId: string }) {
+export function CollectionsToolbarButton({
+  docId,
+  path,
+}: {
+  docId: string
+  /** Storage key for the same doc. Sent as a fallback so the server
+   *  can resolve via path if the viewer's docId got stale (e.g. the
+   *  doc was re-ingested under a new id since the viewer loaded). */
+  path?: string
+}) {
   const [open, setOpen] = useState(false)
   const [all, setAll] = useState<Array<{ id: string; name: string }> | null>(null)
   const [containing, setContaining] = useState<Set<string>>(new Set())
@@ -116,7 +125,10 @@ export function CollectionsToolbarButton({ docId }: { docId: string }) {
     setBusy(cid)
     setError(null)
     try {
-      const r = await api.addCollectionItems(cid, { docIds: [docId] })
+      const r = await api.addCollectionItems(cid, {
+        docIds: [docId],
+        ...(path ? { paths: [path] } : {}),
+      })
       if (r.skipped.length > 0 && r.added.length === 0) {
         setError(r.skipped[0]?.reason ?? 'could not add')
         return
@@ -158,7 +170,14 @@ export function CollectionsToolbarButton({ docId }: { docId: string }) {
     setError(null)
     try {
       const c = await api.createCollection({ name })
-      await api.addCollectionItems(c.collection.id, { docIds: [docId] })
+      const r = await api.addCollectionItems(c.collection.id, {
+        docIds: [docId],
+        ...(path ? { paths: [path] } : {}),
+      })
+      if (r.added.length === 0 && r.skipped.length > 0) {
+        setError(r.skipped[0]?.reason ?? 'could not add')
+        return
+      }
       setDraft('')
       setHover(0)
       // Refresh so the brand-new collection shows up as a chip.
@@ -203,7 +222,8 @@ export function CollectionsToolbarButton({ docId }: { docId: string }) {
       <button
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
-        title="Add to collection"
+        title={triggerLabel}
+        aria-label="Collections"
         aria-expanded={open}
         style={{
           ...(containing.size > 0 ? { color: 'var(--accent)' } : null),
@@ -211,7 +231,9 @@ export function CollectionsToolbarButton({ docId }: { docId: string }) {
         }}
       >
         <Layers size={13} />
-        <span className="truncate max-w-[140px]">{triggerLabel}</span>
+        {containing.size > 0 && (
+          <span className="text-[10px] font-semibold tabular-nums">{containing.size}</span>
+        )}
       </button>
       {open && (
         <div
@@ -259,8 +281,8 @@ export function CollectionsToolbarButton({ docId }: { docId: string }) {
               className="flex-1 min-w-[80px] h-[22px] bg-transparent outline-none text-[12.5px] text-fg placeholder:text-subtle"
               placeholder={
                 inChips.length === 0
-                  ? 'Search or create…'
-                  : 'Add another…'
+                  ? 'Find a collection or type a new name…'
+                  : 'Add to another collection…'
               }
               value={draft}
               onChange={(e) => {

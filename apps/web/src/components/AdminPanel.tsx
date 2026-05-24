@@ -19,6 +19,9 @@ import {
   Mail,
   Send,
   HardDrive,
+  RefreshCw,
+  Webhook,
+  Plug,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate } from 'react-router-dom'
@@ -31,8 +34,10 @@ import {
   type WorkspaceSettings,
 } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
+import { AdminWebhooksPanel } from './AdminWebhooksPanel'
+import { AdminOauthClientsPanel } from './AdminOauthClientsPanel'
 
-type Section = 'general' | 'users' | 'duplicates' | 'embeddings' | 'storage' | 'mounts' | 'mail' | 'advanced'
+type Section = 'general' | 'users' | 'duplicates' | 'embeddings' | 'storage' | 'mounts' | 'mail' | 'webhooks' | 'oauth-clients' | 'advanced'
 
 type Group = {
   label: string
@@ -58,11 +63,15 @@ const GROUPS: Group[] = [
   },
   {
     label: 'Notifications',
-    items: [{ id: 'mail', label: 'Email (SMTP)', icon: Mail }],
+    items: [
+      { id: 'mail', label: 'Email (SMTP)', icon: Mail },
+      { id: 'webhooks', label: 'Webhooks', icon: Webhook },
+    ],
   },
   {
     label: 'Access',
     items: [
+      { id: 'oauth-clients', label: 'OAuth clients', icon: Plug },
       { id: 'advanced', label: 'Server & sessions', icon: Settings },
     ],
   },
@@ -82,7 +91,7 @@ export function AdminPanel() {
       >
         <div
           className="h-11 px-2 flex items-center gap-1.5 border-b shrink-0"
-          style={{ borderColor: 'var(--border)' }}
+          style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
         >
           <button
             className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -107,9 +116,15 @@ export function AdminPanel() {
                   <button
                     key={item.id}
                     onClick={() => setSection(item.id)}
+                    /* No `transition-colors` on the active row: when the
+                       user switches theme, `--selected` and `--accent`
+                       both flip values; a colour transition would animate
+                       the selected row over ~150ms while everything else
+                       snaps instantly, producing a visible lag. Non-active
+                       rows still get hover smoothing. */
                     className={clsx(
-                      'w-full flex items-center gap-2 px-2 h-7 rounded text-[13px] text-left transition-colors',
-                      !isActive && 'hover:bg-hover',
+                      'w-full flex items-center gap-2 px-2 h-7 rounded text-[13px] text-left',
+                      !isActive && 'transition-colors hover:bg-hover',
                     )}
                     style={{
                       background: isActive ? 'var(--selected)' : 'transparent',
@@ -144,6 +159,8 @@ export function AdminPanel() {
             {section === 'storage' && <StoragePanel />}
             {section === 'mounts' && <ExternalMountsPanel />}
             {section === 'mail' && <MailPanel />}
+            {section === 'webhooks' && <AdminWebhooksPanel />}
+            {section === 'oauth-clients' && <AdminOauthClientsPanel />}
             {section === 'advanced' && <AdvancedPanel />}
           </div>
         </div>
@@ -215,7 +232,7 @@ function GeneralPanel() {
     setDataMsg(null)
     try {
       await api.adminSetDataDir(trimmed)
-      setDataMsg('Data dir saved. Restart the server to use the new location. Existing data is NOT auto-moved.')
+      setDataMsg('Data dir saved. Restart the server to apply.')
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -290,10 +307,16 @@ function GeneralPanel() {
       {error && <ErrText text={error} />}
 
       <Card title="Locations">
-        <div>
-          <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1">
-            Vault root
-          </div>
+        <input
+          ref={folderInputRef}
+          type="file"
+          /* @ts-expect-error - non-standard but widely supported folder-pick attrs */
+          webkitdirectory=""
+          directory=""
+          style={{ display: 'none' }}
+          onChange={onFolderPicked}
+        />
+        <FieldRow label="Vault root">
           <div className="flex items-center gap-2">
             <input
               className="input flex-1"
@@ -302,57 +325,22 @@ function GeneralPanel() {
               onChange={(e) => setVaultDraft(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && saveVaultRoot()}
             />
-            <input
-              ref={folderInputRef}
-              type="file"
-              /* @ts-expect-error - non-standard but widely supported folder-pick attrs */
-              webkitdirectory=""
-              directory=""
-              style={{ display: 'none' }}
-              onChange={onFolderPicked}
-            />
             <button
-              className="btn-ghost"
+              className="btn-ghost h-8 w-8 px-0 shrink-0"
               disabled={browsing || savingPath}
               onClick={() => openBrowse('vault')}
-              title="Pick a folder via Finder"
+              title="Browse — pick a folder via Finder"
+              aria-label="Browse for folder"
             >
               {browsing && browseTarget === 'vault' ? (
                 <Loader2 size={13} className="animate-spin" />
               ) : (
                 <FolderSearch size={13} />
               )}
-              Browse
             </button>
-            <button
-              className="btn-primary"
-              disabled={!vaultDirty || savingPath}
-              onClick={() => saveVaultRoot()}
-            >
-              {savingPath ? <Loader2 size={13} className="animate-spin" /> : null}
-              Save
-            </button>
-            {vaultDirty && (
-              <button
-                className="btn-ghost"
-                disabled={savingPath}
-                onClick={() => setVaultDraft(sys.vaultRoot)}
-              >
-                Reset
-              </button>
-            )}
           </div>
-          {pathMsg && (
-            <div className="mt-1.5 text-[11.5px]" style={{ color: '#00875A' }}>
-              {pathMsg}
-            </div>
-          )}
-        </div>
-
-        <div className="border-t pt-3" style={{ borderColor: 'var(--border)' }}>
-          <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-1">
-            Data dir
-          </div>
+        </FieldRow>
+        <FieldRow label="Data dir">
           <div className="flex items-center gap-2">
             <input
               className="input flex-1"
@@ -362,50 +350,40 @@ function GeneralPanel() {
               onKeyDown={(e) => e.key === 'Enter' && saveDataDir()}
             />
             <button
-              className="btn-ghost"
+              className="btn-ghost h-8 w-8 px-0 shrink-0"
               disabled={browsing || savingData}
               onClick={() => openBrowse('data')}
-              title="Pick a folder via Finder"
+              title="Browse — pick a folder via Finder"
+              aria-label="Browse for folder"
             >
               {browsing && browseTarget === 'data' ? (
                 <Loader2 size={13} className="animate-spin" />
               ) : (
                 <FolderSearch size={13} />
               )}
-              Browse
             </button>
-            <button
-              className="btn-primary"
-              disabled={dataDraft.trim() === sys.dataDir || savingData}
-              onClick={() => saveDataDir()}
-            >
-              {savingData ? <Loader2 size={13} className="animate-spin" /> : null}
-              Save
-            </button>
-            {dataDraft.trim() !== sys.dataDir && (
-              <button
-                className="btn-ghost"
-                disabled={savingData}
-                onClick={() => setDataDraft(sys.dataDir)}
-              >
-                Reset
-              </button>
-            )}
           </div>
-          {dataMsg && (
-            <div
-              className="mt-2 px-3 py-2 rounded text-[11.5px]"
-              style={{ background: '#FFFAE6', color: '#974F0C', border: '1px solid #FFE0AC' }}
-            >
-              {dataMsg}
-            </div>
-          )}
-          <Hint>
-            <strong>Existing data is not auto-migrated</strong> — move it manually before
-            restarting.
-          </Hint>
-        </div>
+        </FieldRow>
+        {dataMsg && (
+          <div
+            className="mt-1 px-3 py-2 rounded text-[11.5px]"
+            style={{ background: '#FFFAE6', color: '#974F0C', border: '1px solid #FFE0AC' }}
+          >
+            {dataMsg}
+          </div>
+        )}
+        <Hint>Restart the server after changing either path. Existing data isn't moved automatically.</Hint>
       </Card>
+
+      <SaveBar
+        onSave={async () => {
+          if (vaultDirty) await saveVaultRoot()
+          if (dataDraft.trim() !== sys.dataDir) await saveDataDir()
+        }}
+        saving={savingPath || savingData}
+        msg={pathMsg}
+        disabled={!vaultDirty && dataDraft.trim() === sys.dataDir}
+      />
 
       {candidates && (
         <div
@@ -533,19 +511,14 @@ function EmbeddingsPanel() {
       <Card title="Ollama">
         <div className="flex items-center gap-3">
           <Toggle checked={enabled} onChange={() => setEnabled((v) => !v)} disabled={saving} />
-          <div className="flex-1 text-[12.5px]">
-            <div className="font-medium text-fg">Embeddings enabled</div>
-            <div className="text-muted mt-0.5">
-              Status:{' '}
-              {sys.ollama.available ? (
-                <Badge color="#00875A" icon={<CheckCircle2 size={11} />}>connected</Badge>
-              ) : sys.ollama.enabled ? (
-                <Badge color="#BF2600" icon={<XCircle size={11} />}>unreachable</Badge>
-              ) : (
-                <Badge color="#6B778C">disabled</Badge>
-              )}
-            </div>
-          </div>
+          <span className="text-[12.5px] text-fg font-medium flex-1">Embeddings</span>
+          {sys.ollama.available ? (
+            <Badge color="#00875A" icon={<CheckCircle2 size={11} />}>connected</Badge>
+          ) : sys.ollama.enabled ? (
+            <Badge color="#BF2600" icon={<XCircle size={11} />}>unreachable</Badge>
+          ) : (
+            <Badge color="#6B778C">off</Badge>
+          )}
         </div>
         <FieldRow label="Endpoint">
           <input
@@ -588,12 +561,7 @@ function EmbeddingsPanel() {
             off (or while picking the right chat model). */}
         <div className="flex items-center gap-3 mt-4 pt-4" style={{ borderTop: '1px solid var(--border)' }}>
           <Toggle checked={chatEnabled} onChange={() => setChatEnabled((v) => !v)} disabled={saving} />
-          <div className="flex-1 text-[12.5px]">
-            <div className="font-medium text-fg">AI chat per document</div>
-            <div className="text-muted mt-0.5">
-              Per-doc chat dock that uses the model below for generation. Requires Ollama to be reachable.
-            </div>
-          </div>
+          <span className="text-[12.5px] text-fg font-medium">Per-document AI chat</span>
         </div>
         <FieldRow label="Chat model">
           {availableModels.length > 0 ? (
@@ -670,6 +638,13 @@ function StoragePanel() {
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [reconciling, setReconciling] = useState(false)
+  const [reconcileResult, setReconcileResult] = useState<{
+    scanned: number
+    ingested: number
+    updated: number
+    skipped: number
+  } | null>(null)
 
   const refresh = async () => {
     try {
@@ -725,6 +700,21 @@ function StoragePanel() {
     }
   }
 
+  const runReconcile = async () => {
+    if (reconciling) return
+    setReconciling(true)
+    setReconcileResult(null)
+    setError(null)
+    try {
+      const r = await api.adminReconcileVault()
+      setReconcileResult(r)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setReconciling(false)
+    }
+  }
+
   if (!sys && !error) return <Muted text="Loading…" />
   if (!sys) return <ErrText text={error || 'failed'} />
 
@@ -743,6 +733,43 @@ function StoragePanel() {
             }
           />
         </FieldRow>
+      </Card>
+
+      <Card title="Reconcile vault">
+        <div className="flex items-center gap-3 flex-wrap">
+          <button
+            className="btn-primary h-8"
+            onClick={runReconcile}
+            disabled={reconciling}
+          >
+            {reconciling ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <RefreshCw size={13} />
+            )}
+            Reconcile now
+          </button>
+          {reconcileResult && (
+            <div className="text-[11.5px] text-subtle">
+              Scanned {reconcileResult.scanned} · ingested{' '}
+              <span className="text-fg font-semibold">
+                {reconcileResult.ingested}
+              </span>{' '}
+              new · updated {reconcileResult.updated}
+              {reconcileResult.skipped > 0 && (
+                <span style={{ color: '#BF2600' }}>
+                  {' '}· {reconcileResult.skipped} failed
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        <Hint>
+          Walks every user's vault folder and ingests any supported file
+          that isn't currently indexed. Use after dropping files in via
+          Finder / rsync, or to recover after a bulk-delete leaves orphan
+          files on disk. Already-indexed files cost just a sha check.
+        </Hint>
       </Card>
 
       <Card title="Backend">
@@ -925,7 +952,7 @@ function MailPanel() {
         </FieldRow>
         <div className="flex items-center gap-2 pt-1">
           <Toggle checked={secure} onChange={() => setSecure((v) => !v)} disabled={saving} />
-          <span className="text-[12.5px] text-fg">TLS on connect (SMTPS, usually port 465)</span>
+          <span className="text-[12.5px] text-fg">TLS on connect</span>
         </div>
         <FieldRow label="From">
           <input
@@ -1088,7 +1115,7 @@ function AdvancedPanel() {
             onChange={() => setCookieSecure((v) => !v)}
             disabled={saving}
           />
-          <span className="text-[12.5px] text-fg">Cookie Secure (HTTPS-only)</span>
+          <span className="text-[12.5px] text-fg">HTTPS-only cookies</span>
         </div>
 
       </Card>
@@ -1222,13 +1249,6 @@ function UsersPanel() {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-end">
-        <button className="btn-primary" onClick={openAdd}>
-          <UserPlus size={14} />
-          Add user
-        </button>
-      </div>
-
       {addOpen && (
         <Modal title="Add user" onClose={() => setAddOpen(false)} width={420}>
           <div className="space-y-2">
@@ -1283,10 +1303,15 @@ function UsersPanel() {
 
       {error && <ErrText text={error} />}
 
-      <div>
-        <SectionLabel>
-          {users ? `${users.length} user${users.length === 1 ? '' : 's'}` : ''}
-        </SectionLabel>
+      <Card
+        title={`Users${users ? ` · ${users.length}` : ''}`}
+        action={
+          <button className="btn-primary h-7" onClick={openAdd}>
+            <UserPlus size={13} />
+            Add user
+          </button>
+        }
+      >
         <div className="rounded border border-app overflow-hidden">
           <table className="w-full text-[13px]">
             <thead style={{ background: 'var(--panel)' }}>
@@ -1320,11 +1345,22 @@ function UsersPanel() {
                     </td>
                     <td className="px-3 py-2">
                       <button
-                        className="text-[11.5px] hover:underline"
-                        style={{ color: u.disabled ? '#BF2600' : '#00875A' }}
+                        className="inline-flex items-center px-1.5 h-5 rounded text-[10px] font-semibold uppercase tracking-wider transition-opacity hover:opacity-80"
+                        title={u.disabled ? 'Click to enable' : 'Click to disable'}
+                        style={
+                          u.disabled
+                            ? {
+                                background: 'color-mix(in srgb, #BF2600 12%, transparent)',
+                                color: '#BF2600',
+                              }
+                            : {
+                                background: 'color-mix(in srgb, #00875A 12%, transparent)',
+                                color: '#00875A',
+                              }
+                        }
                         onClick={() => toggleDisabled(u)}
                       >
-                        {u.disabled ? 'disabled' : 'active'}
+                        {u.disabled ? 'Disabled' : 'Active'}
                       </button>
                     </td>
                     <td className="px-3 py-2 text-right">
@@ -1342,27 +1378,26 @@ function UsersPanel() {
                   </tr>
                   {editing === u.username && (
                     <tr style={{ borderTop: '1px solid var(--border)' }}>
-                      <td colSpan={5} className="px-3 py-3 space-y-3" style={{ background: 'var(--panel)' }}>
-                        <div className="flex items-center gap-2">
-                          <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle w-[120px]">
-                            Upload quota
-                          </div>
+                      <td colSpan={5} className="px-3 py-2" style={{ background: 'var(--panel)' }}>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+                            Quota
+                          </span>
                           <input
                             type="number"
                             min={0}
                             className="input h-7 text-[12px]"
-                            style={{ width: 140 }}
+                            style={{ width: 120 }}
                             placeholder="Unlimited"
                             value={editQuotaMB}
                             onChange={(e) => setEditQuotaMB(e.target.value)}
                           />
-                          <span className="text-[11.5px] text-subtle">MB (blank = unlimited)</span>
-                        </div>
-                        <div className="flex justify-end gap-2">
-                          <button className="btn-ghost" onClick={() => setEditing(null)}>
+                          <span className="text-[11px] text-subtle">MB</span>
+                          <div className="flex-1" />
+                          <button className="btn-ghost h-7" onClick={() => setEditing(null)}>
                             Cancel
                           </button>
-                          <button className="btn-primary" onClick={saveEdit}>
+                          <button className="btn-primary h-7" onClick={saveEdit}>
                             Save
                           </button>
                         </div>
@@ -1377,7 +1412,7 @@ function UsersPanel() {
             </tbody>
           </table>
         </div>
-      </div>
+      </Card>
 
       {settings && (
         <Card title="Sign-ups">
@@ -1450,10 +1485,7 @@ function DuplicatesPanel() {
   return (
     <div className="space-y-5">
       <Hint>
-        <strong>Exact</strong> groups share a sha256 (byte-identical copies).{' '}
-        <strong>Near</strong> groups share a perceptual hash (visually
-        identical — resized, recompressed, mild crop). Trash whichever
-        copies you don't want to keep.
+        <strong>Exact</strong> = byte-identical. <strong>Near</strong> = visually identical (resized, recompressed, cropped).
       </Hint>
       {groups.map((g) => (
         <Card
@@ -1578,28 +1610,26 @@ function Modal({
   )
 }
 
-function Card({ title, children }: { title: string; children: React.ReactNode }) {
+function Card({
+  title,
+  action,
+  children,
+}: {
+  title: string
+  action?: React.ReactNode
+  children: React.ReactNode
+}) {
   return (
-    <section
-      className="rounded border border-app overflow-hidden"
-      style={{ background: 'var(--bg)' }}
-    >
+    <section className="space-y-4">
       <div
-        className="px-3 h-8 flex items-center border-b text-[11.5px] uppercase tracking-wider font-semibold text-subtle"
-        style={{ background: 'var(--panel)', borderColor: 'var(--border)' }}
+        className="flex items-center justify-between gap-3 pb-2"
+        style={{ borderBottom: '1px solid var(--border)' }}
       >
-        {title}
+        <div className="text-[14px] font-semibold text-fg">{title}</div>
+        {action}
       </div>
-      <div className="p-3 space-y-3">{children}</div>
+      <div className="space-y-4 pl-0.5">{children}</div>
     </section>
-  )
-}
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle mb-2 px-1">
-      {children}
-    </div>
   )
 }
 
@@ -1609,8 +1639,10 @@ function Hint({ children }: { children: React.ReactNode }) {
 
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="grid grid-cols-[140px_1fr] gap-3 items-center">
-      <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle">{label}</div>
+    <div>
+      <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
+        {label}
+      </div>
       <div>{children}</div>
     </div>
   )
@@ -1620,14 +1652,16 @@ function SaveBar({
   onSave,
   saving,
   msg,
+  disabled,
 }: {
   onSave: () => void
   saving: boolean
   msg: string | null
+  disabled?: boolean
 }) {
   return (
     <div className="flex items-center gap-3">
-      <button className="btn-primary" onClick={onSave} disabled={saving}>
+      <button className="btn-primary" onClick={onSave} disabled={saving || disabled}>
         {saving ? <Loader2 size={13} className="animate-spin" /> : null}
         Save
       </button>
@@ -1750,16 +1784,7 @@ function ExternalMountsPanel() {
   }
 
   return (
-    <div className="space-y-6">
-      <header>
-        <div className="text-[18px] font-semibold text-fg">External libraries</div>
-        <div className="text-[12.5px] text-muted mt-1">
-          Mount an existing on-disk folder as a read-only library. Every signed-in user can
-          browse it from the sidebar. Files are never written; the vault watcher does not
-          ingest them.
-        </div>
-      </header>
-
+    <div className="space-y-4">
       {error && (
         <div
           className="px-3 py-2 rounded text-[12.5px]"
@@ -1769,11 +1794,7 @@ function ExternalMountsPanel() {
         </div>
       )}
 
-      <section
-        className="rounded-lg p-4"
-        style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
-      >
-        <div className="text-[13px] font-semibold text-fg mb-2.5">Add a mount</div>
+      <Card title="Add a mount">
         <div className="flex flex-col sm:flex-row gap-2">
           <input
             className="input flex-1 h-8 text-[12.5px]"
@@ -1794,16 +1815,16 @@ function ExternalMountsPanel() {
             Add
           </button>
         </div>
-      </section>
+        <Hint>Read-only mounts appear in the sidebar for every user. Never written, never indexed.</Hint>
+      </Card>
 
-      <section>
-        <div className="text-[13px] font-semibold text-fg mb-2">Current mounts</div>
+      <Card title="Current mounts">
         {!mounts ? (
           <div className="text-[12.5px] text-muted inline-flex items-center gap-1.5">
             <Loader2 size={12} className="animate-spin" /> Loading…
           </div>
         ) : mounts.length === 0 ? (
-          <div className="text-[12.5px] text-subtle">No mounts configured.</div>
+          <div className="text-[12.5px] text-subtle">None configured.</div>
         ) : (
           <div className="space-y-1.5">
             {mounts.map((m) => (
@@ -1823,6 +1844,7 @@ function ExternalMountsPanel() {
                   className="btn-ghost"
                   onClick={() => remove(m.id)}
                   title="Remove mount"
+                  aria-label="Remove mount"
                   style={{ color: '#BF2600' }}
                 >
                   <Trash2 size={12} />
@@ -1831,7 +1853,7 @@ function ExternalMountsPanel() {
             ))}
           </div>
         )}
-      </section>
+      </Card>
     </div>
   )
 }

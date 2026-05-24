@@ -55,6 +55,11 @@ const dataDir = anchor.dataDir
   : expand(envStr('DATA_DIR', './data'))
 const isProd = process.env.NODE_ENV === 'production'
 const sessionSecret = envStr('SESSION_SECRET', '')
+/** Optional previous session secret used to decrypt at-rest data
+ *  (webhook secrets, etc.) after the primary was rotated. The
+ *  decrypt path tries the current key first then falls back here;
+ *  successful fallbacks trigger a lazy re-encrypt on next save. */
+const sessionSecretPrevious = envStr('SESSION_SECRET_PREVIOUS', '')
 if (!sessionSecret || sessionSecret.length < 32) {
   // Print the actual command to generate one. Newcomers stare at the
   // "required >= 32 chars" message and don't know what to type.
@@ -180,6 +185,9 @@ export const config = {
   })(),
   session: {
     secret: sessionSecret || randomDevSecret(),
+    /** Previous secret (if set) — used only for decrypting at-rest
+     *  data after rotation. Never used for signing cookies. */
+    secretPrevious: sessionSecretPrevious || '',
     cookieName: 'reader_sid',
     secure: envBool('COOKIE_SECURE', false),
     sameSite: (envStr('COOKIE_SAMESITE', 'lax') as 'lax' | 'strict' | 'none'),

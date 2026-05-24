@@ -6,6 +6,7 @@ import {
   Loader2,
   AlertCircle,
   ArrowLeft,
+  FileText,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { useVault } from '../lib/vault-context'
@@ -79,22 +80,32 @@ export function TrashPage() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto surface">
-      <div className="max-w-[1080px] mx-auto px-8 py-10">
-        <button className="btn-ghost mb-4" onClick={() => navigate('/')}>
-          <ArrowLeft size={13} /> Back to vault
+    <div
+      className="flex-1 flex flex-col overflow-hidden"
+      style={{ background: 'var(--rail)' }}
+    >
+      <header
+        className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
+        style={{ background: 'var(--panel-2)' }}
+      >
+        <button
+          className="btn-ghost h-7 w-7 px-0 shrink-0"
+          onClick={() => navigate('/')}
+          title="Back to vault"
+          aria-label="Back to vault"
+        >
+          <ArrowLeft size={14} />
         </button>
-
-        <header className="mb-6">
-          <div className="text-[26px] font-semibold text-fg leading-tight inline-flex items-center gap-2.5">
-            <Trash2 size={20} className="text-accent" />
-            Trash
-          </div>
-          <div className="text-[13px] text-muted mt-1.5">
-            Items you've deleted from the vault. Restore returns the file to its original
-            path. Anything you don't restore is purged automatically after 30 days.
-          </div>
-        </header>
+        <Trash2 size={13} className="text-accent shrink-0" />
+        <div className="text-[13.5px] font-semibold text-fg">Trash</div>
+        {entries && (
+          <span className="text-[11.5px] text-subtle ml-1.5">
+            {entries.length} {entries.length === 1 ? 'item' : 'items'}
+          </span>
+        )}
+      </header>
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-[1080px] mx-auto px-8 py-6">
 
         {error && (
           <div
@@ -107,8 +118,8 @@ export function TrashPage() {
 
         {!entries ? null : entries.length === 0 ? (
           <div
-            className="rounded-xl p-8 text-center"
-            style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
+            className="rounded-md p-8 text-center"
+            style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
           >
             <div className="text-[14px] text-fg font-medium">Trash is empty</div>
             <div className="text-[12px] text-muted mt-1.5">
@@ -117,63 +128,71 @@ export function TrashPage() {
           </div>
         ) : (
           <div
-            className="rounded-xl overflow-hidden"
-            style={{ background: 'var(--panel)', border: '1px solid var(--border)' }}
+            className="rounded-md overflow-hidden divide-y"
+            style={{
+              background: 'var(--viewer)',
+              border: '1px solid var(--border)',
+              borderColor: 'var(--border)',
+            }}
           >
-            {entries.map((e, i) => (
-              <div
-                key={e.id}
-                className="flex items-center gap-3 px-4 py-3"
-                style={{
-                  borderTop: i === 0 ? undefined : '1px solid var(--border)',
-                }}
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="text-[13.5px] font-medium text-fg truncate">
-                    {e.filename}
+            {entries.map((e) => {
+              const lastSlash = e.storageKey.lastIndexOf('/')
+              const parentDir = lastSlash >= 0 ? e.storageKey.slice(0, lastSlash) : ''
+              return (
+                <div
+                  key={e.id}
+                  className="flex items-center gap-3 px-3 py-2.5"
+                >
+                  <FileText size={14} className="text-subtle shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] font-medium text-fg truncate">
+                      {e.filename}
+                    </div>
+                    <div className="text-[11px] text-subtle truncate mt-0.5">
+                      {parentDir && (
+                        <>
+                          <span className="opacity-80">{parentDir}/</span>
+                          <span className="mx-1.5 opacity-60">·</span>
+                        </>
+                      )}
+                      <span className="tabular-nums">{formatBytes(e.bytes)}</span>
+                      <span className="mx-1.5 opacity-60">·</span>
+                      <span>deleted {timeAgo(e.trashedAt)}</span>
+                      <span className="mx-1.5 opacity-60">·</span>
+                      <span style={{ color: deletionColor(e.trashedAt) }}>
+                        {deletionCountdown(e.trashedAt)}
+                      </span>
+                    </div>
                   </div>
-                  <div className="text-[11.5px] text-subtle truncate mt-0.5">
-                    /{e.storageKey}
-                  </div>
-                </div>
-                <div className="text-[11.5px] text-subtle shrink-0 tabular-nums">
-                  {formatBytes(e.bytes)}
-                </div>
-                <div className="text-[11.5px] shrink-0 w-[180px] text-right">
-                  <div className="text-subtle">deleted {timeAgo(e.trashedAt)}</div>
-                  <div
-                    className="text-[10.5px] mt-0.5"
-                    style={{ color: deletionColor(e.trashedAt) }}
+                  <button
+                    className="btn-ghost shrink-0"
+                    onClick={() => restore(e)}
+                    disabled={busyId === e.id}
+                    title="Restore to original location"
                   >
-                    {deletionCountdown(e.trashedAt)}
-                  </div>
+                    {busyId === e.id ? (
+                      <Loader2 size={12} className="animate-spin" />
+                    ) : (
+                      <RotateCcw size={12} />
+                    )}
+                    Restore
+                  </button>
+                  <button
+                    className="btn-ghost shrink-0"
+                    onClick={() => purge(e)}
+                    disabled={busyId === e.id}
+                    style={{ color: '#BF2600' }}
+                    title="Permanently delete"
+                    aria-label="Permanently delete"
+                  >
+                    <Trash2 size={12} />
+                  </button>
                 </div>
-                <button
-                  className="btn-ghost shrink-0"
-                  onClick={() => restore(e)}
-                  disabled={busyId === e.id}
-                  title="Restore to original location"
-                >
-                  {busyId === e.id ? (
-                    <Loader2 size={12} className="animate-spin" />
-                  ) : (
-                    <RotateCcw size={12} />
-                  )}
-                  Restore
-                </button>
-                <button
-                  className="btn-ghost shrink-0"
-                  onClick={() => purge(e)}
-                  disabled={busyId === e.id}
-                  style={{ color: '#BF2600' }}
-                  title="Permanently delete"
-                >
-                  <Trash2 size={12} />
-                </button>
-              </div>
-            ))}
+              )
+            })}
           </div>
         )}
+        </div>
       </div>
     </div>
   )

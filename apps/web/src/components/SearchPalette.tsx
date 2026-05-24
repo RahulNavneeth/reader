@@ -41,6 +41,13 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
   const [searching, setSearching] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [activeIdx, setActiveIdx] = useState(0)
+  // Faceted filters. The kind chip-bar maps to a mime prefix list
+  // the server applies on top of the auth filter. Tag filter is a
+  // free-form chip list (AND semantics) entered by typing into the
+  // tag input + pressing Enter.
+  const [kindFilter, setKindFilter] = useState<'all' | 'markdown' | 'pdf' | 'image' | 'video' | 'other'>('all')
+  const [tagFilter, setTagFilter] = useState<string[]>([])
+  const [tagDraft, setTagDraft] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -51,7 +58,25 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
     setSettledQuery('')
     setError(null)
     setActiveIdx(0)
+    // Don't reset filters between opens — users repeating the same
+    // filter combo across queries shouldn't have to re-pick chips.
   }, [open])
+
+  // Derive the mime prefix list from the kind chip.
+  const filterPayload = useMemo(() => {
+    const mimeByKind: Record<typeof kindFilter, string[] | undefined> = {
+      all: undefined,
+      markdown: ['text/markdown', 'text/plain'],
+      pdf: ['application/pdf'],
+      image: ['image/'],
+      video: ['video/'],
+      other: undefined,
+    }
+    return {
+      mime: mimeByKind[kindFilter],
+      tags: tagFilter.length > 0 ? tagFilter : undefined,
+    }
+  }, [kindFilter, tagFilter])
 
   // Debounced live search.
   useEffect(() => {
@@ -66,7 +91,7 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
     setSearching(true)
     const t = setTimeout(async () => {
       try {
-        const r = await api.searchKnowledge(query.trim(), 20)
+        const r = await api.searchKnowledge(query.trim(), 20, filterPayload)
         if (!cancel) {
           setHits(r.hits)
           setSettledQuery(query.trim())
@@ -82,7 +107,7 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
       cancel = true
       clearTimeout(t)
     }
-  }, [query, open])
+  }, [query, open, filterPayload])
 
   const openHit = useCallback(
     (hit: SearchHit) => {
@@ -210,6 +235,77 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
         maxHeight: '70vh',
       }}
     >
+      {/* Filter chip-bar. Only shown when the user has typed
+          something or already engaged a filter — otherwise the
+          empty palette looks busier than the actions list it sits
+          on top of. */}
+      {(query.trim() || kindFilter !== 'all' || tagFilter.length > 0) && (
+        <div
+          className="px-2.5 py-2 flex flex-wrap items-center gap-1 border-b"
+          style={{ borderColor: 'var(--border)' }}
+        >
+          {(['all', 'markdown', 'pdf', 'image', 'video'] as const).map((k) => {
+            const active = kindFilter === k
+            const label = k === 'all' ? 'All' : k[0].toUpperCase() + k.slice(1)
+            return (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setKindFilter(k)}
+                className="px-1.5 h-5 rounded text-[10.5px] font-medium transition-colors"
+                style={{
+                  background: active ? 'var(--selected)' : 'transparent',
+                  color: active ? 'var(--accent)' : 'var(--fg-muted)',
+                }}
+                onMouseEnter={(e) => {
+                  if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'var(--hover)'
+                }}
+                onMouseLeave={(e) => {
+                  if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'transparent'
+                }}
+              >
+                {label}
+              </button>
+            )
+          })}
+          <span className="w-px h-3 mx-0.5" style={{ background: 'var(--border)' }} aria-hidden />
+          {tagFilter.map((t) => (
+            <span
+              key={t}
+              className="inline-flex items-center gap-0.5 px-1.5 h-5 rounded text-[10.5px] font-medium"
+              style={{ background: 'var(--selected)', color: 'var(--accent)' }}
+            >
+              #{t}
+              <button
+                type="button"
+                onClick={() => setTagFilter((cur) => cur.filter((x) => x !== t))}
+                className="ml-0.5 hover:opacity-70"
+                aria-label={`Remove tag ${t}`}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          <input
+            value={tagDraft}
+            onChange={(e) => setTagDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                const t = tagDraft.trim().toLowerCase().replace(/^#/, '')
+                if (t && !tagFilter.includes(t)) setTagFilter((cur) => [...cur, t])
+                setTagDraft('')
+              }
+              if (e.key === 'Backspace' && tagDraft === '' && tagFilter.length > 0) {
+                setTagFilter((cur) => cur.slice(0, -1))
+              }
+            }}
+            placeholder="+ tag"
+            className="text-[10.5px] px-1 h-5 w-20 outline-none bg-transparent"
+            style={{ color: 'var(--fg)' }}
+          />
+        </div>
+      )}
       <div ref={listRef} className="overflow-y-auto" style={{ maxHeight: '70vh' }}>
         {error && (
           <div className="px-4 py-3 text-[12.5px]" style={{ color: '#BF2600' }}>

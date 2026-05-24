@@ -191,11 +191,11 @@ export function ShareWithUserButton({ paths }: Props) {
         className="btn-ghost"
         onClick={() => setOpen((v) => !v)}
         title="Share with another user"
+        aria-label="Share"
         aria-expanded={open}
         style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
       >
         <Users size={13} />
-        Share
       </button>
       {open && (
         <div
