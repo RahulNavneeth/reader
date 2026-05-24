@@ -12,6 +12,7 @@ import { getUser } from '../stores/users.js'
 import { listAllDocuments } from '../stores/documents.js'
 import { resolveUserVault, userVaultRoot } from '../lib/userVault.js'
 import { audit } from '../stores/audit.js'
+import { dispatch as dispatchWebhook } from '../services/webhooks.js'
 
 /**
  * User-to-user share endpoints.
@@ -73,12 +74,28 @@ export async function userSharesRoutes(app: FastifyInstance) {
       canEdit: !!body.canEdit,
       label: body.label,
     })
+    // The recipient's search cache should now include this path —
+    // their visibility just changed. Cheap full flush is fine; the
+    // alternative (per-user cache eviction) adds complexity for no
+    // material throughput win on typical share volumes.
+    const { invalidateSearchCache } = await import('../services/search.js')
+    invalidateSearchCache()
     await audit({
       actor: owner.username,
       action: 'vault.share-with',
       target: normalizedPath,
       meta: { recipient: recipient.username, canEdit: share.canEdit, isFolder },
     })
+    dispatchWebhook({
+      type: 'share',
+      path: normalizedPath,
+      actor: owner.username,
+      shareId: share.id,
+      recipient: recipient.username,
+      canEdit: share.canEdit,
+      isFolder,
+      revoked: false,
+    }).catch(() => null)
     // When a folder is shared, also write an audit entry for every
     // descendant file and sub-folder so each item's activity log shows
     // it became accessible via the cascade. Mirrors the public-cascade
@@ -162,12 +179,30 @@ export async function userSharesRoutes(app: FastifyInstance) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     await deleteUserShare(id)
+    // Recipient just lost visibility on this path — flush the
+    // search cache so a subsequent query doesn't keep returning
+    // it. Mirrors the grant path above.
+    const { invalidateSearchCache } = await import('../services/search.js')
+    invalidateSearchCache()
     await audit({
       actor: user.username,
       action: 'vault.share-revoke',
       target: share.storageKey,
       meta: { recipient: share.recipient, owner: share.owner },
     })
+    // Always fire as the share's OWNER so per-user webhook
+    // subscriptions stay tied to the file's owner regardless of who
+    // clicked Revoke (owner, recipient, or admin can all revoke).
+    dispatchWebhook({
+      type: 'share',
+      path: share.storageKey,
+      actor: share.owner,
+      shareId: share.id,
+      recipient: share.recipient,
+      canEdit: share.canEdit,
+      isFolder: share.isFolder,
+      revoked: true,
+    }).catch(() => null)
     return { ok: true }
   })
 }

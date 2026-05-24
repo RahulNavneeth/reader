@@ -46,7 +46,7 @@ import {
 } from '../services/livePhoto.js'
 import { invalidateSearchCache } from '../services/search.js'
 import { publish } from '../services/events.js'
-import { dispatch as dispatchWebhook } from '../services/webhooks.js'
+import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
 import type { DocumentMeta } from '../types.js'
 import { resolveUserVault, userVaultRel, ensureUserVault, userVaultRoot } from '../lib/userVault.js'
 import { hashPassword as hashShareSecret, verifyPassword as verifySharePassword } from '../lib/sharePassword.js'
@@ -622,6 +622,110 @@ function inferMime(filename: string, fallback?: string): string {
   return m[ext] || fallback || 'application/octet-stream'
 }
 
+/**
+ * Stream the bytes of a vault file with full access checks. Shared by:
+ *   - GET /api/file/raw                (explicit API endpoint, kept for back-compat)
+ *   - the bare `/<path>` fallback      (so public/shared/owned files have a
+ *     clean URL form — no `?path=…&owner=…` in the address bar)
+ *
+ * Access semantics mirror /api/resolve + /api/file/raw exactly:
+ *   - anonymous → public file only (with `?p=` password if gated)
+ *   - authed   → own files + share-grants + public, in that precedence
+ *
+ * Returns nothing useful — the helper sends the reply (or an error) itself.
+ * Caller should check `reply.sent` before doing anything else with reply.
+ */
+export async function serveVaultFileBytes(
+  _app: FastifyInstance,
+  req: FastifyRequest,
+  reply: FastifyReply,
+  opts: { rel: string; publicPassword?: string; ownerHint?: string },
+): Promise<FastifyReply> {
+  const { rel, publicPassword, ownerHint } = opts
+
+  // Throttle failed `?p=` attempts before scrypt-verify burns CPU.
+  if (publicPassword) {
+    const locked = gateLockedSeconds(req.ip)
+    if (locked != null) {
+      return reply
+        .code(429)
+        .header('Retry-After', String(locked))
+        .send({ error: 'too many failed password attempts', retryAfter: locked })
+    }
+  }
+
+  const requester = req.currentUser?.username
+  const ctx = await resolveReadContext({ rel, ownerHint, requester })
+  if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+    return reply.code(403).send({ error: 'forbidden' })
+  }
+  const meta = ctx.meta
+  const owner = ctx.owner
+  if (!owner) {
+    return reply.code(401).send({ error: 'auth required' })
+  }
+
+  const gate = publicGate(meta, publicPassword)
+  if (gate === 'password-required' || gate === 'password-wrong') {
+    if (gate === 'password-wrong') recordGateFailure(req.ip)
+    return reply.code(401).send({
+      error: gate === 'password-wrong' ? 'incorrect password' : 'password required',
+      passwordRequired: true,
+    })
+  }
+  if (gate !== 'ok') {
+    if (!req.currentUser) {
+      return reply.code(401).send({ error: 'auth required' })
+    }
+    const u = req.currentUser
+    if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+  } else if (publicPassword) {
+    // Successful gate with password — reset the bucket.
+    clearGateFailures(req.ip)
+  }
+  const abs = resolveVault(rel, owner)
+  const s = await stat(abs).catch(() => null)
+  if (!s || !s.isFile()) {
+    return reply.code(404).send({ error: 'not found' })
+  }
+
+  const mime = inferMime(abs)
+  const disposition = `inline; filename="${path.basename(abs).replace(/"/g, '')}"`
+
+  // Range support — needed for HTML5 <video>, which sends `Range: bytes=...`
+  // to seek. Without 206 responses Safari refuses to play altogether.
+  const range = (req.headers.range || '') as string
+  const m = /^bytes=(\d*)-(\d*)$/.exec(range)
+  if (m) {
+    const total = s.size
+    const start = m[1] ? Number(m[1]) : 0
+    const end = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1
+    if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
+      return reply
+        .code(416)
+        .header('Content-Range', `bytes */${total}`)
+        .send({ error: 'range not satisfiable' })
+    }
+    return reply
+      .code(206)
+      .header('Content-Type', mime)
+      .header('Content-Length', String(end - start + 1))
+      .header('Content-Range', `bytes ${start}-${end}/${total}`)
+      .header('Accept-Ranges', 'bytes')
+      .header('Content-Disposition', disposition)
+      .send(createReadStream(abs, { start, end }))
+  }
+
+  return reply
+    .header('Content-Type', mime)
+    .header('Content-Length', String(s.size))
+    .header('Accept-Ranges', 'bytes')
+    .header('Content-Disposition', disposition)
+    .send(createReadStream(abs))
+}
+
 // ─── routes ─────────────────────────────────────────────────────────────────
 
 export async function vaultRoutes(app: FastifyInstance) {
@@ -1167,79 +1271,11 @@ export async function vaultRoutes(app: FastifyInstance) {
     const { path: rel, p: publicPassword, owner: ownerHint } =
       req.query as { path?: string; p?: string; owner?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-
-    // Throttle failed `?p=` attempts before scrypt-verify burns CPU.
-    if (publicPassword) {
-      const locked = gateLockedSeconds(req.ip)
-      if (locked != null) {
-        return reply
-          .code(429)
-          .header('Retry-After', String(locked))
-          .send({ error: 'too many failed password attempts', retryAfter: locked })
-      }
-    }
-
-    const requester = req.currentUser?.username
-    const ctx = await resolveReadContext({ rel, ownerHint, requester })
-    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
-      return reply.code(403).send({ error: 'forbidden' })
-    }
-    const meta = ctx.meta
-    const owner = ctx.owner
-    if (!owner) return reply.code(401).send({ error: 'auth required' })
-
-    const gate = publicGate(meta, publicPassword)
-    if (gate === 'password-required' || gate === 'password-wrong') {
-      if (gate === 'password-wrong') recordGateFailure(req.ip)
-      return reply.code(401).send({ error: gate === 'password-wrong' ? 'incorrect password' : 'password required', passwordRequired: true })
-    }
-    if (gate !== 'ok') {
-      if (!requireAuth(req, reply)) return
-      const u = req.currentUser!
-      if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
-        return reply.code(403).send({ error: 'forbidden' })
-      }
-    } else if (publicPassword) {
-      // Successful gate with password — reset the bucket.
-      clearGateFailures(req.ip)
-    }
-    const abs = resolveVault(rel, owner)
-    const s = await stat(abs).catch(() => null)
-    if (!s || !s.isFile()) return reply.code(404).send({ error: 'not found' })
-
-    const mime = inferMime(abs)
-    const disposition = `inline; filename="${path.basename(abs).replace(/"/g, '')}"`
-
-    // Range support — needed for HTML5 <video>, which sends `Range: bytes=...`
-    // to seek. Without 206 responses Safari refuses to play altogether.
-    const range = (req.headers.range || '') as string
-    const m = /^bytes=(\d*)-(\d*)$/.exec(range)
-    if (m) {
-      const total = s.size
-      const start = m[1] ? Number(m[1]) : 0
-      const end = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1
-      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= total) {
-        return reply
-          .code(416)
-          .header('Content-Range', `bytes */${total}`)
-          .send({ error: 'range not satisfiable' })
-      }
-      return reply
-        .code(206)
-        .header('Content-Type', mime)
-        .header('Content-Length', String(end - start + 1))
-        .header('Content-Range', `bytes ${start}-${end}/${total}`)
-        .header('Accept-Ranges', 'bytes')
-        .header('Content-Disposition', disposition)
-        .send(createReadStream(abs, { start, end }))
-    }
-
-    return reply
-      .header('Content-Type', mime)
-      .header('Content-Length', String(s.size))
-      .header('Accept-Ranges', 'bytes')
-      .header('Content-Disposition', disposition)
-      .send(createReadStream(abs))
+    return serveVaultFileBytes(app, req, reply, {
+      rel,
+      publicPassword,
+      ownerHint,
+    })
   })
 
   // Display-friendly version of a file. For HEIC this returns the JPEG we
@@ -1570,10 +1606,13 @@ export async function vaultRoutes(app: FastifyInstance) {
       const filename = safeFilename(part.filename || 'upload.bin')
       const finalAbs = await uniquePath(targetDir, filename)
       const finalRel = toVaultRel(finalAbs, user.username)
+      const sha256 = sha256Of(buffer)
+      // Pre-mark so chokidar's `add` doesn't fire a duplicate upload
+      // webhook — we dispatch our own below.
+      markExpectedWrite(finalAbs, sha256)
       await import('node:fs/promises').then(({ writeFile }) => writeFile(finalAbs, buffer))
 
       const mime = inferMime(filename, part.mimetype || undefined)
-      const sha256 = sha256Of(buffer)
       const now = Date.now()
       // Folder cascade for new children: if the closest published
       // ancestor folder is public, the new file inherits its
@@ -1608,7 +1647,14 @@ export async function vaultRoutes(app: FastifyInstance) {
         req.log.warn({ err }, 'live-photo pair check failed')
       })
       const { runJob } = await import('../services/jobs.js')
-      runJob('ingest', finalRel, () => ingestDocument(meta, buffer)).catch((err) => {
+      runJob('ingest', finalRel, async () => {
+        const ingested = await ingestDocument(meta, buffer)
+        // Flush the per-process search cache once the chunks/embeddings
+        // exist, so the next /api/search sees the new doc without
+        // waiting for the TTL.
+        invalidateSearchCache()
+        return ingested
+      }).catch((err) => {
         req.log.warn({ err, rel: finalRel }, 'ingest job failed')
       })
 
@@ -1676,6 +1722,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     await saveMeta(meta)
     const finalMeta = await ingestDocument(meta, buffer)
+    invalidateSearchCache()
     await audit({ actor: user.username, action: 'vault.index', target: rel })
     return { document: redactPublicMeta(finalMeta) }
   })
@@ -1711,10 +1758,18 @@ export async function vaultRoutes(app: FastifyInstance) {
         req.log.warn({ err, rel }, 'trash move failed; hard-deleting')
         return rm(abs, { force: true }).catch(() => null)
       })
+      // Drop the index row so search / list_documents / resolve_path
+      // stop returning a phantom hit pointing at a now-missing file.
+      // The trash manifest (separate from the SQLite row) retains
+      // enough state to recreate the doc on restore. Matches the
+      // semantics MCP `delete_document` already follows.
+      if (meta?.id) await deleteDocument(meta.id).catch(() => null)
     }
     invalidateSearchCache()
     publish({ type: 'trash', path: rel })
-    dispatchWebhook({ type: 'delete', path: rel, actor: user.username }).catch(() => null)
+    // Distinct from `delete` so receivers can differentiate the
+    // recoverable Trash move from a permanent purge.
+    dispatchWebhook({ type: 'trash', path: rel, actor: user.username }).catch(() => null)
     await audit({ actor: user.username, action: 'vault.trash', target: rel })
     return { ok: true }
   })
@@ -1763,6 +1818,17 @@ export async function vaultRoutes(app: FastifyInstance) {
     await mkdir(path.dirname(targetAbs), { recursive: true })
     const blobName = entry.filename.replace(/\.\./g, '_').replace(/[\/\\]/g, '_')
     const src = path.join(config.paths.trash, entry.id, blobName)
+    // Pre-mark so chokidar's `add` event on the restored path doesn't
+    // dispatch its own `upload` webhook on top of the explicit one we
+    // fire below. Hash is read from the source blob before the move.
+    try {
+      const blobBuf = await readFile(src)
+      markExpectedWrite(targetAbs, sha256Of(blobBuf))
+    } catch {
+      // Source missing or unreadable — let the move below raise the
+      // real error; skipping the mark just means a possible duplicate
+      // webhook, not a correctness break.
+    }
     try {
       // Cross-device safe: /data/trash and /vault are typically two
       // separate bind mounts in compose deployments, so plain rename
@@ -1786,6 +1852,16 @@ export async function vaultRoutes(app: FastifyInstance) {
     await purgeTrash(entry.id)
     invalidateSearchCache()
     publish({ type: 'restore', path: entry.storageKey })
+    // Restore = the file reappears at its old path. From the receiver's
+    // POV that's equivalent to a fresh upload — fire the `upload` event
+    // so downstream mirrors see the resurrected file. No `trash` /
+    // `delete` history is rolled back; the original events stand.
+    dispatchWebhook({
+      type: 'upload',
+      path: entry.storageKey,
+      actor: user.username,
+      bytes: entry.bytes,
+    }).catch(() => null)
     await audit({ actor: user.username, action: 'trash.restore', target: entry.storageKey })
     return { ok: true }
   })
@@ -1795,9 +1871,38 @@ export async function vaultRoutes(app: FastifyInstance) {
     const user = req.currentUser!
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const { id } = req.params as { id: string }
-    const { purgeTrash } = await import('../stores/trash.js')
+    const { purgeTrash, listTrash } = await import('../stores/trash.js')
+    // Look up the manifest before purge so the webhook can carry the
+    // original storageKey. Without this the `delete` event would
+    // have no actionable path for downstream receivers.
+    const all = await listTrash()
+    const entry = all.find((e) => e.id === id)
+    if (!entry) return reply.code(404).send({ error: 'not found in trash' })
+    // Owner-or-admin only. Without this gate any non-viewer user
+    // could permanently destroy another user's trash entry by ID.
+    if (entry.owner !== user.username && user.role !== 'admin') {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
     await purgeTrash(id)
-    await audit({ actor: user.username, action: 'trash.purge', target: id })
+    {
+      // Permanent removal — distinct event from `trash` (which is
+      // the recoverable soft-delete). Receivers can use `delete` to
+      // tear down mirrored state.
+      dispatchWebhook({
+        type: 'delete',
+        path: entry.storageKey,
+        actor: user.username,
+      }).catch(() => null)
+    }
+    await audit({
+      actor: user.username,
+      action: 'trash.purge',
+      // Per-file activity panel keys on storageKey; entry.storageKey
+      // is the original path, so the panel can render this purge
+      // alongside the original trash event.
+      target: entry.storageKey,
+      meta: { trashEntryId: id },
+    })
     return { ok: true }
   })
 
@@ -1908,6 +2013,14 @@ export async function vaultRoutes(app: FastifyInstance) {
           updatedAt: Date.now(),
         }
         await saveMeta(next)
+        // Per-file webhook so receivers tracking a single doc see
+        // the visibility flip instead of only the bulk roll-up.
+        dispatchWebhook({
+          type: 'visibility',
+          path: rel,
+          actor: user.username,
+          public: body.public,
+        }).catch(() => null)
         ok++
       } catch {
         failed++
@@ -1929,6 +2042,12 @@ export async function vaultRoutes(app: FastifyInstance) {
           publicPasswordHash: body.public ? passwordHash : null,
           updatedAt: now,
         })
+        dispatchWebhook({
+          type: 'folder-visibility',
+          path: folderRel,
+          actor: user.username,
+          public: body.public,
+        }).catch(() => null)
       } catch {
         /* skip; file cascade already succeeded */
       }
@@ -2046,6 +2165,10 @@ export async function vaultRoutes(app: FastifyInstance) {
           bytes: s.size,
           trashedBy: user.username,
         })
+        // Drop the dangling SQL row so search / list_documents stop
+        // pointing at the now-missing file. Same rationale as the
+        // single-file DELETE path above.
+        if (meta?.id) await deleteDocument(meta.id).catch(() => null)
         ok++
       } catch (e) {
         failed++
@@ -2202,8 +2325,29 @@ export async function vaultRoutes(app: FastifyInstance) {
     // re-fetch instead of relying on the diff payload. Empty array
     // is fine — bulk add/remove doesn't yield a clean per-path
     // final-tags set without an extra read.
+    //
+    // Webhooks also fire per path (one `tags` or `folder-tags` event
+    // each, depending on the inode type) so external receivers see
+    // the same per-path granularity the in-app sidebar does.
     for (const rel of body.paths) {
       publish({ type: 'tags', path: rel, tags: [] })
+      // Resolve mime/dir once more for the webhook type. We already
+      // stat'd each path above; doing it again is cheap relative to
+      // the audit footprint and avoids threading state across the
+      // loop.
+      const isFolder = await stat(resolveVault(rel, user.username))
+        .then((s) => s.isDirectory())
+        .catch(() => false)
+      const meta = isFolder
+        ? await getFolderMeta(user.username, rel).catch(() => null)
+        : docs.find((d) => d.storageKey === rel && d.owner === user.username)
+      const finalTags = meta?.tags ?? []
+      dispatchWebhook({
+        type: isFolder ? 'folder-tags' : 'tags',
+        path: rel,
+        actor: user.username,
+        tags: finalTags,
+      }).catch(() => null)
     }
     await audit({
       actor: user.username,
@@ -2237,6 +2381,7 @@ export async function vaultRoutes(app: FastifyInstance) {
       })
     }
     await audit({ actor: user.username, action: 'vault.mkdir', target: rel })
+    dispatchWebhook({ type: 'mkdir', path: rel, actor: user.username }).catch(() => null)
     return { ok: true, path: rel }
   })
 
@@ -2291,6 +2436,14 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     invalidateSearchCache()
     await audit({ actor: user.username, action: 'vault.move', target: from, meta: { to } })
+    dispatchWebhook({
+      type: 'move',
+      path: to,
+      actor: user.username,
+      from,
+      to,
+      isFolder: srcStat.isDirectory(),
+    }).catch(() => null)
     return { ok: true }
   })
 
@@ -2472,6 +2625,9 @@ export async function vaultRoutes(app: FastifyInstance) {
       updatedAt: Date.now(),
     }
     await saveMeta(next)
+    // Visibility flips change the anon-search result set — drop the
+    // cache so the next public query reflects the new state.
+    invalidateSearchCache()
     publish({ type: 'visibility', path: body.path, public: body.public })
     dispatchWebhook({
       type: 'visibility',
@@ -2775,6 +2931,12 @@ export async function vaultRoutes(app: FastifyInstance) {
         expiresAt,
       },
     })
+    dispatchWebhook({
+      type: 'folder-visibility',
+      path: body.path,
+      actor: user.username,
+      public: body.public,
+    }).catch(() => null)
     const { publicPasswordHash: _drop, ...safe } = folderMeta
     return {
       folder: { ...safe, hasPassword: !!passwordHash },
@@ -2806,12 +2968,22 @@ export async function vaultRoutes(app: FastifyInstance) {
       updatedAt: Date.now(),
     }
     await saveFolderMeta(next)
+    // Folder-tag changes alter what `?tag=` filters return — drop
+    // the search cache so the next tag-filtered query reflects the
+    // new state. Matches what `vault.folder-visibility` already does.
+    invalidateSearchCache()
     await audit({
       actor: user.username,
       action: 'vault.folder-tags',
       target: body.path,
       meta: { tags },
     })
+    dispatchWebhook({
+      type: 'folder-tags',
+      path: body.path,
+      actor: user.username,
+      tags,
+    }).catch(() => null)
     const { publicPasswordHash, ...safe } = next
     return { folder: { ...safe, hasPassword: !!publicPasswordHash } }
   })

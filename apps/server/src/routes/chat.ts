@@ -59,6 +59,8 @@ import { resolveUserVault } from '../lib/userVault.js'
 import { withEditLock } from '../lib/editLock.js'
 import { audit } from '../stores/audit.js'
 import { ingestDocument } from '../services/ingest.js'
+import { invalidateSearchCache } from '../services/search.js'
+import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
 import * as mdx from '../lib/mdx.js'
 import {
   addUserMemory,
@@ -76,6 +78,10 @@ import {
   locateHeadingForExcerpt,
 } from '../services/chat.js'
 import { runAgent } from '../services/agent.js'
+import {
+  embedMessageForStorage,
+  findRelevantPastMessages,
+} from '../services/chatMemory.js'
 
 export async function chatRoutes(app: FastifyInstance) {
   app.addHook('preHandler', app.requireUser)
@@ -430,6 +436,10 @@ export async function chatRoutes(app: FastifyInstance) {
       // Fresh question — persist the user turn up front so a
       // mid-stream disconnect still keeps the question in history.
       newUserMsgId = nanoid()
+      // Embed for future semantic retrieval. Best-effort: a failure
+      // (Ollama down, no model pulled) means this message just
+      // won't surface in similarity scans on later turns.
+      const userEmbedding = await embedMessageForStorage(content)
       appendMessage({
         id: newUserMsgId,
         docId,
@@ -445,7 +455,7 @@ export async function chatRoutes(app: FastifyInstance) {
         toolTrace: null,
         error: null,
         createdAt: now,
-      })
+      }, userEmbedding)
       // Bump the thread's updated_at so it floats to the top of
       // the switcher dropdown, and rename "New chat" to a derived
       // title based on the first user message.
@@ -592,6 +602,29 @@ export async function chatRoutes(app: FastifyInstance) {
     const collectedToolTrace: Array<{ id: string; name: string; args: unknown; ok?: boolean; summary?: string }> = []
     let collectedProposedEdits: ProposedEditOp[] = []
     let agentDone = false
+    // Semantic retrieval over older messages in this thread. Embed
+    // the query, pull top-K relevant past turns that aren't already
+    // in the recent window the agent will see verbatim. Best-effort:
+    // a failure here means no retrieval; we still send the
+    // extractive summary + recent window for continuity.
+    let relevantPast: Awaited<ReturnType<typeof findRelevantPastMessages>> = []
+    try {
+      // The agent's packHistory keeps the last ~3000 tokens of
+      // history verbatim — approximate "in window" here as the last
+      // 20 messages so we don't surface duplicates of what the
+      // model is about to read in the window. Slightly conservative
+      // (the actual window may be larger or smaller) but cheap.
+      const recentIds = new Set(history.slice(-20).map((m) => m.id))
+      relevantPast = await findRelevantPastMessages({
+        docId,
+        userId: user.username,
+        threadId: activeThreadId,
+        query: content,
+        excludeIds: recentIds,
+      })
+    } catch {
+      relevantPast = []
+    }
     try {
       const gen = runAgent({
         anchor: ctx.anchor,
@@ -601,6 +634,11 @@ export async function chatRoutes(app: FastifyInstance) {
         user: { username: user.username, role: user.role },
         signal: ac.signal,
         attachedDocs: attachedDocsForPrompt,
+        relevantPast: relevantPast.map((r) => ({
+          role: r.role,
+          content: r.content,
+          createdAt: r.createdAt,
+        })),
       })
       for await (const ev of gen) {
         if (ev.kind === 'token') {
@@ -751,6 +789,9 @@ export async function chatRoutes(app: FastifyInstance) {
     }
     if (agentDone && (assembled.length > 0 || collectedProposedEdits.length > 0)) {
       const asstId = nanoid()
+      // Embed the assistant turn too so a future user query can
+      // retrieve "you previously told me about X" matches.
+      const asstEmbedding = await embedMessageForStorage(assembled)
       appendMessage({
         id: asstId,
         docId,
@@ -766,7 +807,7 @@ export async function chatRoutes(app: FastifyInstance) {
         editTargetSha256: collectedProposedEdits.length > 0 ? ctx.anchor.sha256 : null,
         toolTrace: collectedToolTrace.length > 0 ? collectedToolTrace : null,
         createdAt: regenerateOriginalCreatedAt ?? Date.now(),
-      })
+      }, asstEmbedding)
       send({ kind: 'done', messageId: asstId })
     } else {
       const stubId = nanoid()
@@ -905,6 +946,9 @@ export async function chatRoutes(app: FastifyInstance) {
           reason: 'apply-edit',
         }).catch(() => null)
       }
+      // Tell the watcher this sha is an in-app write so its
+      // chokidar fire doesn't double-dispatch the edit webhook.
+      markExpectedWrite(abs, sha256Of(nextBuf))
       await writeFile(abs, nextBuf)
       const nextMeta = {
         ...live,
@@ -915,6 +959,7 @@ export async function chatRoutes(app: FastifyInstance) {
       }
       await saveMeta(nextMeta)
       const finalMeta = await ingestDocument(nextMeta, nextBuf)
+      invalidateSearchCache()
       // Persist the per-op appliedAt stamps, then mark the whole
       // turn applied so the message-level pill renders.
       setPendingEdit(messageId, user.username, docId, stamped)
@@ -922,13 +967,22 @@ export async function chatRoutes(app: FastifyInstance) {
       await audit({
         actor: user.username,
         action: 'chat.apply_edit',
-        target: docId,
+        // Per-file activity panel keys off storageKey (not docId), so
+        // chat-driven edits surface alongside in-app + MCP edits.
+        target: live.storageKey,
         meta: {
-          path: live.storageKey,
+          docId,
           ops: turn.pendingEdit!.map((o) => o.op),
           messageId,
         },
       })
+      dispatchWebhook({
+        type: 'edit',
+        path: live.storageKey,
+        actor: user.username,
+        bytes: nextBuf.length,
+        source: 'chat',
+      }).catch(() => null)
       return finalMeta
     }).catch((e) => {
       const status = (e as { status?: number }).status ?? 500
@@ -1070,7 +1124,15 @@ export async function chatRoutes(app: FastifyInstance) {
       return reply.code(409).send({ error: 'edit already applied' })
     }
     if (opIndex >= turn.pendingEdit.length) {
-      return reply.code(400).send({ error: 'opIndex out of range' })
+      // Stale client state — the pendingEdit array shrank since the
+      // preview was rendered (the message-level apply-edit fired,
+      // a parallel discard ran, or the agent emitted a new turn that
+      // overwrote this one). Tell the client to refresh instead of
+      // re-firing the same out-of-range index via Retry.
+      return reply.code(409).send({
+        error: `pending edits changed (now ${turn.pendingEdit.length} op${turn.pendingEdit.length === 1 ? '' : 's'}, you tried op #${opIndex + 1}). Refresh the chat to see the latest.`,
+        code: 'pending_edits_stale',
+      })
     }
     if (turn.pendingEdit[opIndex]?.appliedAt) {
       return reply.code(409).send({ error: 'op already applied' })
@@ -1107,7 +1169,12 @@ export async function chatRoutes(app: FastifyInstance) {
         throw Object.assign(new Error('edit already applied'), { status: 409 })
       }
       if (opIndex >= freshTurn.pendingEdit.length) {
-        throw Object.assign(new Error('opIndex out of range'), { status: 400 })
+        throw Object.assign(
+          new Error(
+            `pending edits changed (now ${freshTurn.pendingEdit.length} op${freshTurn.pendingEdit.length === 1 ? '' : 's'}, you tried op #${opIndex + 1}). Refresh the chat to see the latest.`,
+          ),
+          { status: 409, code: 'pending_edits_stale' },
+        )
       }
       if (freshTurn.pendingEdit[opIndex]?.appliedAt) {
         throw Object.assign(new Error('op already applied'), { status: 409 })
@@ -1133,6 +1200,9 @@ export async function chatRoutes(app: FastifyInstance) {
           reason: 'apply-op',
         }).catch(() => null)
       }
+      // Tell the watcher this sha is an in-app write so its
+      // chokidar fire doesn't double-dispatch the edit webhook.
+      markExpectedWrite(abs, sha256Of(nextBuf))
       await writeFile(abs, nextBuf)
       const newSha = sha256Of(nextBuf)
       const nextMeta = {
@@ -1144,6 +1214,7 @@ export async function chatRoutes(app: FastifyInstance) {
       }
       await saveMeta(nextMeta)
       const finalMeta = await ingestDocument(nextMeta, nextBuf)
+      invalidateSearchCache()
       // Stamp THIS op as applied, preserve the array shape. If every
       // op now carries an appliedAt, flip the message-level applied
       // flag (matches bulk apply-edit semantics).
@@ -1164,14 +1235,21 @@ export async function chatRoutes(app: FastifyInstance) {
       await audit({
         actor: user.username,
         action: 'chat.apply_edit_op',
-        target: docId,
+        target: live.storageKey,
         meta: {
-          path: live.storageKey,
+          docId,
           op: (op as { op: string }).op,
           opIndex,
           messageId,
         },
       })
+      dispatchWebhook({
+        type: 'edit',
+        path: live.storageKey,
+        actor: user.username,
+        bytes: nextBuf.length,
+        source: 'chat',
+      }).catch(() => null)
       return finalMeta
     }).catch((e) => {
       const status = (e as { status?: number }).status ?? 500
@@ -1307,6 +1385,11 @@ function applyOp(text: string, op: ProposedEditOp): string {
       return mdx.appendText(text, op.content)
     case 'prepend_text':
       return mdx.prependText(text, op.content)
+    case 'rewrite_file':
+      // Full-content replace. No mdx involvement — the new content
+      // wholly supersedes the old. Used for CSV / JSON / YAML / any
+      // non-markdown text format the agent needs to rewrite.
+      return op.content
   }
 }
 

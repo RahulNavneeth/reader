@@ -5,6 +5,7 @@ import { resolveUserVault, userVaultRoot } from '../lib/userVault.js'
 import { audit } from '../stores/audit.js'
 import { saveMeta, sha256Of } from '../stores/documents.js'
 import { ingestDocument } from '../services/ingest.js'
+import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
 import { nanoid } from 'nanoid'
 import type { DocumentMeta } from '../types.js'
 
@@ -20,17 +21,108 @@ import type { DocumentMeta } from '../types.js'
  *   GET  /api/templates                  — list available templates
  *   POST /api/templates/instantiate      — create a new doc from one
  *
- * Instantiation substitutes a small set of placeholders:
- *   {{date}}      → YYYY-MM-DD (today, local)
- *   {{datetime}}  → ISO-8601 local datetime
- *   {{title}}     → the target file's title (passed in body)
- *   {{user}}      → caller's username
- *  Plus any user-supplied vars (body.vars) — `{{my_var}}` is
- *  replaced with `body.vars.my_var`. Unknown placeholders are
- *  left intact so a template author can include literal `{{X}}`
- *  by misspelling on purpose.
+ * Instantiation substitutes built-ins (see `computeBuiltins`)
+ * plus any user-supplied vars (body.vars) — `{{my_var}}` is
+ * replaced with `body.vars.my_var`. Unknown placeholders are
+ * left intact so a template author can include literal `{{X}}`
+ * by misspelling on purpose. User-supplied vars win on key
+ * conflict so a template author can override a built-in default.
  */
 const TEMPLATES_DIR = '_templates'
+
+/** ISO 8601 week number for a date. Week starts on Monday; the
+ *  first week of the year contains the year's first Thursday. */
+function isoWeek(d: Date): number {
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+  const dayNr = (t.getUTCDay() + 6) % 7
+  t.setUTCDate(t.getUTCDate() - dayNr + 3)
+  const firstThursday = t.getTime()
+  t.setUTCMonth(0, 1)
+  if (t.getUTCDay() !== 4) {
+    t.setUTCMonth(0, 1 + ((4 - t.getUTCDay()) + 7) % 7)
+  }
+  return 1 + Math.ceil((firstThursday - t.getTime()) / 604800000)
+}
+
+function slugify(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+/**
+ * Built-in placeholders auto-filled at instantiate time. Order
+ * here matches the docstring + list-API response so the client
+ * can render a "Available placeholders" hint without re-deriving.
+ *
+ * Date/time:
+ *   date       → YYYY-MM-DD
+ *   datetime   → ISO-8601 with offset
+ *   time       → HH:MM (24-hour, local)
+ *   year       → 2026
+ *   month      → 05 (zero-padded)
+ *   month_name → May
+ *   day        → 23 (zero-padded)
+ *   weekday    → Saturday
+ *   week       → 21 (ISO week, zero-padded)
+ *   quarter    → Q2
+ *   timestamp  → unix epoch seconds
+ *
+ * Scope:
+ *   title    → the target file's title
+ *   slug     → slugified title (a-z0-9 + hyphens)
+ *   user     → caller's username
+ *   filename → basename of target, no extension
+ *   folder   → parent dir of target (empty for vault root)
+ *
+ * Identity:
+ *   uuid → short random ID
+ */
+export function computeBuiltins(opts: {
+  now: Date
+  title: string
+  user: string
+  targetRel: string
+}): Record<string, string> {
+  const { now, title, user, targetRel } = opts
+  const yyyy = now.getFullYear()
+  const mm = String(now.getMonth() + 1).padStart(2, '0')
+  const dd = String(now.getDate()).padStart(2, '0')
+  const hh = String(now.getHours()).padStart(2, '0')
+  const mi = String(now.getMinutes()).padStart(2, '0')
+  const month_name = now.toLocaleDateString('en-US', { month: 'long' })
+  const weekday = now.toLocaleDateString('en-US', { weekday: 'long' })
+  const folder = path.dirname(targetRel.replace(/^\/+/, ''))
+  return {
+    date: `${yyyy}-${mm}-${dd}`,
+    datetime: now.toISOString(),
+    time: `${hh}:${mi}`,
+    year: String(yyyy),
+    month: mm,
+    month_name,
+    day: dd,
+    weekday,
+    week: String(isoWeek(now)).padStart(2, '0'),
+    quarter: `Q${Math.floor(now.getMonth() / 3) + 1}`,
+    timestamp: String(Math.floor(now.getTime() / 1000)),
+    title,
+    slug: slugify(title) || 'untitled',
+    user,
+    filename: path.basename(targetRel, path.extname(targetRel)),
+    folder: folder === '.' ? '' : folder,
+    uuid: nanoid(10),
+  }
+}
+
+/** Stable ordering used for both the list-API hint and tests. */
+export const BUILTIN_KEYS = [
+  'date', 'datetime', 'time', 'year', 'month', 'month_name', 'day',
+  'weekday', 'week', 'quarter', 'timestamp',
+  'title', 'slug', 'user', 'filename', 'folder', 'uuid',
+] as const
 
 export async function templatesRoutes(app: FastifyInstance) {
   app.addHook('preHandler', app.requireUser)
@@ -82,7 +174,7 @@ export async function templatesRoutes(app: FastifyInstance) {
       })
     }
     templates.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
-    return { templates }
+    return { templates, builtins: BUILTIN_KEYS }
   })
 
   app.post<{
@@ -97,13 +189,48 @@ export async function templatesRoutes(app: FastifyInstance) {
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
     const body = req.body ?? {}
     const templateRel = (body.template ?? '').trim()
-    const targetRel = (body.target ?? '').trim()
-    const title = (body.title ?? '').trim()
+    let targetRel = (body.target ?? '').trim()
+    let title = (body.title ?? '').trim()
     if (!templateRel || !targetRel) {
       return reply.code(400).send({ error: 'template and target are required' })
     }
     if (!templateRel.startsWith(`${TEMPLATES_DIR}/`)) {
       return reply.code(400).send({ error: `template must be under ${TEMPLATES_DIR}/` })
+    }
+    // Substitute placeholders in the title + target path BEFORE
+    // path validation, so a user can type
+    // `journal/{{date}}-{{slug}}.md` and have it land at
+    // `journal/2026-05-23-my-doc.md`. Path resolution still goes
+    // through resolveUserVault so the substituted values can't be
+    // used to escape the user's vault.
+    const subst = (s: string, vars: Record<string, string>) =>
+      s.replace(/\{\{\s*([a-zA-Z0-9_-]+)\s*\}\}/g, (m, key: string) =>
+        Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : m,
+      )
+    const earlyVars = computeBuiltins({
+      now: new Date(),
+      title: title || 'untitled',
+      user: user.username,
+      targetRel,
+    })
+    title = subst(title, { ...earlyVars, ...(body.vars ?? {}) })
+    targetRel = subst(targetRel, {
+      // After title substitution, slug derives from the resolved
+      // title — so `{{slug}}` in the target path uses the final
+      // title, not the raw template.
+      ...computeBuiltins({
+        now: new Date(),
+        title: title || 'untitled',
+        user: user.username,
+        targetRel,
+      }),
+      ...(body.vars ?? {}),
+    })
+    // Reject empty target after substitution (e.g. user typed
+    // only `{{unknownvar}}` which left the field literally empty
+    // after resolution).
+    if (!targetRel) {
+      return reply.code(400).send({ error: 'target resolves to empty path' })
     }
     // Resolve through userVault so `..` traversal can't escape
     // either the template or the target out of the user's vault.
@@ -137,13 +264,12 @@ export async function templatesRoutes(app: FastifyInstance) {
     // time so a template can carry a literal `{{date}}` that
     // resolves to "now". User-supplied `vars` win on key conflict
     // so they can override defaults if needed.
-    const now = new Date()
-    const builtins: Record<string, string> = {
-      date: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`,
-      datetime: now.toISOString(),
+    const builtins = computeBuiltins({
+      now: new Date(),
       title: title || path.basename(targetRel, path.extname(targetRel)),
       user: user.username,
-    }
+      targetRel,
+    })
     const vars = { ...builtins, ...(body.vars ?? {}) }
     let content = tplBuf.toString('utf8')
     content = content.replace(/\{\{\s*([a-zA-Z0-9_-]+)\s*\}\}/g, (m, key: string) =>
@@ -151,8 +277,12 @@ export async function templatesRoutes(app: FastifyInstance) {
     )
 
     await mkdir(path.dirname(targetAbs), { recursive: true })
-    await writeFile(targetAbs, content)
     const buf = Buffer.from(content, 'utf8')
+    // Pre-mark so the watcher's `add` event doesn't fire a duplicate
+    // upload webhook — we dispatch our own `template` event below and
+    // ingest synchronously here.
+    markExpectedWrite(targetAbs, sha256Of(buf))
+    await writeFile(targetAbs, content)
     const id = nanoid()
     const meta: DocumentMeta = {
       id,
@@ -173,12 +303,23 @@ export async function templatesRoutes(app: FastifyInstance) {
     try {
       await saveMeta(meta)
       const finalMeta = await ingestDocument(meta, buf)
+      // Newly-instantiated template doc joins the searchable corpus;
+      // flush so the next search reflects it.
+      const { invalidateSearchCache } = await import('../services/search.js')
+      invalidateSearchCache()
       await audit({
         actor: user.username,
         action: 'template.instantiate',
         target: meta.storageKey,
         meta: { template: templateRel },
       })
+      dispatchWebhook({
+        type: 'template',
+        path: meta.storageKey,
+        actor: user.username,
+        template: templateRel,
+        title: meta.title,
+      }).catch(() => null)
       return { ok: true, document: finalMeta }
     } catch (e) {
       req.log.error({ err: e }, 'template.instantiate failed')

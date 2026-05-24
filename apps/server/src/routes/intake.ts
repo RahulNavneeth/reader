@@ -8,6 +8,7 @@ import { sha256Of, saveMeta } from '../stores/documents.js'
 import { ingestDocument } from '../services/ingest.js'
 import { audit } from '../stores/audit.js'
 import { invalidateSearchCache } from '../services/search.js'
+import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
 import type { ApiToken, DocumentMeta } from '../types.js'
 
 /**
@@ -140,6 +141,10 @@ export async function intakeRoutes(app: FastifyInstance) {
         }
         const safeName = name.replace(/[^a-zA-Z0-9._-]+/g, '_')
         const abs = await uniquePath(path.join(attDir, safeName))
+        // Pre-mark so chokidar's `add` doesn't fire a duplicate
+        // upload webhook — the parent doc dispatches a single
+        // `intake` event below for the whole batch.
+        markExpectedWrite(abs, sha256Of(buf))
         await writeFile(abs, buf)
         const rootLen = resolveUserVault(token.createdBy, '').length
         const rel = abs.slice(rootLen + 1)
@@ -176,6 +181,9 @@ export async function intakeRoutes(app: FastifyInstance) {
       await mkdir(inboxDir, { recursive: true })
       const slugBase = `${dayPrefix(received)}-${slugify(subject || 'untitled')}.md`
       const docAbs = await uniquePath(path.join(inboxDir, slugBase))
+      // Pre-mark — see attachments above. The `intake` webhook
+      // fired below is the single user-visible event for this batch.
+      markExpectedWrite(docAbs, sha256Of(docBuf))
       await writeFile(docAbs, docBuf)
       const rootLen = resolveUserVault(token.createdBy, '').length
       const docRel = docAbs.slice(rootLen + 1)
@@ -213,6 +221,13 @@ export async function intakeRoutes(app: FastifyInstance) {
           tokenName: token.name,
         },
       })
+      dispatchWebhook({
+        type: 'intake',
+        path: docRel,
+        actor: token.createdBy,
+        subject: subject || undefined,
+        from: from || undefined,
+      }).catch(() => null)
 
       return {
         ok: true,
