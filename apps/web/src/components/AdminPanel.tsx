@@ -34,6 +34,7 @@ import {
   type WorkspaceSettings,
 } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
+import { useVault } from '../lib/vault-context'
 import { AdminWebhooksPanel } from './AdminWebhooksPanel'
 import { AdminOauthClientsPanel } from './AdminOauthClientsPanel'
 
@@ -434,6 +435,7 @@ function GeneralPanel() {
 // ─── Search & embeddings ────────────────────────────────────────────────────
 
 function EmbeddingsPanel() {
+  const { refreshWorkspace } = useVault()
   const [sys, setSys] = useState<SystemInfo | null>(null)
   const [enabled, setEnabled] = useState<boolean>(true)
   const [baseUrl, setBaseUrl] = useState('')
@@ -492,6 +494,9 @@ function EmbeddingsPanel() {
         },
       })
       await refresh()
+      // Push the new chatEnabled into VaultContext so the doc viewer
+      // hides/shows the Reader AI dock without a page reload.
+      await refreshWorkspace()
       setMsg('Saved.')
       setTimeout(() => setMsg(null), 2500)
     } catch (e) {

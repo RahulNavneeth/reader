@@ -145,6 +145,26 @@ export default function App() {
       })
   }, [])
 
+  // Public hook for descendants (AdminPanel) to push a workspace
+  // refresh after they mutate settings — keeps chatEnabled live
+  // without forcing a page reload.
+  const refreshWorkspace = useCallback(async () => {
+    try {
+      const r = await api.me()
+      setAuth((prev) =>
+        prev.status === 'authed'
+          ? {
+              ...prev,
+              user: r.user,
+              workspace: { chatEnabled: r.workspace?.chatEnabled ?? true },
+            }
+          : prev,
+      )
+    } catch {
+      /* ignore — stale state is recoverable on next nav */
+    }
+  }, [])
+
   const handleLogout = async () => {
     try {
       await api.logout()
@@ -290,6 +310,7 @@ export default function App() {
         setCurrentFolder,
         currentUsername: auth.user.username,
         chatEnabled: auth.workspace.chatEnabled,
+        refreshWorkspace,
         mobileSidebarOpen,
         setMobileSidebarOpen,
       }}

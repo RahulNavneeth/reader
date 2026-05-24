@@ -44,6 +44,11 @@ export type VaultContextValue = {
    *  When false, the doc viewer hides the chat dock + open button so
    *  users can't open a panel that will only 503 on send. */
   chatEnabled: boolean
+  /** Re-fetch `/api/auth/me` so workspace toggles (chatEnabled, etc.)
+   *  reflect without a page reload. AdminPanel calls this after a
+   *  successful settings save so the admin's own session sees the
+   *  change immediately; other sessions catch up on next nav. */
+  refreshWorkspace: () => Promise<void>
 }
 
 export const VaultContext = createContext<VaultContextValue | null>(null)
