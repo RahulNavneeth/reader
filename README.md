@@ -548,6 +548,25 @@ The vault is the irreplaceable part. `data/` can be regenerated (the app
 will re-index on first run) but you'll lose tags, shares, pins, and the
 audit log if you only restore the vault.
 
+**Option C — scheduled, in-process:**
+
+Admin → **Settings → Backup** turns on a daily-or-weekly snapshot of
+the same two directories. Archives land in `$DATA_DIR/backups/` by
+default (override the path in the same panel). Old archives matching
+`reader-backup-*.tar.gz` get pruned after `retainDays` if you set one
+(0 = keep forever).
+
+The schedule survives restarts — the next fire-time is stored in
+`$DATA_DIR/backup-state.json` and re-armed on boot. A "Backup now"
+button on the same panel runs an out-of-band snapshot. Both
+scheduled and manual runs emit `backup.run` / `backup.failed` /
+`backup.prune` audit events so a missed cadence shows up in the
+activity log.
+
+Under the hood it's the same `createBackup` primitive the CLI uses —
+shell out to `tar`, `VACUUM INTO` a hot SQLite snapshot first to
+avoid a torn copy under concurrent writes.
+
 **Full account export** is also built in: each user can download a ZIP of
 their files + a `manifest.json` of tags/shares/pins from **Account → Export
 everything**.

@@ -146,6 +146,14 @@ export type WorkspaceSettings = {
     from?: string
     secure?: boolean
   }
+  backup?: {
+    enabled?: boolean
+    schedule?: 'daily' | 'weekly'
+    time?: string
+    weekday?: number
+    outDir?: string
+    retainDays?: number
+  }
 }
 
 export type SystemInfo = {
@@ -718,6 +726,24 @@ export const api = {
     post<{ ok: true; dataDir: string | null; restartRequired: true }>('/api/admin/data-dir', { dataDir }),
   adminTestSmtp: (to: string) =>
     post<{ ok: true; id: string }>('/api/admin/smtp/test', { to }),
+  adminBackupState: () =>
+    get<{
+      lastRunAt: number | null
+      lastSuccessAt: number | null
+      lastFile: string | null
+      lastBytes: number | null
+      lastError: string | null
+      nextFireAt: number | null
+    }>('/api/admin/backup/state'),
+  adminBackupRunNow: () =>
+    post<{
+      lastRunAt: number | null
+      lastSuccessAt: number | null
+      lastFile: string | null
+      lastBytes: number | null
+      lastError: string | null
+      nextFireAt: number | null
+    }>('/api/admin/backup/run-now'),
   adminReembedAll: () =>
     post<{
       total: number

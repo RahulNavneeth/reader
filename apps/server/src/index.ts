@@ -497,6 +497,14 @@ export async function buildApp(opts: BuildAppOptions = {}) {
 
     // Watch the vault for external edits (Obsidian, vim, Finder) and re-ingest.
     startVaultWatcher(app.log).catch((err) => app.log.warn({ err }, 'vault watcher start failed'))
+
+    // Scheduled-backup timer. No-op when admin hasn't enabled it; the
+    // scheduler logs "idle" in that case. Reapplied whenever the admin
+    // PATCH /api/admin/settings changes the backup block.
+    const { startBackupScheduler } = await import('./services/backupScheduler.js')
+    await startBackupScheduler(app.log).catch((err) =>
+      app.log.warn({ err }, 'backup scheduler start failed'),
+    )
   }
 
   return app

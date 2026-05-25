@@ -66,6 +66,22 @@ export type WorkspaceSettings = {
    * the per-user vault.
    */
   externalMounts?: ExternalMount[]
+  /** Scheduled-backup config. Off by default; admin opts in. The
+   *  scheduler lives in services/backupScheduler.ts and re-reads this
+   *  every time the admin saves. */
+  backup?: {
+    enabled?: boolean
+    schedule?: 'daily' | 'weekly'
+    /** "HH:MM" local-clock fire time. */
+    time?: string
+    /** 0..6 (Sun..Sat) — only honored when `schedule = 'weekly'`. */
+    weekday?: number
+    /** Absolute directory the archives land in. Defaults to
+     *  `${DATA_DIR}/backups` when unset. */
+    outDir?: string
+    /** Auto-prune archives older than this many days. 0 = forever. */
+    retainDays?: number
+  }
 }
 
 export type ExternalMount = {

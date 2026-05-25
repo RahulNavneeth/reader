@@ -22,6 +22,8 @@ import {
   RefreshCw,
   Webhook,
   Plug,
+  Archive,
+  Play,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate } from 'react-router-dom'
@@ -38,7 +40,7 @@ import { useVault } from '../lib/vault-context'
 import { AdminWebhooksPanel } from './AdminWebhooksPanel'
 import { AdminOauthClientsPanel } from './AdminOauthClientsPanel'
 
-type Section = 'general' | 'users' | 'duplicates' | 'embeddings' | 'storage' | 'mounts' | 'mail' | 'webhooks' | 'oauth-clients' | 'advanced'
+type Section = 'general' | 'users' | 'duplicates' | 'embeddings' | 'storage' | 'mounts' | 'mail' | 'webhooks' | 'oauth-clients' | 'advanced' | 'backup'
 
 type Group = {
   label: string
@@ -74,6 +76,12 @@ const GROUPS: Group[] = [
     items: [
       { id: 'oauth-clients', label: 'OAuth clients', icon: Plug },
       { id: 'advanced', label: 'Server & sessions', icon: Settings },
+    ],
+  },
+  {
+    label: 'Reliability',
+    items: [
+      { id: 'backup', label: 'Backup', icon: Archive },
     ],
   },
 ]
@@ -163,6 +171,7 @@ export function AdminPanel() {
             {section === 'webhooks' && <AdminWebhooksPanel />}
             {section === 'oauth-clients' && <AdminOauthClientsPanel />}
             {section === 'advanced' && <AdvancedPanel />}
+            {section === 'backup' && <BackupPanel />}
           </div>
         </div>
       </main>
@@ -1004,6 +1013,210 @@ function MailPanel() {
       <SaveBar onSave={save} saving={saving} msg={msg} />
     </div>
   )
+}
+
+// ─── Backup ─────────────────────────────────────────────────────────────────
+
+function BackupPanel() {
+  const [enabled, setEnabled] = useState(false)
+  const [schedule, setSchedule] = useState<'daily' | 'weekly'>('daily')
+  const [time, setTime] = useState('03:00')
+  const [weekday, setWeekday] = useState(0)
+  const [outDir, setOutDir] = useState('')
+  const [retainDays, setRetainDays] = useState<number | ''>(0)
+  const [state, setState] = useState<{
+    lastRunAt: number | null
+    lastSuccessAt: number | null
+    lastFile: string | null
+    lastBytes: number | null
+    lastError: string | null
+    nextFireAt: number | null
+  } | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [runningNow, setRunningNow] = useState(false)
+  const [msg, setMsg] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const refresh = async () => {
+    try {
+      const [s, st] = await Promise.all([api.adminSettings(), api.adminBackupState()])
+      const b = s.settings.backup ?? {}
+      setEnabled(!!b.enabled)
+      setSchedule((b.schedule ?? 'daily') as 'daily' | 'weekly')
+      setTime(b.time ?? '03:00')
+      setWeekday(b.weekday ?? 0)
+      setOutDir(b.outDir ?? '')
+      setRetainDays(b.retainDays ?? 0)
+      setState(st)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    }
+  }
+
+  useEffect(() => {
+    refresh()
+  }, [])
+
+  const save = async () => {
+    setSaving(true)
+    setError(null)
+    setMsg(null)
+    try {
+      await api.adminPatchSettings({
+        backup: {
+          enabled,
+          schedule,
+          time,
+          weekday: schedule === 'weekly' ? weekday : undefined,
+          outDir: outDir.trim() || undefined,
+          retainDays: typeof retainDays === 'number' ? retainDays : 0,
+        },
+      })
+      await refresh()
+      setMsg('Saved.')
+      setTimeout(() => setMsg(null), 2500)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const runNow = async () => {
+    setRunningNow(true)
+    setError(null)
+    setMsg(null)
+    try {
+      const r = await api.adminBackupRunNow()
+      setState(r)
+      setMsg('Backup complete.')
+      setTimeout(() => setMsg(null), 3500)
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e))
+    } finally {
+      setRunningNow(false)
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      {error && <ErrText text={error} />}
+
+      <Card title="Scheduled backup">
+        <div className="flex items-center gap-3">
+          <Toggle checked={enabled} onChange={() => setEnabled((v) => !v)} disabled={saving} />
+          <span className="text-[12.5px] text-fg font-medium">
+            Run a tar.gz snapshot of <code className="text-[11.5px]">/data</code> + <code className="text-[11.5px]">/vault</code> on a schedule
+          </span>
+        </div>
+        <FieldRow label="Cadence">
+          <select
+            className="input"
+            value={schedule}
+            onChange={(e) => setSchedule(e.target.value as 'daily' | 'weekly')}
+            disabled={!enabled || saving}
+          >
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+          </select>
+        </FieldRow>
+        <FieldRow label="Time">
+          <input
+            type="time"
+            className="input"
+            value={time}
+            onChange={(e) => setTime(e.target.value)}
+            disabled={!enabled || saving}
+          />
+        </FieldRow>
+        {schedule === 'weekly' && (
+          <FieldRow label="Day">
+            <select
+              className="input"
+              value={weekday}
+              onChange={(e) => setWeekday(Number(e.target.value))}
+              disabled={!enabled || saving}
+            >
+              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d, i) => (
+                <option key={d} value={i}>
+                  {d}
+                </option>
+              ))}
+            </select>
+          </FieldRow>
+        )}
+        <FieldRow label="Output directory">
+          <input
+            className="input"
+            placeholder="(default: $DATA_DIR/backups)"
+            value={outDir}
+            onChange={(e) => setOutDir(e.target.value)}
+            disabled={saving}
+          />
+        </FieldRow>
+        <FieldRow label="Retain (days)">
+          <input
+            type="number"
+            min={0}
+            className="input"
+            value={retainDays}
+            onChange={(e) =>
+              setRetainDays(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))
+            }
+            disabled={saving}
+          />
+        </FieldRow>
+        <div className="text-[11.5px] text-subtle">
+          Retain = 0 keeps every archive. Otherwise older `reader-backup-*.tar.gz` files
+          in the output dir are pruned after each run.
+        </div>
+      </Card>
+
+      <Card title="Status">
+        <div className="space-y-1.5 text-[12.5px]">
+          <StatusLine label="Next backup" value={fmtAbsTs(state?.nextFireAt)} />
+          <StatusLine label="Last run" value={fmtAbsTs(state?.lastRunAt)} />
+          <StatusLine label="Last success" value={fmtAbsTs(state?.lastSuccessAt)} />
+          <StatusLine label="Last file" value={state?.lastFile ?? '—'} />
+          <StatusLine
+            label="Last size"
+            value={state?.lastBytes != null ? `${(state.lastBytes / 1024 / 1024).toFixed(1)} MB` : '—'}
+          />
+          {state?.lastError && (
+            <div
+              className="text-[11.5px] mt-2 px-2 py-1.5 rounded"
+              style={{ background: 'var(--danger-bg)', color: 'var(--danger-fg)' }}
+            >
+              Last error: {state.lastError}
+            </div>
+          )}
+        </div>
+        <div className="pt-2">
+          <button className="btn-primary" onClick={runNow} disabled={runningNow}>
+            {runningNow ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+            Backup now
+          </button>
+        </div>
+      </Card>
+
+      <SaveBar onSave={save} saving={saving} msg={msg} />
+    </div>
+  )
+}
+
+function StatusLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline gap-2">
+      <span className="text-subtle min-w-[110px]">{label}</span>
+      <span className="text-fg font-mono text-[11.5px] break-all">{value}</span>
+    </div>
+  )
+}
+
+function fmtAbsTs(ts: number | null | undefined): string {
+  if (!ts) return '—'
+  const d = new Date(ts)
+  return d.toLocaleString()
 }
 
 // ─── Server & sessions ──────────────────────────────────────────────────────

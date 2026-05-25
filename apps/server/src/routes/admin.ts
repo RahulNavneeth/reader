@@ -206,6 +206,19 @@ export async function adminRoutes(app: FastifyInstance) {
             secure: z.boolean().optional(),
           })
           .optional(),
+        backup: z
+          .object({
+            enabled: z.boolean().optional(),
+            schedule: z.enum(['daily', 'weekly']).optional(),
+            time: z
+              .string()
+              .regex(/^\d{1,2}:\d{2}$/, 'time must be "HH:MM"')
+              .optional(),
+            weekday: z.number().int().min(0).max(6).optional(),
+            outDir: z.string().optional(),
+            retainDays: z.number().int().min(0).optional(),
+          })
+          .optional(),
       })
       .parse(req.body)
     const current = await loadSettings()
@@ -224,6 +237,7 @@ export async function adminRoutes(app: FastifyInstance) {
       session: { ...(current.session ?? {}), ...(body.session ?? {}) },
       server: { ...(current.server ?? {}), ...(body.server ?? {}) },
       smtp: { ...(current.smtp ?? {}), ...(body.smtp ?? {}) },
+      backup: { ...(current.backup ?? {}), ...(body.backup ?? {}) },
     }
     try {
       await saveSettings(next)
@@ -235,6 +249,14 @@ export async function adminRoutes(app: FastifyInstance) {
     if (body.smtp) invalidateMailCache()
     // Vault root may have moved — re-arm the file watcher against the new path.
     if (body.vaultRoot !== undefined) restartVaultWatcher(req.server.log)
+    // Backup cadence may have changed — reschedule the next fire without
+    // bouncing the server.
+    if (body.backup) {
+      const { reapplyBackupSchedule } = await import(
+        '../services/backupScheduler.js'
+      )
+      await reapplyBackupSchedule()
+    }
     // Redact every secret-bearing field before audit: SMTP password, S3
     // credentials. Previously the S3 access/secret keys went to the
     // audit log in plaintext alongside whatever rest got spread in.
@@ -971,5 +993,29 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get('/api/admin/jobs', async () => {
     const { listJobs, jobCounts } = await import('../services/jobs.js')
     return { jobs: listJobs({ limit: 100 }), counts: jobCounts() }
+  })
+
+  // Last-run state for the scheduled-backup panel. Includes the
+  // pre-computed `nextFireAt` so the UI doesn't redo the math.
+  app.get('/api/admin/backup/state', async () => {
+    const { readBackupState } = await import('../services/backupScheduler.js')
+    return readBackupState()
+  })
+
+  // Trigger a backup outside the schedule. Same handler the timer
+  // uses internally — serialises against concurrent runs so a frantic
+  // click doesn't double-tar the vault.
+  app.post('/api/admin/backup/run-now', async (req, reply) => {
+    const { runBackupNow } = await import('../services/backupScheduler.js')
+    try {
+      const state = await runBackupNow(
+        'manual',
+        req.currentUser?.username ?? 'system',
+        req.server.log,
+      )
+      return state
+    } catch (e: any) {
+      return reply.code(409).send({ error: e?.message ?? String(e) })
+    }
   })
 }
