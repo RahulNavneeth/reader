@@ -3042,6 +3042,75 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { ts: Number(ts), text }
   })
 
+  // Roll the live doc back to a prior snapshot's content. Mirrors
+  // the MCP `restore_version` tool surface so the web UI doesn't
+  // need an external agent to do something users plainly want to do
+  // from a Restore button next to the diff view. Same safety
+  // contract: snapshot the current state FIRST so the restore is
+  // itself reversible (one extra entry shows up in list_versions),
+  // then overwrite. Markdown-only — we restore extracted text, not
+  // arbitrary binary state.
+  app.post('/api/file/version/restore', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { path?: string; ts?: number }
+    const rel = body?.path
+    const ts = Number(body?.ts)
+    if (!rel || !Number.isFinite(ts)) {
+      return reply.code(400).send({ error: 'missing path or ts' })
+    }
+    const docs = await listAllDocuments()
+    const meta = docs.find((d) => d.storageKey === rel)
+    if (!meta) return reply.code(404).send({ error: 'not indexed' })
+    if (!userCanEdit(meta, user.username, user.role)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const { readVersionText, snapshotVersion } = await import('../stores/versions.js')
+    const text = await readVersionText(meta.id, ts)
+    if (text == null) {
+      return reply
+        .code(404)
+        .send({ error: 'version has no extractable text (binary snapshot)' })
+    }
+    // Snapshot current state before clobbering so this restore is
+    // itself reversible — the "undo button" stays one click away.
+    await snapshotVersion(meta.id, {
+      actor: user.username,
+      source: 'manual',
+      reason: 'restore_version',
+    }).catch(() => null)
+    const buffer = Buffer.from(text, 'utf8')
+    const abs = resolveUserVault(meta.owner, meta.storageKey)
+    markExpectedWrite(abs, sha256Of(buffer))
+    const { writeFile } = await import('node:fs/promises')
+    await writeFile(abs, buffer)
+    const next: DocumentMeta = {
+      ...meta,
+      bytes: buffer.length,
+      sha256: sha256Of(buffer),
+      updatedAt: Date.now(),
+      ingest: { status: 'pending', embedded: false },
+    }
+    await saveMeta(next)
+    const finalMeta = await ingestDocument(next, buffer)
+    invalidateSearchCache()
+    dispatchWebhook({
+      type: 'edit',
+      path: meta.storageKey,
+      actor: user.username,
+      bytes: buffer.length,
+      source: 'web',
+    }).catch(() => null)
+    await audit({
+      actor: user.username,
+      action: 'vault.version.restore',
+      target: meta.storageKey,
+      meta: { docId: meta.id, restoredTs: ts },
+    })
+    return { document: redactPublicMeta(finalMeta), restoredTs: ts }
+  })
+
   // Audit trail scoped to one file. Same access check as raw/text — the user
   // must be able to read the file to see its activity. Doc viewer renders this
   // in an "Activity" panel.

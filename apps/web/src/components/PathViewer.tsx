@@ -98,6 +98,10 @@ export function PathViewer({ path, canEdit = true }: Props) {
    *  history and the proposed-edit card reflects the shrunken
    *  pendingEdit array (or flips to Applied if empty). */
   const [chatHistoryReloadKey, setChatHistoryReloadKey] = useState(0)
+  /** Bumped when the user restores a version — DocRail re-fetches
+   *  /api/file/versions so the new pre-restore snapshot row appears
+   *  at the top of the list without a page reload. */
+  const [versionsReloadKey, setVersionsReloadKey] = useState(0)
   // Clear diff view whenever the doc changes.
   useEffect(() => {
     setDiffTs(null)
@@ -612,6 +616,24 @@ export function PathViewer({ path, canEdit = true }: Props) {
             parentDir={parentDir}
             callerOpts={callerOpts}
             onExit={() => setDiffTs(null)}
+            // Restore button always rendered for authed users; the
+            // server enforces userCanEdit and returns 403 on a
+            // read-only share, which surfaces as the inline error.
+            onRestored={async () => {
+              try {
+                const [r, m] = await Promise.all([
+                  api.fileText(path, callerOpts).catch(() => null),
+                  api.fileMeta(path, callerOpts).catch(() => null),
+                ])
+                if (r) setText(r.content)
+                if (m) setMeta(m.meta)
+                // The restore wrote a fresh pre-restore snapshot;
+                // bump the version list so it shows up.
+                setVersionsReloadKey((k) => k + 1)
+              } catch {
+                /* swallow */
+              }
+            }}
           />
         )}
 
@@ -887,6 +909,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
            jumpTo={jumpTo}
            activeDiffTs={diffTs}
            onPickVersion={(ts) => setDiffTs(ts)}
+           versionsReloadKey={versionsReloadKey}
          />
        )}
       </div>

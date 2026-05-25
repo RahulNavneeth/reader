@@ -400,6 +400,11 @@ export const api = {
     ),
   fileVersionText: (rel: string, ts: number) =>
     get<{ ts: number; text: string }>(`/api/file/version${q({ path: rel, ts })}`),
+  fileRestoreVersion: (rel: string, ts: number) =>
+    post<{ document: DocumentMeta; restoredTs: number }>(
+      '/api/file/version/restore',
+      { path: rel, ts },
+    ),
 
   fileActivity: (rel: string, limit = 50) =>
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(

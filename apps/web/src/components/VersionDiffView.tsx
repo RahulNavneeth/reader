@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ChevronLeft, Loader2 } from 'lucide-react'
+import { ChevronLeft, Loader2, RotateCcw } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeSlug from 'rehype-slug'
@@ -7,6 +7,7 @@ import rehypeHighlight from 'rehype-highlight'
 import { ApiError, api } from '../lib/api'
 import { computeLineDiff } from '../lib/lineDiff'
 import { parseImageSize, resolveImageSrc } from '../lib/markdownAssetResolver'
+import { useConfirm } from '../lib/confirm'
 
 type Props = {
   path: string
@@ -21,6 +22,10 @@ type Props = {
   /** Closes the diff view — caller flips its own state back to
    *  the normal doc rendering. */
   onExit: () => void
+  /** Server confirmed the restore landed. Caller refetches the doc
+   *  body + meta and exits the diff view. Omit when the doc is
+   *  read-only — the Restore button is hidden in that case. */
+  onRestored?: () => void | Promise<void>
 }
 
 /**
@@ -48,9 +53,20 @@ type Props = {
  * the user still sees the actual content with clear add/remove
  * tinting, just split.
  */
-export function VersionDiffView({ path, ts, currentText, parentDir, callerOpts, onExit }: Props) {
+export function VersionDiffView({
+  path,
+  ts,
+  currentText,
+  parentDir,
+  callerOpts,
+  onExit,
+  onRestored,
+}: Props) {
+  const confirm = useConfirm()
   const [snapshot, setSnapshot] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [restoring, setRestoring] = useState(false)
+  const [restoreError, setRestoreError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -141,7 +157,48 @@ export function VersionDiffView({ path, ts, currentText, parentDir, callerOpts, 
             <span style={{ color: 'var(--danger-fg)' }}>−{stats.removed}</span>
           </div>
         )}
+        {onRestored && snapshot !== null && (
+          <button
+            className="btn-ghost h-7 px-2 inline-flex items-center gap-1.5 text-[12px]"
+            disabled={restoring || (stats !== null && stats.added === 0 && stats.removed === 0)}
+            onClick={async () => {
+              const ok = await confirm({
+                title: 'Restore this version?',
+                message: `The doc will be rolled back to its state from ${formatFriendlyTimestamp(ts)}. The current content is snapshotted first, so you can undo by restoring the version that's about to be created.`,
+                confirmLabel: 'Restore',
+              })
+              if (!ok) return
+              setRestoring(true)
+              setRestoreError(null)
+              try {
+                await api.fileRestoreVersion(path, ts)
+                await onRestored?.()
+                onExit()
+              } catch (e) {
+                setRestoreError(e instanceof ApiError ? e.message : String(e))
+              } finally {
+                setRestoring(false)
+              }
+            }}
+            title="Roll the doc back to this snapshot"
+          >
+            {restoring ? <Loader2 size={12} className="animate-spin" /> : <RotateCcw size={12} />}
+            Restore
+          </button>
+        )}
       </div>
+      {restoreError && (
+        <div
+          className="px-3 py-2 text-[12px] border-b"
+          style={{
+            background: 'var(--danger-bg)',
+            color: 'var(--danger-fg)',
+            borderColor: 'var(--border)',
+          }}
+        >
+          Restore failed: {restoreError}
+        </div>
+      )}
 
       <div className="flex-1 overflow-auto px-10 py-10">
         {snapshot === null && !error && (

@@ -3532,9 +3532,10 @@ describe('integration: reconcile vault', () => {
     const names = (list.json().items as Array<{ name: string }>).map((i) => i.name)
     expect(names).toContain(fname)
     // Walks the cumulative test vault — grows with every new
-    // describe block. 120s headroom keeps this stable as the suite
-    // expands (most of the time it finishes in 30-50s).
-  }, 120_000)
+    // describe block. 180s headroom now that the v0.9 surface
+    // (OAuth, 35 MCP tools, version-restore) added enough fixtures
+    // to push the cold sweep past 2 min on slower CI workers.
+  }, 180_000)
 })
 
 // ── OAuth + MCP ─────────────────────────────────────────────────────

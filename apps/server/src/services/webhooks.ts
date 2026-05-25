@@ -46,7 +46,7 @@ export type WebhookEvent =
       path: string
       actor: string
       bytes: number
-      source: 'watcher' | 'chat' | 'mcp'
+      source: 'watcher' | 'chat' | 'mcp' | 'web'
     }
   | { type: 'delete'; path: string; actor: string }
   // Soft-delete: file went to Trash, can be restored within the

@@ -40,6 +40,10 @@ type Props = {
   /** Tells the parent (PathViewer) to swap the main content
    *  area to an inline diff against this version's snapshot. */
   onPickVersion?: (ts: number) => void
+  /** Bumped by the parent to force the version list to refetch —
+   *  used after a restore so the just-created pre-restore snapshot
+   *  shows up in the rail without a page reload. */
+  versionsReloadKey?: number
 }
 
 /**
@@ -69,6 +73,7 @@ export function DocRail({
   jumpTo,
   activeDiffTs,
   onPickVersion,
+  versionsReloadKey,
 }: Props) {
   const [versions, setVersions] = useState<Version[] | null>(null)
   const [versionsError, setVersionsError] = useState<string | null>(null)
@@ -96,7 +101,7 @@ export function DocRail({
     return () => {
       cancelled = true
     }
-  }, [path])
+  }, [path, versionsReloadKey])
 
   // Memoised bucketed rows — shared by the delta-compute effect
   // and the render below. Bucketing collapses adjacent-in-time
