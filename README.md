@@ -554,6 +554,69 @@ everything**.
 
 ---
 
+## Leaving Reader
+
+Reader stores everything as **plain files on disk**. Walking away means
+copying two directories and forgetting Reader exists. No proprietary
+format, no database lock-in, no per-row export script.
+
+**The whole exit:**
+
+```bash
+rsync -av ./_state/vault/  /path/to/exported/vault/   # your files
+rsync -av ./_state/data/   /path/to/exported/data/    # tags, shares, pins, audit
+```
+
+That's it. You can `docker compose down`, delete the Reader install, and
+you still have everything you put in. Open the vault folder in Obsidian,
+the Finder, Cursor, Neovim, `grep`, `rsync` it to a NAS — it's just files.
+
+**What's in each directory:**
+
+| Source | What survives | What it looks like |
+|---|---|---|
+| `vault/<username>/…` | Every file you uploaded, in its original folder structure, with original filenames. | A regular directory tree. PDFs, markdown, images, CSVs — exactly what you put in. |
+| `data/documents/<docId>/` | Reader's per-doc metadata (tags, public flag, ACL), extracted plaintext, embedding chunks. Plain JSON. | Re-indexable from `vault/` alone, but keeping it preserves your tags, public links, and share grants. |
+| `data/audit/` | Append-only history of every action (uploads, edits, shares, MCP calls). NDJSON. | Greppable. Survives across migrations. |
+| `data/users/`, `data/sessions/`, `data/tokens/` | Account credentials (argon2 hashes), live sessions, API tokens. | Lift-and-shift to a new Reader install or discard. |
+
+**Per-user export (no admin access required):**
+
+Each user can download their slice independently from **Account → Export
+everything**: a ZIP of their files + a `manifest.json` of every tag,
+share, pin, and visibility flag. Recipients of cross-user shares get
+referenced — the source of truth stays with the owner. Useful when one
+person leaves but the workspace stays up.
+
+**Re-importing into a new Reader instance:**
+
+```bash
+# On the new host:
+rsync -av /path/to/exported/data/  ./_state/data/
+rsync -av /path/to/exported/vault/ ./_state/vault/
+docker compose up -d
+```
+
+That's it — same images, same accounts, same docs, same shares. No
+data migration step, no schema upgrade. The vault is bytes, the
+metadata is JSON, and Reader picks up where it left off.
+
+**Re-indexing without `data/`:**
+
+If you only have the vault (the `data/` dir got lost) you keep the
+files but lose the per-doc metadata. Drop the vault into a fresh
+install and run **Admin → Reindex** — it'll walk every file, extract
+text, and rebuild the search index. You lose the tags/shares/audit;
+the files come back intact.
+
+**No lock-in promise, made structural:**
+
+This isn't a marketing claim — the README walks you through the exit
+path before you've even committed to the install. If a future Reader
+release ever changes that, treat it as a bug.
+
+---
+
 ## Upgrade
 
 Published images live at `ghcr.io/rahulnavneeth/reader`. Pin to a major
