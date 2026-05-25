@@ -1379,6 +1379,8 @@ function applyOp(text: string, op: ProposedEditOp): string {
     }
     case 'insert_after':
       return mdx.insertAfter(text, op.heading, op.content)
+    case 'append_to_section':
+      return mdx.appendToSection(text, op.heading, op.content)
     case 'delete_section':
       return mdx.deleteSection(text, op.heading)
     case 'append_text':

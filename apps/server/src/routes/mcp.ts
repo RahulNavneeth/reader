@@ -236,6 +236,20 @@ const TOOLS = [
     },
   },
   {
+    name: 'append_to_section',
+    description:
+      "Append content to the END of a section's body, before any nested sub-section or the next sibling heading. Use this to add a row to a table, a bullet to a list, or a paragraph to notes that live inside the section. Distinct from `insert_after` (which lands content AFTER the whole section block) and `append_text` (which appends to the end of the whole doc).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Document id.' },
+        heading: { type: 'string', description: 'Exact heading text to anchor against.' },
+        content: { type: 'string', description: 'Content to append inside the section body.' },
+      },
+      required: ['id', 'heading', 'content'],
+    },
+  },
+  {
     name: 'delete_section',
     description:
       "Remove a heading and its body (including nested sub-sections). Use carefully — this is destructive.",
@@ -1136,6 +1150,7 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     name === 'get_section' ||
     name === 'replace_section' ||
     name === 'insert_after' ||
+    name === 'append_to_section' ||
     name === 'delete_section' ||
     name === 'append_text' ||
     name === 'prepend_text'
@@ -1259,6 +1274,14 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         if (!content) throw new Error('content required')
         nextText = mdx.insertAfter(currentText, heading, content)
         auditAction = 'mcp.insert_after'
+        auditMeta = { ...auditMeta, heading, bytes: content.length }
+      } else if (name === 'append_to_section') {
+        const heading = String(args?.heading ?? '')
+        const content = String(args?.content ?? '')
+        if (!heading) throw new Error('heading required')
+        if (!content) throw new Error('content required')
+        nextText = mdx.appendToSection(currentText, heading, content)
+        auditAction = 'mcp.append_to_section'
         auditMeta = { ...auditMeta, heading, bytes: content.length }
       } else if (name === 'delete_section') {
         const heading = String(args?.heading ?? '')

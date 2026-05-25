@@ -1499,6 +1499,7 @@ type ProposedEditOpStateDTO = {
 export type ProposedEditOpDTO =
   | (ProposedEditOpStateDTO & { op: 'replace_section'; heading: string; content: string })
   | (ProposedEditOpStateDTO & { op: 'insert_after'; heading: string; content: string })
+  | (ProposedEditOpStateDTO & { op: 'append_to_section'; heading: string; content: string })
   | (ProposedEditOpStateDTO & { op: 'delete_section'; heading: string })
   | (ProposedEditOpStateDTO & { op: 'append_text'; content: string })
   | (ProposedEditOpStateDTO & { op: 'prepend_text'; content: string })

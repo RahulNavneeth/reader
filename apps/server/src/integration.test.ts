@@ -5378,7 +5378,7 @@ describe('integration: mcp expanded toolkit', () => {
     return r.json()
   }
 
-  it('mcp tools/list exposes all 35 tools', async () => {
+  it('mcp tools/list exposes all 36 tools', async () => {
     const r = await app.inject({
       method: 'POST',
       url: '/mcp',
@@ -5387,11 +5387,42 @@ describe('integration: mcp expanded toolkit', () => {
     })
     expect(r.statusCode).toBe(200)
     const names = (r.json().result.tools as Array<{ name: string }>).map((t) => t.name).sort()
-    expect(names.length).toBe(35)
+    expect(names.length).toBe(36)
     // Sample-check a few of the new entries to catch typos
-    for (const n of ['delete_document', 'unpin', 'resolve_path', 'move_file', 'mkdir', 'rmdir', 'csv_query', 'set_visibility', 'list_pins', 'list_tags', 'list_versions', 'get_pdf_outline', 'restore_version']) {
+    for (const n of ['delete_document', 'unpin', 'resolve_path', 'move_file', 'mkdir', 'rmdir', 'csv_query', 'set_visibility', 'list_pins', 'list_tags', 'list_versions', 'get_pdf_outline', 'restore_version', 'append_to_section']) {
       expect(names).toContain(n)
     }
+  })
+
+  // ── append_to_section: appends inside a section, before children ─
+  it('append_to_section lands content before the next heading', async () => {
+    const path = `expanded/append-section-${Date.now()}.md`
+    const initial =
+      '# T\n\n## Bugs\n- existing bug\n\n### Severity\nN/A\n\n## Other\nUnrelated.\n'
+    const up = await call('upload_text', { path, content: initial })
+    const docId = up.result.structuredContent.document.id
+
+    const r = await call('append_to_section', {
+      id: docId,
+      heading: 'Bugs',
+      content: '- newly reported bug',
+    })
+    expect(r.result.structuredContent.document.id).toBe(docId)
+
+    // Read back the body and assert ordering: existing bug → new
+    // bullet → Severity sub-heading. The new bullet must NOT land
+    // after `### Severity` (that would be the insert_after behavior).
+    const after = await call('get_document', { id: docId })
+    const text = after.result.structuredContent.document
+      ? (after.result.structuredContent as any).text ?? ''
+      : ''
+    const body = text || (after.result.content?.[0]?.text ?? '')
+    const existingIdx = body.indexOf('- existing bug')
+    const newIdx = body.indexOf('- newly reported bug')
+    const severityIdx = body.indexOf('### Severity')
+    expect(existingIdx).toBeGreaterThan(-1)
+    expect(newIdx).toBeGreaterThan(existingIdx)
+    expect(severityIdx).toBeGreaterThan(newIdx)
   })
 
   // ── resolve_path: path → meta bridge ─────────────────────────────

@@ -489,6 +489,7 @@ function summariseProposedEdits(ops: ProposedEditOp[]): string {
     switch (op.op) {
       case 'replace_section': return `Proposed a rewrite of the **${op.heading}** section. Review and Apply below.`
       case 'insert_after': return `Proposed a new section after **${op.heading}**. Review and Apply below.`
+      case 'append_to_section': return `Proposed appending content inside the **${op.heading}** section. Review and Apply below.`
       case 'delete_section': return `Proposed deleting the **${op.heading}** section. Review and Apply below.`
       case 'append_text': return `Proposed appending content to the end of the document. Review and Apply below.`
       case 'prepend_text': return `Proposed prepending content to the start of the document. Review and Apply below.`
@@ -721,13 +722,13 @@ function buildAllTools(): OllamaTool[] {
       function: {
         name: 'propose_edit',
         description:
-          "Propose a structured edit to the current document. The edit is NOT applied immediately — it is shown to the user as a card they can Apply or Discard. Use this when the user asks to rewrite, rephrase, edit, fix, add, remove, or replace content in the document.\n\nOp selection:\n  • Markdown docs with headings → `replace_section` / `insert_after` / `delete_section` (preferred — surgical) or `append_text` / `prepend_text` for whole-file tail/head additions.\n  • CSV / JSON / YAML / TOML / any non-markdown text file → `rewrite_file` with the FULL new content (no section semantics apply).",
+          "Propose a structured edit to the current document. The edit is NOT applied immediately — it is shown to the user as a card they can Apply or Discard. Use this when the user asks to rewrite, rephrase, edit, fix, add, remove, or replace content in the document.\n\nOp selection:\n  • Markdown docs with headings → `replace_section` / `insert_after` / `append_to_section` / `delete_section` (preferred — surgical) or `append_text` / `prepend_text` for whole-file tail/head additions.\n  • `append_to_section` lands content at the END of a section's immediate body (before any nested sub-section). Use it to add a row to a table, a bullet to a list, or a paragraph to notes that live inside the section.\n  • CSV / JSON / YAML / TOML / any non-markdown text file → `rewrite_file` with the FULL new content (no section semantics apply).",
         parameters: {
           type: 'object',
           properties: {
             op: {
               type: 'string',
-              enum: ['replace_section', 'insert_after', 'delete_section', 'append_text', 'prepend_text', 'rewrite_file'],
+              enum: ['replace_section', 'insert_after', 'append_to_section', 'delete_section', 'append_text', 'prepend_text', 'rewrite_file'],
               description: 'Edit kind. Section ops need `heading`. `append_text`/`prepend_text`/`rewrite_file` need just `content`.',
             },
             heading: {
@@ -918,6 +919,7 @@ function describeOp(op: ProposedEditOp): string {
   switch (op.op) {
     case 'replace_section': return `replace_section "${op.heading}"`
     case 'insert_after': return `insert_after "${op.heading}"`
+    case 'append_to_section': return `append_to_section "${op.heading}"`
     case 'delete_section': return `delete_section "${op.heading}"`
     case 'append_text': return 'append_text'
     case 'prepend_text': return 'prepend_text'
@@ -937,6 +939,7 @@ function validateProposedEdit(
   switch (op) {
     case 'replace_section':
     case 'insert_after':
+    case 'append_to_section':
     case 'delete_section': {
       if (!heading) return { error: `${op} requires a "heading" argument.` }
       // Verify the heading actually exists in the doc — otherwise

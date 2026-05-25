@@ -91,6 +91,7 @@ type ProposedEditCommon = {
 export type ProposedEditOp =
   | (ProposedEditCommon & { op: 'replace_section'; heading: string; content: string })
   | (ProposedEditCommon & { op: 'insert_after'; heading: string; content: string })
+  | (ProposedEditCommon & { op: 'append_to_section'; heading: string; content: string })
   | (ProposedEditCommon & { op: 'delete_section'; heading: string })
   | (ProposedEditCommon & { op: 'append_text'; content: string })
   | (ProposedEditCommon & { op: 'prepend_text'; content: string })

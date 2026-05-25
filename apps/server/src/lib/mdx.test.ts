@@ -6,6 +6,7 @@ import {
   getSection,
   replaceSection,
   insertAfter,
+  appendToSection,
   deleteSection,
   appendText,
   prependText,
@@ -180,6 +181,56 @@ describe('insertAfter', () => {
   it('inserts after the last section when targeting the last heading', () => {
     const out = insertAfter(doc, 'B', '## C\nNew tail.')
     expect(out).toMatch(/## B\nB body\.[\s\S]*## C\nNew tail\./)
+  })
+})
+
+describe('appendToSection', () => {
+  it('appends inside a flat section before the next sibling', () => {
+    const doc = '# T\n\n## A\nA body.\n\n## B\nB body.\n'
+    const out = appendToSection(doc, 'A', '- new bullet')
+    // The new bullet must land between A's existing body and B's
+    // heading — that is, inside A.
+    const aBodyIdx = out.indexOf('A body.')
+    const bulletIdx = out.indexOf('- new bullet')
+    const bIdx = out.indexOf('## B')
+    expect(aBodyIdx).toBeLessThan(bulletIdx)
+    expect(bulletIdx).toBeLessThan(bIdx)
+  })
+
+  it('appends BEFORE a nested sub-section, not after it', () => {
+    // This is the whole point of append_to_section vs insert_after:
+    // insert_after would put the bullet after the A.1 block. We
+    // want it inside A, before A.1.
+    const doc = '# T\n\n## A\nA prose.\n\n### A.1\nA.1 prose.\n\n## B\nB prose.\n'
+    const out = appendToSection(doc, 'A', '- end-of-A bullet')
+    const aProseIdx = out.indexOf('A prose.')
+    const bulletIdx = out.indexOf('- end-of-A bullet')
+    const a1Idx = out.indexOf('### A.1')
+    expect(aProseIdx).toBeLessThan(bulletIdx)
+    expect(bulletIdx).toBeLessThan(a1Idx)
+  })
+
+  it('appends to the last section when no next heading exists', () => {
+    const doc = '# T\n\n## A\nA body.\n'
+    const out = appendToSection(doc, 'A', '- new bullet')
+    expect(out).toMatch(/A body\.\n+- new bullet/)
+  })
+
+  it('respects fenced code blocks (no false-positive heading match)', () => {
+    // A `# H1` inside a fenced block must not be mistaken for a
+    // child heading boundary — the append should land at the real
+    // end of A, after the fence.
+    const doc = '## A\nA prose.\n\n```\n# fake heading inside code\n```\n\nA tail.\n\n## B\nB prose.\n'
+    const out = appendToSection(doc, 'A', '- appended bullet')
+    const aTailIdx = out.indexOf('A tail.')
+    const bulletIdx = out.indexOf('- appended bullet')
+    const bIdx = out.indexOf('## B')
+    expect(aTailIdx).toBeLessThan(bulletIdx)
+    expect(bulletIdx).toBeLessThan(bIdx)
+  })
+
+  it('throws on missing heading', () => {
+    expect(() => appendToSection('# T\n', 'NoSuch', 'x')).toThrow(/Heading not found/)
   })
 })
 

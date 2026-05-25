@@ -250,6 +250,7 @@ function opLabel(op: ProposedEditOpDTO['op']): string {
   switch (op) {
     case 'replace_section': return 'Replace section'
     case 'insert_after': return 'Insert section'
+    case 'append_to_section': return 'Append to section'
     case 'delete_section': return 'Delete section'
     case 'append_text': return 'Append to document'
     case 'prepend_text': return 'Prepend to document'
@@ -269,7 +270,12 @@ function OpIcon({ op, inConflict }: { op: ProposedEditOpDTO['op']; inConflict?: 
   if (op === 'delete_section') {
     return <Minus size={11} className={inConflict ? undefined : 'text-danger'} style={tint} />
   }
-  if (op === 'insert_after' || op === 'append_text' || op === 'prepend_text') {
+  if (
+    op === 'insert_after' ||
+    op === 'append_to_section' ||
+    op === 'append_text' ||
+    op === 'prepend_text'
+  ) {
     return <Plus size={11} className={inConflict ? undefined : 'text-accent'} style={tint} />
   }
   return <FileEdit size={11} className={inConflict ? undefined : 'text-accent'} style={tint} />

@@ -53,7 +53,7 @@ Single-node, single Docker image, runs on a Mac mini or Raspberry Pi.
 
 **AI agents (MCP)**
 - MCP endpoint at `/mcp` (Bearer token or OAuth 2.1)
-- **35 tools** across read, edit, search, organize, and richer
+- **36 tools** across read, edit, search, organize, and richer
   PDF/CSV inspection — see [Connecting AI agents](#connecting-ai-agents-mcp)
 - OAuth 2.1 + Dynamic Client Registration so Claude Code / Desktop /
   Cursor / Inspector connect by URL — no token paste, browser consent,
@@ -655,7 +655,7 @@ ALLOWED_ORIGINS=https://reader.example.com
 
 Reader exposes a Model Context Protocol endpoint at `/mcp` so AI
 agents can search your vault, read files, and (if you grant write
-scopes) create + edit them. **35 tools** are available; the agent
+scopes) create + edit them. **36 tools** are available; the agent
 sees only the subset its scopes cover.
 
 | Category | Tools |
@@ -664,7 +664,7 @@ sees only the subset its scopes cover.
 | Browse | `list_documents`, `list_folder`, `resolve_path`, `list_pins`, `list_tags`, `list_versions` |
 | Read | `get_document`, `get_outline`, `get_section`, `get_chunk` |
 | Search | `search_knowledge` |
-| Edit (markdown) | `replace_section`, `insert_after`, `delete_section`, `append_text`, `prepend_text` |
+| Edit (markdown) | `replace_section`, `insert_after`, `append_to_section`, `delete_section`, `append_text`, `prepend_text` |
 | Upload | `upload_text`, `upload_file`, `upload_from_url` |
 | Organize | `set_tags`, `set_visibility`, `pin`, `unpin`, `move_file`, `mkdir`, `rmdir`, `delete_document`, `restore_version` |
 | PDF | `get_pdf_outline`, `pdf_page_count`, `pdf_page_text` |

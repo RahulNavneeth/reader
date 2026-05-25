@@ -39,6 +39,7 @@ export const TOOL_SCOPES: ScopeDef[] = [
   { scope: 'tool:set_tags',         label: 'Set tags',        description: 'Replace the tag set on a document.', write: true },
   { scope: 'tool:replace_section',  label: 'Replace section', description: 'Rewrite one section of a markdown document.', write: true },
   { scope: 'tool:insert_after',     label: 'Insert after',    description: 'Insert content after a section heading.', write: true },
+  { scope: 'tool:append_to_section',label: 'Append to section', description: "Append content at the end of a section's body, before any nested sub-section.", write: true },
   { scope: 'tool:delete_section',   label: 'Delete section',  description: 'Remove a section from a markdown document.', write: true },
   { scope: 'tool:append_text',      label: 'Append text',     description: 'Append text to the end of a document.', write: true },
   { scope: 'tool:prepend_text',     label: 'Prepend text',    description: 'Prepend text to the start of a document.', write: true },

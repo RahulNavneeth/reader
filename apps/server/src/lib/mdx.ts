@@ -156,6 +156,47 @@ export function replaceSection(
   return spliceLines(text, ref.bodyStart, ref.endLine, bodyLines)
 }
 
+/** Append content to the END of the matched section's immediate
+ *  body — before any nested child heading, before the next sibling.
+ *  Distinct from `insertAfter`, which lands content AFTER the whole
+ *  section block (including nested subsections). Use this to add a
+ *  row to a table, a bullet to a list, or a paragraph to notes that
+ *  sit at the end of a section but before its sub-sections begin.
+ *
+ *  Semantics: find the first heading-of-any-level after the matched
+ *  heading; that's where the immediate body ends. Walk back over any
+ *  trailing blank padding so the new content snuggles up to the
+ *  existing last content line rather than landing in a void. */
+export function appendToSection(
+  text: string,
+  heading: string,
+  content: string,
+): string {
+  const ref = findSection(text, heading)
+  if (!ref) throw new Error(`Heading not found: "${heading}"`)
+  const lines = text.split('\n')
+  // First heading anywhere after our section's body-start is the
+  // end of our IMMEDIATE body — child headings count. outline() is
+  // fence-aware, so a `# H1` inside a fenced code block doesn't
+  // confuse the boundary detection.
+  const all = outline(text)
+  const myIdx = all.findIndex((s) => s.startLine === ref.startLine)
+  const next = all[myIdx + 1]
+  const immediateEnd = next ? next.startLine : lines.length
+  // Walk back over trailing blank padding so the splice point lands
+  // just past the last real content line of the immediate body.
+  let insertAt = immediateEnd
+  while (insertAt > ref.bodyStart && lines[insertAt - 1].trim() === '') {
+    insertAt--
+  }
+  const insertion = content.split('\n')
+  // Separating blanks on both sides so the appended block doesn't
+  // visually glom onto either neighbour.
+  if (insertion[0] !== '') insertion.unshift('')
+  if (insertion[insertion.length - 1] !== '') insertion.push('')
+  return spliceLines(text, insertAt, insertAt, insertion)
+}
+
 /** Insert content immediately after the matched heading's body
  *  (i.e., at the start of the next sibling-or-ancestor heading).
  *  Useful for adding subsections under a section. */
