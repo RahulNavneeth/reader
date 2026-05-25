@@ -119,17 +119,19 @@ export function AccountTokensPage() {
           <section
             className="rounded-md p-3 space-y-2"
             style={{
-              background: 'var(--selected)',
-              border: '1px solid var(--accent)',
+              background: 'var(--viewer)',
+              border: '1px solid var(--border)',
+              borderLeft: '2px solid var(--accent)',
             }}
           >
-            <div className="text-[12.5px] font-semibold text-fg">
+            <div className="text-[12.5px] font-semibold text-fg inline-flex items-center gap-1.5">
+              <KeyRound size={12} className="text-accent shrink-0" />
               Copy your new token — you won't see it again.
             </div>
             <div className="flex items-center gap-2">
               <code
-                className="flex-1 px-2 py-1.5 rounded text-[12.5px] break-all"
-                style={{ background: 'var(--bg)', border: '1px solid var(--border)' }}
+                className="flex-1 px-2 py-1.5 rounded text-[12.5px] break-all font-mono"
+                style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}
               >
                 {newSecret}
               </code>
