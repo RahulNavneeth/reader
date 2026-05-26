@@ -23,6 +23,21 @@ export type PublicUser = {
 
 export type IngestStatus = 'pending' | 'extracting' | 'embedding' | 'ready' | 'failed' | 'no-text'
 
+/** Smart-collection rule. NULL on a static collection
+ *  (membership via collection_members); non-NULL → resolved at
+ *  view time from the docs corpus + optional Ollama semantic
+ *  search. */
+export type SmartCollectionQuery = {
+  tags?: string[]
+  pathPrefix?: string
+  mimeKind?: 'image' | 'video' | 'file' | 'markdown'
+  dateFromTs?: number | null
+  dateToTs?: number | null
+  archived?: boolean
+  semanticQuery?: string
+  semanticLimit?: number
+}
+
 export type DocumentMeta = {
   id: string
   title: string
@@ -37,6 +52,13 @@ export type DocumentMeta = {
   public?: boolean
   publicExpiresAt?: number | null
   publicPasswordHash?: string | null
+  archived?: boolean
+  archivedAt?: number | null
+  templateSource?: {
+    template: string
+    vars: Record<string, string>
+    title?: string
+  } | null
   tags: string[]
   collectionId?: string
   createdAt: number
@@ -154,6 +176,13 @@ export type WorkspaceSettings = {
     outDir?: string
     retainDays?: number
   }
+  templates?: {
+    allowFetch?: boolean
+    fetchAllowlist?: string[]
+  }
+  clip?: {
+    enabled?: boolean
+  }
 }
 
 export type SystemInfo = {
@@ -163,6 +192,7 @@ export type SystemInfo = {
   maxFileBytes: number
   ingest: { maxFileBytes: number; chunkChars: number; chunkOverlap: number }
   ollama: { enabled: boolean; baseUrl: string; embedModel: string; chatEnabled: boolean; chatModel: string; available: boolean }
+  clip: { enabled: boolean; model: string }
   storage: {
     backend: 'local' | 's3'
     s3: {
@@ -413,6 +443,8 @@ export const api = {
       '/api/file/version/restore',
       { path: rel, ts },
     ),
+  fileArchive: (rel: string, archived: boolean) =>
+    post<{ document: DocumentMeta }>('/api/file/archive', { path: rel, archived }),
 
   fileActivity: (rel: string, limit = 50) =>
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
@@ -548,6 +580,19 @@ export const api = {
     vars?: Record<string, string>
   }) =>
     post<{ ok: true; document: DocumentMeta }>('/api/templates/instantiate', b),
+  saveAsTemplate: (b: { source: string; name: string }) =>
+    post<{
+      ok: true
+      template: {
+        path: string
+        name: string
+        title: string
+        bytes: number
+        updatedAt: number
+      }
+    }>('/api/templates/save-as', b),
+  refreshTemplate: (id: string) =>
+    post<{ ok: true; document: DocumentMeta }>('/api/templates/refresh', { id }),
 
   // calendar heatmap
   accountCalendar: (from?: string, to?: string) => {
@@ -625,6 +670,43 @@ export const api = {
       ok: number
       errors: Array<{ path: string; reason: string }>
     }>('/api/file/bulk-tags', body),
+  bulkArchive: (paths: string[], archived: boolean) =>
+    post<{
+      ok: number
+      errors: Array<{ path: string; reason: string }>
+    }>('/api/file/bulk-archive', { paths, archived }),
+  accountOnThisDay: () =>
+    get<{
+      today: string
+      items: Array<{
+        id: string
+        storageKey: string
+        title: string
+        createdAt: number
+        updatedAt: number
+        year: number
+        yearsAgo: number
+        mimeKind: 'image' | 'video' | 'file'
+      }>
+    }>('/api/account/on-this-day'),
+  accountArchive: () =>
+    get<{
+      folders: Array<{
+        path: string
+        name: string
+        tags: string[]
+        archivedAt: number | null
+      }>
+      files: Array<{
+        docId: string
+        path: string
+        name: string
+        mime: string
+        kind: 'image' | 'video' | 'file'
+        bytes: number
+        archivedAt: number | null
+      }>
+    }>('/api/account/archive'),
 
   // trash
   trashList: () =>
@@ -813,7 +895,7 @@ export const api = {
       webhooks: {
         id: string
         url: string
-        events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+        events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest' | 'archive'>
         secret?: string
         hasSecret?: boolean
         enabled?: boolean
@@ -840,7 +922,7 @@ export const api = {
     }>('/api/admin/webhooks'),
   adminCreateWebhook: (body: {
     url: string
-    events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+    events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest' | 'archive'>
     secret?: string
     enabled?: boolean
   }) =>
@@ -849,7 +931,7 @@ export const api = {
     id: string,
     body: {
       url?: string
-      events?: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+      events?: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest' | 'archive'>
       secret?: string
       enabled?: boolean
     },
@@ -1018,7 +1100,7 @@ export const api = {
       webhooks: Array<{
         id: string
         url: string
-        events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+        events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest' | 'archive'>
         hasSecret?: boolean
         enabled?: boolean
         createdAt: number
@@ -1051,7 +1133,7 @@ export const api = {
     }>('/api/account/webhooks'),
   accountCreateWebhook: (body: {
     url: string
-    events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+    events: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest' | 'archive'>
     secret?: string
     enabled?: boolean
   }) =>
@@ -1060,7 +1142,7 @@ export const api = {
     id: string,
     body: {
       url?: string
-      events?: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest'>
+      events?: Array<'upload' | 'edit' | 'delete' | 'trash' | 'move' | 'mkdir' | 'share' | 'tags' | 'visibility' | 'folder-tags' | 'folder-visibility' | 'pin' | 'intake' | 'template' | 'export' | 'ingest' | 'archive'>
       secret?: string
       enabled?: boolean
     },
@@ -1083,8 +1165,12 @@ export const api = {
   accountDeleteWebhook: (id: string) =>
     request<{ ok: true }>('DELETE', `/api/account/webhooks/${encodeURIComponent(id)}`),
 
-  // timeline — chronological photo + video feed
-  accountTimeline: (cursor?: string, limit = 200) =>
+  // timeline — chronological photo + video feed. `archived` tristate:
+  // unset hides archived docs (default); 'true' includes both; 'only'
+  // returns just archived (used by the dedicated /archive view).
+  accountTimeline: (
+    opts: { cursor?: string; limit?: number; archived?: 'true' | 'only' } = {},
+  ) =>
     get<{
       days: Array<{
         day: string
@@ -1102,7 +1188,13 @@ export const api = {
       }>
       nextCursor: string | null
       total: number
-    }>(`/api/account/timeline${q({ cursor, limit })}`),
+    }>(
+      `/api/account/timeline${q({
+        cursor: opts.cursor,
+        limit: opts.limit ?? 200,
+        archived: opts.archived,
+      })}`,
+    ),
 
   // map — geotagged photos
   accountMap: () =>
@@ -1199,6 +1291,7 @@ export const api = {
         publicExpiresAt?: number | null
         publicSlug?: string | null
         hasPassword?: boolean
+        query: SmartCollectionQuery | null
       }
       items: Array<{
         docId: string
@@ -1219,7 +1312,12 @@ export const api = {
     }>(`/api/collections/${encodeURIComponent(id)}`),
   patchCollection: (
     id: string,
-    body: { name?: string; description?: string | null; coverDocId?: string | null },
+    body: {
+      name?: string
+      description?: string | null
+      coverDocId?: string | null
+      query?: SmartCollectionQuery | null
+    },
   ) =>
     request<{ collection: { id: string; name: string; updatedAt: number } }>(
       'PATCH',

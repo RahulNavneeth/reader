@@ -3,11 +3,20 @@ import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveUserVault, userVaultRoot } from '../lib/userVault.js'
 import { audit } from '../stores/audit.js'
-import { saveMeta, sha256Of } from '../stores/documents.js'
+import { isFrozenForArchive, loadMeta, saveMeta, sha256Of, userCanEdit } from '../stores/documents.js'
+import { snapshotVersion } from '../stores/versions.js'
+import { publish as publishEvent } from '../services/events.js'
+import { broadcastEdit } from '../services/crdtRegistry.js'
+import { invalidateSearchCache } from '../services/search.js'
 import { ingestDocument } from '../services/ingest.js'
 import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
 import { nanoid } from 'nanoid'
 import type { DocumentMeta } from '../types.js'
+import { applyTemplate, applyTemplateAsync } from '../services/templateEngine.js'
+import {
+  makeVaultIncludeResolver,
+  makeUrlFetchResolver,
+} from '../services/templateResolvers.js'
 
 /**
  * Document templates. Templates live as plain `.md` files under
@@ -203,18 +212,14 @@ export async function templatesRoutes(app: FastifyInstance) {
     // `journal/2026-05-23-my-doc.md`. Path resolution still goes
     // through resolveUserVault so the substituted values can't be
     // used to escape the user's vault.
-    const subst = (s: string, vars: Record<string, string>) =>
-      s.replace(/\{\{\s*([a-zA-Z0-9_-]+)\s*\}\}/g, (m, key: string) =>
-        Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : m,
-      )
     const earlyVars = computeBuiltins({
       now: new Date(),
       title: title || 'untitled',
       user: user.username,
       targetRel,
     })
-    title = subst(title, { ...earlyVars, ...(body.vars ?? {}) })
-    targetRel = subst(targetRel, {
+    title = applyTemplate(title, { ...earlyVars, ...(body.vars ?? {}) })
+    targetRel = applyTemplate(targetRel, {
       // After title substitution, slug derives from the resolved
       // title — so `{{slug}}` in the target path uses the final
       // title, not the raw template.
@@ -271,10 +276,17 @@ export async function templatesRoutes(app: FastifyInstance) {
       targetRel,
     })
     const vars = { ...builtins, ...(body.vars ?? {}) }
-    let content = tplBuf.toString('utf8')
-    content = content.replace(/\{\{\s*([a-zA-Z0-9_-]+)\s*\}\}/g, (m, key: string) =>
-      Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : m,
-    )
+    let content: string
+    try {
+      content = await applyTemplateAsync(tplBuf.toString('utf8'), vars, {
+        loadInclude: makeVaultIncludeResolver(user.username),
+        loadFetch: makeUrlFetchResolver(),
+      })
+    } catch (e) {
+      return reply.code(400).send({
+        error: `template: ${(e as Error).message}`,
+      })
+    }
 
     await mkdir(path.dirname(targetAbs), { recursive: true })
     const buf = Buffer.from(content, 'utf8')
@@ -299,6 +311,14 @@ export async function templatesRoutes(app: FastifyInstance) {
       acl: { readers: [], editors: [] },
       tags: [],
       ingest: { status: 'pending', embedded: false },
+      // Provenance so the doc can be re-rendered later. Stash the
+      // user-supplied vars only — built-ins (date, uuid, etc.) are
+      // re-computed at refresh time.
+      templateSource: {
+        template: templateRel,
+        vars: body.vars ?? {},
+        title: title || undefined,
+      },
     } as unknown as DocumentMeta
     try {
       await saveMeta(meta)
@@ -320,10 +340,192 @@ export async function templatesRoutes(app: FastifyInstance) {
         template: templateRel,
         title: meta.title,
       }).catch(() => null)
+      broadcastEdit(
+        meta.id,
+        { owner: meta.owner, storageKey: meta.storageKey },
+        content,
+        'template-instantiate',
+      )
       return { ok: true, document: finalMeta }
     } catch (e) {
       req.log.error({ err: e }, 'template.instantiate failed')
       return reply.code(500).send({ error: (e as Error).message ?? 'instantiate failed' })
     }
+  })
+
+  // Copy an existing doc into `_templates/<name>.md` so the user can
+  // re-instantiate it later. Markdown-only — bytes of non-text files
+  // wouldn't substitute, and a template can't include an attachment
+  // by reference anyway. Refuses to clobber an existing template;
+  // the client can rename and retry.
+  app.post<{
+    Body: { source?: string; name?: string }
+  }>('/api/templates/save-as', async (req, reply) => {
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const sourceRel = (req.body?.source ?? '').trim().replace(/^\/+|\/+$/g, '')
+    const rawName = (req.body?.name ?? '').trim()
+    if (!sourceRel || !rawName) {
+      return reply.code(400).send({ error: 'source and name are required' })
+    }
+    if (!/\.(md|markdown|mdx)$/i.test(sourceRel)) {
+      return reply.code(400).send({ error: 'only markdown documents can be saved as templates' })
+    }
+    // Sanitise the template filename: keep alphanumerics, dashes,
+    // underscores, dots, and spaces. Strip everything else so a
+    // user pasting a heading line as the name can't smuggle path
+    // segments (`../`, leading `/`) or shell metacharacters into
+    // the eventual file location.
+    let name = rawName.replace(/[^a-zA-Z0-9 ._-]+/g, '').replace(/^[. ]+|[. ]+$/g, '')
+    if (!name) return reply.code(400).send({ error: 'name resolves to empty after sanitising' })
+    if (!/\.(md|markdown|mdx)$/i.test(name)) name = `${name}.md`
+    let sourceAbs: string
+    let templateAbs: string
+    const templateRel = `${TEMPLATES_DIR}/${name}`
+    try {
+      sourceAbs = resolveUserVault(user.username, sourceRel)
+      templateAbs = resolveUserVault(user.username, templateRel)
+    } catch (e) {
+      return reply.code(400).send({ error: (e as Error).message })
+    }
+    let body: Buffer
+    try {
+      body = await readFile(sourceAbs)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+        return reply.code(404).send({ error: 'source not found' })
+      }
+      throw e
+    }
+    try {
+      await stat(templateAbs)
+      return reply.code(409).send({ error: 'template with that name already exists' })
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    }
+    await mkdir(path.dirname(templateAbs), { recursive: true })
+    // Pre-register the write so the watcher doesn't fire a duplicate
+    // upload webhook for what we're already auditing as a template
+    // save.
+    markExpectedWrite(templateAbs, sha256Of(body))
+    await writeFile(templateAbs, body)
+    await audit({
+      actor: user.username,
+      action: 'template.save_as',
+      target: templateRel,
+      meta: { source: sourceRel, bytes: body.length },
+    })
+    return {
+      ok: true,
+      template: {
+        path: templateRel,
+        name,
+        title: name.replace(/\.(md|markdown|mdx)$/i, ''),
+        bytes: body.length,
+        updatedAt: Date.now(),
+      },
+    }
+  })
+
+  // Re-render a doc that was originally instantiated from a template.
+  // Uses the stashed `templateSource.{template, vars, title}` plus
+  // freshly computed built-ins (date / time / uuid are "now"), and
+  // overwrites the file. The pre-refresh content is snapshotted to
+  // the versions store first, so the user can `restore_version` if
+  // the refresh wasn't what they wanted.
+  //
+  // Refuses on:
+  //   - doc not found (404)
+  //   - caller can't edit the doc (403)
+  //   - doc is archived — read-only freeze applies (409 code:archived)
+  //   - doc has no templateSource (400 — refresh has no semantics)
+  //   - template no longer exists (404 — user deleted the source)
+  app.post<{ Body: { id?: string } }>('/api/templates/refresh', async (req, reply) => {
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const id = String(req.body?.id ?? '').trim()
+    if (!id) return reply.code(400).send({ error: 'id required' })
+    const meta = await loadMeta(id)
+    if (!meta) return reply.code(404).send({ error: 'document not found' })
+    if (!userCanEdit(meta, user.username, user.role)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    if (isFrozenForArchive(meta)) {
+      return reply.code(409).send({ error: 'document is archived — unarchive to refresh', code: 'archived' })
+    }
+    const src = meta.templateSource
+    if (!src) {
+      return reply.code(400).send({ error: 'document was not created from a template' })
+    }
+    const templateAbs = (() => {
+      try {
+        return resolveUserVault(meta.owner, src.template)
+      } catch {
+        return null
+      }
+    })()
+    if (!templateAbs) return reply.code(400).send({ error: 'template path invalid' })
+    let tplBuf: Buffer
+    try {
+      tplBuf = await readFile(templateAbs)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+        return reply.code(404).send({ error: 'source template no longer exists' })
+      }
+      throw e
+    }
+    const builtins = computeBuiltins({
+      now: new Date(),
+      title: src.title || meta.title,
+      user: user.username,
+      targetRel: meta.storageKey,
+    })
+    const vars = { ...builtins, ...src.vars }
+    let content: string
+    try {
+      content = await applyTemplateAsync(tplBuf.toString('utf8'), vars, {
+        loadInclude: makeVaultIncludeResolver(meta.owner),
+        loadFetch: makeUrlFetchResolver(),
+      })
+    } catch (e) {
+      return reply.code(400).send({ error: `template: ${(e as Error).message}` })
+    }
+    // Snapshot BEFORE the overwrite so the user has an undo path.
+    await snapshotVersion(meta.id).catch(() => null)
+    const targetAbs = resolveUserVault(meta.owner, meta.storageKey)
+    const buf = Buffer.from(content, 'utf8')
+    markExpectedWrite(targetAbs, sha256Of(buf))
+    await writeFile(targetAbs, buf)
+    const next: DocumentMeta = {
+      ...meta,
+      bytes: buf.length,
+      sha256: sha256Of(buf),
+      updatedAt: Date.now(),
+      ingest: { status: 'pending', embedded: false },
+    }
+    await saveMeta(next)
+    const finalMeta = await ingestDocument(next, buf)
+    invalidateSearchCache()
+    await audit({
+      actor: user.username,
+      action: 'template.refresh',
+      target: meta.storageKey,
+      meta: { template: src.template, docId: meta.id },
+    })
+    dispatchWebhook({
+      type: 'edit',
+      path: meta.storageKey,
+      actor: user.username,
+      bytes: buf.length,
+      source: 'web',
+    }).catch(() => null)
+    publishEvent({ type: 'edit', path: meta.storageKey, docId: meta.id })
+    broadcastEdit(
+      meta.id,
+      { owner: meta.owner, storageKey: meta.storageKey },
+      content,
+      'template-refresh',
+    )
+    return { ok: true, document: finalMeta }
   })
 }

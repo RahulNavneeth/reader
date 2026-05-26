@@ -82,6 +82,27 @@ export type WorkspaceSettings = {
     /** Auto-prune archives older than this many days. 0 = forever. */
     retainDays?: number
   }
+  /** Template engine settings.
+   *  `allowFetch` gates the {{fetch url="..."}} placeholder; off by
+   *  default. When on, only hosts in `fetchAllowlist` are reachable.
+   *  Use `*.example.com` for a suffix match; bare `api.foo.com` for
+   *  an exact match. Private / loopback / link-local addresses are
+   *  always blocked regardless of allowlist. */
+  templates?: {
+    allowFetch?: boolean
+    fetchAllowlist?: string[]
+  }
+  /** CLIP image-text embedding toggle. When enabled, ingest drops
+   *  a 512-dim CLIP sidecar per image and `searchKnowledge` fuses
+   *  the image-text similarity into the rank — so "sunset" via
+   *  the search bar (or a smart collection's semantic query)
+   *  also surfaces matching photos. Heavy: needs the
+   *  transformers.js model in memory (~150 MB once loaded).
+   *  Off by default; admin opts in. Requires a server restart
+   *  for the first load since the model is process-scoped. */
+  clip?: {
+    enabled?: boolean
+  }
 }
 
 export type ExternalMount = {
@@ -114,6 +135,7 @@ export type WebhookConfig = {
     | 'template'
     | 'export'
     | 'ingest'
+    | 'archive'
   >
   /** Shared secret in encrypted form (AES-256-GCM, prefixed `enc:v1:`).
    *  Legacy hooks written before encryption shipped may still hold
@@ -180,6 +202,7 @@ const ENV = {
   },
   server: { ...config.server },
   smtp: { ...config.smtp },
+  clip: { enabled: config.clip.enabled },
 }
 
 let cache: WorkspaceSettings | null = null
@@ -225,6 +248,8 @@ function applyOverrides(s: WorkspaceSettings): void {
   config.smtp.pass = s.smtp?.pass ?? ENV.smtp.pass
   config.smtp.from = s.smtp?.from?.trim() || ENV.smtp.from
   config.smtp.secure = s.smtp?.secure ?? ENV.smtp.secure
+
+  config.clip.enabled = s.clip?.enabled ?? ENV.clip.enabled
 }
 
 export async function loadSettings(): Promise<WorkspaceSettings> {
@@ -282,4 +307,9 @@ export const RESTART_REQUIRED_KEYS: Array<keyof WorkspaceSettings> = [
   'storage',
   'session',
   'server',
+  // CLIP toggling needs a process restart — the model + ONNX
+  // runtime are loaded lazily but stay resident; flipping off in
+  // a live process doesn't unload them, and flipping on without
+  // a restart skips the warmup hook in clipEmbed.ts.
+  'clip',
 ]

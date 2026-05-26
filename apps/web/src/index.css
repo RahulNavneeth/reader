@@ -26,15 +26,28 @@
      * darker base and the viewer is the slightly-bluer panel. */
     --viewer: var(--bg);
     --rail: var(--panel);
+    /* Three-tier hierarchy used across every settings/page surface.
+     * surface-1 = brightest (top app shell header)
+     * surface-2 = mid (per-page sub-header — Connected apps, etc.)
+     * surface-3 = darkest of the three (page body)
+     * The existing --bg/--panel/--panel-2 tokens flip brightness
+     * between light + dark mode, so these aliases pin the order
+     * regardless of theme — `surface-1` is always the most
+     * elevated surface, `surface-3` always the deepest. */
+    --surface-1: var(--bg);
+    --surface-2: var(--panel-2);
+    --surface-3: var(--panel);
     --composer-input: var(--bg);
     --input-bg: var(--bg);
     --input-border: var(--border);
-    /* Table styling derived from --viewer so it adapts whether the
-     * underlying surface is white (light) or the panel tint (dark).
-     * Header is a subtly darker (light) / lighter (dark) shade
-     * than the surface; stripes a milder variant of the same. */
-    --table-header-bg: color-mix(in srgb, var(--fg) 8%, var(--viewer));
-    --table-stripe-bg: color-mix(in srgb, var(--fg) 4%, var(--viewer));
+    /* Table chrome derived from --surface-2 so the header always
+     * pops one tier above the page body — the body is on
+     * --surface-3 (or the card sits on --surface-3), so deriving
+     * from --viewer would collapse the header into the body in
+     * light mode where --viewer === body. The 8%/4% mixes give a
+     * visible-but-quiet step against the row stripes. */
+    --table-header-bg: color-mix(in srgb, var(--fg) 8%, var(--surface-2));
+    --table-stripe-bg: color-mix(in srgb, var(--fg) 4%, var(--surface-2));
   }
   .dark {
     --bg: #0B1424;
@@ -55,6 +68,11 @@
     --scrim: rgba(0, 0, 0, 0.35);
     --viewer: var(--panel);
     --rail: var(--bg);
+    /* Dark-mode inversion of the surface-1/2/3 chain — see the
+     * light-mode block above for the ordering contract. */
+    --surface-1: var(--panel-2);
+    --surface-2: var(--panel);
+    --surface-3: var(--bg);
     --composer-input: var(--panel-2);
     /* One step lighter than --panel-2 so an input visibly pops
      * against the header / rail surfaces in dark mode. */
@@ -78,6 +96,75 @@
     background: var(--accent-bg);
     color: var(--fg);
   }
+
+  /* Theme swap kill-switch — see hooks/useTheme.ts. Suppresses
+   * every CSS transition (including animations) on every element
+   * while the dark-mode class is being toggled, so the var swap
+   * paints instantly everywhere instead of crossfading on the
+   * subset of elements that opt into a `transition-*` rule. Class
+   * is removed on the next animation frame, restoring normal
+   * hover/focus smoothing immediately after. */
+  html.theme-transitioning,
+  html.theme-transitioning *,
+  html.theme-transitioning *::before,
+  html.theme-transitioning *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+
+  /* Native checkbox — themed. The browser default renders a heavy
+   * gray rounded square that sits poorly against the Reader chrome
+   * in both light and dark mode. `appearance: none` strips it and
+   * we paint our own using theme tokens: surface-2 background at
+   * rest, accent fill + white check on `:checked`, danger-fg ring
+   * on `:invalid`. The 14px footprint matches the icon row beside
+   * which checkboxes typically sit. */
+  input[type='checkbox'] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1px solid var(--input-border, var(--border));
+    background: var(--input-bg, var(--viewer));
+    display: inline-block;
+    vertical-align: middle;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin: 0;
+    /* No `transition` on background/border — the theme toggle flips
+     * --input-bg + --input-border, and a 100ms ease made every
+     * checkbox lag visibly behind the rest of the chrome. Hover /
+     * check states are short enough that a snap reads as crisp,
+     * not jarring. */
+  }
+  input[type='checkbox']:hover:not(:disabled) {
+    border-color: var(--accent);
+  }
+  input[type='checkbox']:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  input[type='checkbox']:checked {
+    background-color: var(--accent);
+    border-color: var(--accent);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none'><path d='M2.5 6.3l2.4 2.4 4.6-5' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-size: 11px 11px;
+    background-position: center;
+    background-repeat: no-repeat;
+  }
+  input[type='checkbox']:indeterminate {
+    background-color: var(--accent);
+    border-color: var(--accent);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><rect x='2.5' y='5.25' width='7' height='1.5' rx='0.75' fill='white'/></svg>");
+    background-size: 11px 11px;
+    background-position: center;
+    background-repeat: no-repeat;
+  }
+  input[type='checkbox']:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
 }
 
 @layer components {
@@ -86,6 +173,15 @@
   .panel-2 { background: var(--panel-2); }
   .border-app { border-color: var(--border); }
   .border-soft { border-color: var(--border-soft); }
+
+  /* Settings list card — row dividers pulled from the theme's
+     --border token so they don't read as too-bright lines on the
+     dark surface (Tailwind's `divide-y` ships with a fixed light-
+     gray colour that doesn't adapt). Used by SettingsListCard +
+     anywhere else that wants the same row-separator behaviour. */
+  .settings-list-card > * + * {
+    border-top: 1px solid var(--border);
+  }
   .text-fg { color: var(--fg); }
   .text-muted { color: var(--fg-muted); }
   .text-subtle { color: var(--fg-subtle); }
@@ -95,21 +191,49 @@
   .bg-hover { background: var(--hover); }
   .bg-selected { background: var(--selected); }
 
+  /* Button transitions are scoped to background-color + filter only.
+   * Tailwind's stock `transition-colors` also smooths `color`, which
+   * dragged every button (theme toggle included) through a 150ms
+   * crossfade on theme switch while the rest of the chrome flipped
+   * instantly. Hover bg + brightness still ease nicely; the colour
+   * swap snaps with the theme. */
   .btn {
-    @apply inline-flex items-center justify-center gap-1.5 px-3 h-8 rounded text-[13px] font-medium transition-colors;
+    @apply inline-flex items-center justify-center gap-1.5 px-3 h-8 rounded text-[13px] font-medium;
     color: var(--fg);
+    transition: background-color 150ms;
   }
   .btn:hover { background: var(--hover); }
   .btn-primary {
-    @apply inline-flex items-center justify-center gap-1.5 px-3 h-8 rounded text-[13px] font-medium transition-colors text-white;
+    @apply inline-flex items-center justify-center gap-1.5 px-3 h-8 rounded text-[13px] font-medium text-white;
     background: var(--accent);
+    transition: filter 150ms;
   }
   .btn-primary:hover { filter: brightness(1.05); }
   .btn-ghost {
-    @apply inline-flex items-center justify-center gap-1.5 px-2 h-7 rounded text-[12.5px] font-medium transition-colors;
+    @apply inline-flex items-center justify-center gap-1.5 px-2 h-7 rounded text-[12.5px] font-medium;
     color: var(--fg-muted);
+    transition: background-color 150ms;
   }
   .btn-ghost:hover { background: var(--hover); color: var(--fg); }
+
+  /* Danger-flavoured ghost button — destructive actions (Revoke,
+     Delete, Purge). Reads as red on rest and a darker red wash on
+     hover so the intent is reinforced rather than fading into the
+     neutral hover. Built on top of btn-ghost so the height/spacing
+     stay consistent with neighbouring buttons. */
+  .btn-ghost-danger {
+    @apply inline-flex items-center justify-center gap-1.5 px-2 h-7 rounded text-[12.5px] font-medium;
+    color: var(--danger-fg);
+    transition: background-color 150ms;
+  }
+  .btn-ghost-danger:hover {
+    background: var(--danger-bg);
+    color: var(--danger-fg);
+  }
+  .btn-ghost-danger:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
 
   .input {
     /* No transition at all on .input. Any color/border transition

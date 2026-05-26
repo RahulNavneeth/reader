@@ -20,11 +20,14 @@ import { PublicCollectionPage } from './components/PublicCollectionPage'
 import { NewFolderButton } from './components/NewFolderButton'
 import { TemplatesButton } from './components/TemplatesButton'
 import { TrashPage } from './components/TrashPage'
+import { ArchivePage } from './components/ArchivePage'
 import { SearchPalette } from './components/SearchPalette'
 import { UploadButton } from './components/UploadButton'
 import { PublicResolver } from './components/PublicResolver'
 import { VaultContext } from './lib/vault-context'
 import { useReaderEvents } from './lib/events'
+import { useSyncDrain } from './lib/sync/useSyncDrain'
+import { SyncStatusBadge } from './components/SyncStatusBadge'
 import { useOnlineStatus } from './hooks/useOnlineStatus'
 
 type AuthState =
@@ -171,6 +174,13 @@ export default function App() {
     } catch {
       /* swallow */
     }
+    // Drop any queued offline ops — they belong to the
+    // outgoing user; replaying them under a different account
+    // would either fail with 403 or write to the wrong vault.
+    const { clearAll } = await import('./lib/sync/queue')
+    const { clearCursor } = await import('./lib/sync/cursor')
+    await clearAll().catch(() => null)
+    clearCursor()
     setAuth({ status: 'anonymous' })
   }
 
@@ -185,6 +195,11 @@ export default function App() {
   // Routes through bumpRefresh so a flood of events compresses to one
   // refresh per frame instead of one re-render per event.
   useReaderEvents(bumpRefresh, auth.status === 'authed')
+  // Phase-1 offline sync: track network state + queue depth, replay
+  // through /api/sync/push on reconnect. The hook is a no-op when
+  // the user is signed out so a logged-out browser doesn't try to
+  // drain a previous account's queue.
+  const syncStatus = useSyncDrain(auth.status === 'authed', bumpRefresh)
 
   const doUpload = useCallback(async (arr: File[], dir: string) => {
     // Don't abort the whole batch on one bad file — log it and move on.
@@ -344,7 +359,7 @@ export default function App() {
         {!location.pathname.startsWith('/oauth/') && (
         <header
           className="h-12 flex items-center px-3 border-b border-app shrink-0"
-          style={{ background: 'var(--panel-2)' }}
+          style={{ background: 'var(--surface-1)' }}
         >
           {/* Three sections: logo + (mobile-only) hamburger on the
               left, search in the middle, actions on the right.
@@ -461,6 +476,8 @@ export default function App() {
               }}
             />
 
+            <SyncStatusBadge status={syncStatus} />
+
             <button
               className="btn-ghost"
               onClick={toggle}
@@ -482,6 +499,7 @@ export default function App() {
           <Route path="/account/connected-apps" element={<AccountConnectedAppsPage />} />
           <Route path="/oauth/consent" element={<OAuthConsentPage onAuthed={(user) => onAuthed(user)} />} />
           <Route path="/trash" element={<TrashPage />} />
+          <Route path="/archive" element={<ArchivePage />} />
           <Route path="/map" element={<MapPage />} />
           <Route path="/timeline" element={<TimelinePage />} />
           <Route path="/collections" element={<CollectionsPage />} />

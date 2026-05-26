@@ -16,9 +16,11 @@
  *     intermediate state — though we serialise scheduled runs anyway.
  */
 import { spawn } from 'node:child_process'
-import { mkdir, readdir, stat, unlink } from 'node:fs/promises'
+import { mkdir, readdir, rename, stat, unlink } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
+import { moveAcrossDevices } from '../lib/fs.js'
 
 export interface BackupOptions {
   /** Reader's app-state directory (sqlite, audit, sessions, …). */
@@ -92,12 +94,18 @@ export async function createBackup(opts: BackupOptions): Promise<BackupResult> {
     }
   }
 
-  const file = path.join(outDir, `reader-backup-${ts()}.tar.gz`)
+  const finalFile = path.join(outDir, `reader-backup-${ts()}.tar.gz`)
+  // Write to a tmp file OUTSIDE the dataDir / vaultRoot trees so tar
+  // doesn't read its own in-flight output as part of the archive.
+  // Without this, scheduled backups landed in `$DATA_DIR/backups/`
+  // (i.e. inside the tree being tarred) and tar would race itself,
+  // exiting with `file changed as we read it`.
+  const tmpFile = path.join(os.tmpdir(), `reader-backup-${process.pid}-${Date.now()}.tar.gz`)
   const dataParent = path.dirname(dataDir)
   const vaultParent = path.dirname(vaultRoot)
   const args = [
     '-czf',
-    file,
+    tmpFile,
     '--exclude=reader.db-wal',
     '--exclude=reader.db-shm',
     '--exclude=reader.db-journal',
@@ -105,7 +113,7 @@ export async function createBackup(opts: BackupOptions): Promise<BackupResult> {
     '-C', dataParent, path.basename(dataDir),
     '-C', vaultParent, path.basename(vaultRoot),
   ]
-  log(`[backup] writing ${file}`)
+  log(`[backup] writing ${finalFile}`)
   log(`[backup]   data:  ${dataDir}`)
   log(`[backup]   vault: ${vaultRoot}`)
 
@@ -120,13 +128,28 @@ export async function createBackup(opts: BackupOptions): Promise<BackupResult> {
         else reject(new Error(`tar exited with code ${code}${stderr ? `: ${stderr.trim()}` : ''}`))
       })
     })
+    // Promote tmp → final location only after a clean tar exit. Try
+    // a same-fs rename first; fall back to copy+unlink if tmpdir is
+    // on a different volume (common in Docker bind-mount setups).
+    try {
+      await rename(tmpFile, finalFile)
+    } catch (e: any) {
+      if (e?.code === 'EXDEV') {
+        await moveAcrossDevices(tmpFile, finalFile)
+      } else {
+        throw e
+      }
+    }
   } finally {
     if (snapshot) await unlink(snapshot).catch(() => null)
+    // If we threw before the rename, clean up the tmp file so it
+    // doesn't accumulate under /tmp on repeated failures.
+    await unlink(tmpFile).catch(() => null)
   }
 
-  const s = await stat(file)
+  const s = await stat(finalFile)
   log(`[backup] done — ${(s.size / (1024 * 1024)).toFixed(1)} MB`)
-  return { file, bytes: s.size, snapshotted: !!snapshot }
+  return { file: finalFile, bytes: s.size, snapshotted: !!snapshot }
 }
 
 /**

@@ -31,6 +31,8 @@ import { RevokePublicPopover } from './RevokePublicPopover'
 import { PinButton } from './PinButton'
 import { BulkCollectionsButton } from './BulkCollectionsButton'
 import { BulkTagsButton } from './BulkTagsButton'
+import { BulkArchiveButton } from './BulkArchiveButton'
+import { OnThisDayCard } from './OnThisDayCard'
 
 type FolderMetaShape = {
   owner: string
@@ -329,11 +331,11 @@ export function FolderGrid({
   }
 
   return (
-    <div ref={rootRef} className="h-full flex flex-col" style={{ background: 'var(--rail)' }}>
+    <div ref={rootRef} className="h-full flex flex-col" style={{ background: 'var(--surface-3)' }}>
       <div
         data-grid-toolbar=""
         className="flex items-center gap-2 px-3 min-h-11 py-1.5 border-b shrink-0 flex-wrap"
-        style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
+        style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
       >
         <PathBreadcrumb
           dir={dir}
@@ -454,6 +456,10 @@ export function FolderGrid({
                 same tag lands in document metas for files and
                 folder metas for folders. */}
             <BulkTagsButton paths={selectedPaths} />
+            {/* Bulk archive — sends to the same /api/file/bulk-archive
+                that handles folder cascade. Hidden when the selection
+                is empty; the button itself confirms before firing. */}
+            <BulkArchiveButton paths={selectedPaths} onChanged={refresh} />
             {/* Share-with-user fans out to every selected path under
                 one recipient/permission combo — no need to pick each
                 target one at a time. */}
@@ -653,6 +659,14 @@ export function FolderGrid({
                     onChanged={refresh}
                   />
                 )}
+                {/* Archive the entire folder — cascades through every
+                    descendant doc via /api/file/bulk-archive. Root
+                    folder is excluded for the same reason as Pin (you
+                    can't archive the whole vault). The button itself
+                    is icon-only with a themed confirm dialog. */}
+                {dir !== '' && (
+                  <BulkArchiveButton paths={[dir]} onChanged={refresh} />
+                )}
 
               </>
             )}
@@ -661,6 +675,9 @@ export function FolderGrid({
       </div>
 
       <div className="flex-1 overflow-y-auto p-6">
+        {/* "On this day" memories — only at the vault root,
+            owner-side. Hidden when there's nothing to show. */}
+        {dir === '' && !isSharedView && <OnThisDayCard />}
         {error && (
           <div className="px-2 py-4">
             <div className="flex items-center gap-2 text-fg font-semibold mb-1">

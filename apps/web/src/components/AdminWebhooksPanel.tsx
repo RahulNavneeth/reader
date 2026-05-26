@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
+import { SettingsListCard, SettingsListEmpty } from './SettingsList'
 
 type WebhookEvent =
   | 'upload'
@@ -31,6 +32,7 @@ type WebhookEvent =
   | 'template'
   | 'export'
   | 'ingest'
+  | 'archive'
 
 type DeadLetter = {
   id: string
@@ -80,6 +82,7 @@ const ALL_EVENTS: WebhookEvent[] = [
   'template',
   'export',
   'ingest',
+  'archive',
 ]
 
 export function AdminWebhooksPanel(): JSX.Element {
@@ -230,14 +233,14 @@ export function AdminWebhooksPanel(): JSX.Element {
       )}
 
       {loading ? (
-        <div className="text-subtle text-[12px] py-4">Loading…</div>
+        <div className="text-subtle text-[12.5px] py-4">Loading…</div>
       ) : hooks.length === 0 && !adding ? (
-        <div className="text-subtle text-[12px] py-4">
-          No global webhooks yet. Per-user hooks live under each user's account
-          settings.
-        </div>
-      ) : (
-        <ul className="divide-y" style={{ borderColor: 'var(--border)' }}>
+        <SettingsListEmpty
+          title="No global webhooks yet"
+          hint="Per-user hooks live under each user's account settings."
+        />
+      ) : hooks.length === 0 ? null : (
+        <SettingsListCard>
           {hooks.map((h) => (
             <Row
               key={h.id}
@@ -247,7 +250,7 @@ export function AdminWebhooksPanel(): JSX.Element {
               onError={(m) => setError(m)}
             />
           ))}
-        </ul>
+        </SettingsListCard>
       )}
     </section>
   )
@@ -417,7 +420,7 @@ function Row({
   }
 
   return (
-    <li className="py-3 first:pt-0">
+    <div className="px-3 py-2.5">
       <div className="flex items-start gap-3">
         <div className="mt-0.5 shrink-0">
           {hook.lastDelivery ? (
@@ -516,10 +519,9 @@ function Row({
           </button>
           <button
             onClick={onDelete}
-            className="btn-ghost h-7 w-7 px-0 grid place-items-center"
+            className="btn-ghost-danger h-7 w-7 px-0 grid place-items-center"
             title="Delete hook"
             aria-label="Delete"
-            style={{ color: '#BF2600' }}
           >
             <Trash2 size={11} />
           </button>
@@ -636,7 +638,7 @@ function Row({
           )}
         </div>
       )}
-    </li>
+    </div>
   )
 }
 

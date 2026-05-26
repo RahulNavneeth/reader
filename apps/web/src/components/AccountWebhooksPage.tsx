@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
+import { SettingsListCard, SettingsListEmpty } from './SettingsList'
 
 type WebhookEvent =
   | 'upload'
@@ -35,6 +36,7 @@ type WebhookEvent =
   | 'template'
   | 'export'
   | 'ingest'
+  | 'archive'
 type DeadLetter = {
   id: string
   ts: number
@@ -81,6 +83,7 @@ const ALL_EVENTS: WebhookEvent[] = [
   'template',
   'export',
   'ingest',
+  'archive',
 ]
 
 /** Grouped event taxonomy used by the chip picker. Keeps the long
@@ -93,8 +96,8 @@ const EVENT_GROUPS: Array<{
 }> = [
   {
     label: 'File',
-    hint: 'Per-file create / modify / remove',
-    events: ['upload', 'edit', 'delete', 'trash', 'move'],
+    hint: 'Per-file create / modify / remove / archive',
+    events: ['upload', 'edit', 'delete', 'trash', 'move', 'archive'],
   },
   {
     label: 'Metadata',
@@ -143,6 +146,7 @@ const EVENT_LABEL: Record<WebhookEvent, string> = {
   template: 'from template',
   export: 'vault export',
   ingest: 'index ready',
+  archive: 'archive/unarchive',
 }
 
 /**
@@ -219,11 +223,11 @@ export function AccountWebhooksPage() {
   return (
     <div
       className="flex-1 flex flex-col overflow-hidden"
-      style={{ background: 'var(--rail)' }}
+      style={{ background: 'var(--surface-3)' }}
     >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
-        style={{ background: 'var(--panel-2)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -296,11 +300,12 @@ export function AccountWebhooksPage() {
 
         <Section title={`Your webhooks${hooks && hooks.length > 0 ? ` · ${hooks.length}` : ''}`}>
           {!hooks ? null : hooks.length === 0 ? (
-            <div className="text-[12.5px] text-subtle py-2">
-              No webhooks yet. Add one above to start receiving event POSTs.
-            </div>
+            <SettingsListEmpty
+              title="No webhooks yet"
+              hint="Add one above to start receiving event POSTs."
+            />
           ) : (
-            <ul className="divide-y" style={{ borderColor: 'var(--border)' }}>
+            <SettingsListCard>
               {hooks.map((h) => (
                 <WebhookRow
                   key={h.id}
@@ -310,7 +315,7 @@ export function AccountWebhooksPage() {
                   onError={(msg) => setError(msg)}
                 />
               ))}
-            </ul>
+            </SettingsListCard>
           )}
         </Section>
         </div>
@@ -542,7 +547,7 @@ function WebhookRow({
   }
 
   return (
-    <li className="py-3 first:pt-0">
+    <div className="px-3 py-2.5">
       <div className="flex items-start gap-3">
         <div className="mt-0.5 shrink-0">
           {hook.lastDelivery ? (
@@ -662,9 +667,8 @@ function WebhookRow({
             <Pencil size={12} />
           </button>
           <button
-            className="btn-ghost"
+            className="btn-ghost-danger"
             onClick={onDelete}
-            style={{ color: '#BF2600' }}
             title="Delete webhook"
             aria-label="Delete webhook"
           >
@@ -835,7 +839,7 @@ function WebhookRow({
           )}
         </div>
       )}
-    </li>
+    </div>
   )
 }
 
@@ -893,7 +897,7 @@ function EventShapesLink(): JSX.Element {
         >
           <div
             className="w-full max-w-2xl max-h-[80vh] rounded-lg overflow-hidden flex flex-col"
-            style={{ background: 'var(--viewer)', border: '1px solid var(--border)' }}
+            style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
             onClick={(e) => e.stopPropagation()}
           >
             <div

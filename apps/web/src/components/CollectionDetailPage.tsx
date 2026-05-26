@@ -14,6 +14,7 @@ import { ApiError, api } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
 import { CollectionShareButton } from './CollectionShareButton'
 import { CollectionPublicButton } from './CollectionPublicButton'
+import { SmartCollectionEditor } from './SmartCollectionEditor'
 
 type Detail = Awaited<ReturnType<typeof api.getCollection>>
 
@@ -219,7 +220,7 @@ export function CollectionDetailPage() {
       </header>
 
 
-      <div className="flex-1 overflow-y-auto px-6 py-6">
+      <div className="flex-1 overflow-y-auto px-6 py-6 flex flex-col">
         {error && (
           <div
             className="mb-4 px-3 py-2 rounded text-[12.5px] inline-flex items-center gap-2"
@@ -229,8 +230,18 @@ export function CollectionDetailPage() {
           </div>
         )}
 
+        <div className="w-full max-w-[1080px] mx-auto">
+          {canEdit && data && id && (
+            <SmartCollectionEditor
+              collectionId={id}
+              initialQuery={data.collection.query}
+              onChanged={refresh}
+            />
+          )}
+        </div>
+
         {!loading && data && data.items.length === 0 && (
-          <div className="h-full flex items-center justify-center">
+          <div className="flex-1 flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
               style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
@@ -238,14 +249,15 @@ export function CollectionDetailPage() {
               <Layers size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No items yet</div>
               <div className="text-[12px] text-muted mt-1.5">
-                Open any file and use "Add to collection" from its menu to
-                drop it into this collection.
+                {data.collection.query
+                  ? 'Nothing matches your query right now. Adjust the filters above, or add docs that fit.'
+                  : 'Open any file and use "Add to collection" from its menu to drop it into this collection. Or click "Make smart" above to populate via a saved search.'}
               </div>
             </div>
           </div>
         )}
 
-        <div className="max-w-[1080px] mx-auto">
+        <div className="w-full max-w-[1080px] mx-auto">
           <div
             className="grid gap-1.5"
             style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))' }}
@@ -256,8 +268,13 @@ export function CollectionDetailPage() {
                 className="group relative overflow-hidden rounded-md"
                 style={{
                   aspectRatio: '1 / 1',
-                  background: 'var(--bg)',
+                  background: 'var(--viewer)',
                   border: '1px solid var(--border)',
+                  // Same lift the TimelinePage tiles use — the
+                  // canvas vs --viewer luminance delta is too
+                  // small in light mode without a shadow to
+                  // separate the card.
+                  boxShadow: '0 1px 3px rgba(9, 30, 66, 0.08)',
                 }}
               >
                 <button
@@ -268,7 +285,7 @@ export function CollectionDetailPage() {
                   {it.kind === 'file' ? (
                     <div
                       className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-2"
-                      style={{ background: 'var(--panel)' }}
+                      style={{ background: 'var(--viewer)' }}
                     >
                       <FileText size={28} className="text-subtle" strokeWidth={1.4} />
                       <div className="text-[11px] text-fg text-center leading-tight line-clamp-3 break-all">

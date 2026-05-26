@@ -27,12 +27,22 @@ export async function searchRoutes(app: FastifyInstance) {
       const n = Number(v)
       return Number.isFinite(n) ? n : undefined
     }
+    const archivedRaw = query.archived?.trim()
     const filters: SearchFilters = {
       mime: asArray((req.query as Record<string, unknown>).mime as string | string[] | undefined),
       tags: asArray((req.query as Record<string, unknown>).tags as string | string[] | undefined),
       after: asInt(query.after),
       before: asInt(query.before),
       folder: query.folder?.trim() || undefined,
+      // Tristate: `archived=only` → archived-only view, `archived=true`
+      // → include both, anything else (unset) → hide archived. Aligns
+      // with SearchFilters.archived shape.
+      archived:
+        archivedRaw === 'only'
+          ? 'only'
+          : archivedRaw === 'true'
+            ? true
+            : undefined,
     }
     void reply
 

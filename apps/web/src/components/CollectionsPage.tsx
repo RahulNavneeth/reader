@@ -75,11 +75,11 @@ export function CollectionsPage() {
   return (
     <div
       className="flex-1 flex flex-col overflow-hidden"
-      style={{ background: 'var(--rail)' }}
+      style={{ background: 'var(--surface-3)' }}
     >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
-        style={{ background: 'var(--panel-2)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -292,7 +292,7 @@ function CollectionCard({
       <div style={{ borderBottom: '1px solid var(--border)' }}>
         <CoverArt preview={c.preview} memberCount={c.memberCount} />
       </div>
-      <div className="px-2.5 py-2" style={{ background: 'var(--viewer)' }}>
+      <div className="px-2.5 py-2" style={{ background: 'var(--surface-2)' }}>
         <div className="text-[12.5px] font-medium text-fg truncate" title={c.name}>
           {c.name}
         </div>
@@ -344,7 +344,7 @@ function CoverArt({
     return (
       <div
         className="w-full aspect-square flex items-center justify-center"
-        style={{ background: 'var(--viewer)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <Layers size={26} className="text-subtle" strokeWidth={1.4} />
       </div>
@@ -355,7 +355,7 @@ function CoverArt({
     return (
       <div
         className="relative w-full aspect-square overflow-hidden"
-        style={{ background: 'var(--viewer)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <CoverTile item={it} mode="single" />
         {memberCount > 1 && (
@@ -380,7 +380,7 @@ function CoverArt({
       }}
     >
       {preview.slice(0, 4).map((it) => (
-        <div key={it.docId} className="relative overflow-hidden" style={{ background: 'var(--viewer)' }}>
+        <div key={it.docId} className="relative overflow-hidden" style={{ background: 'var(--surface-2)' }}>
           <CoverTile item={it} mode="mosaic" />
         </div>
       ))}
@@ -404,7 +404,7 @@ function CoverTile({
       return (
         <div
           className="absolute inset-0 flex items-center justify-center"
-          style={{ background: 'var(--viewer)' }}
+          style={{ background: 'var(--surface-2)' }}
         >
           <FileText size={18} className="text-subtle" strokeWidth={1.4} />
         </div>
@@ -417,7 +417,7 @@ function CoverTile({
     return (
       <div
         className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-3"
-        style={{ background: 'var(--viewer)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <FileText size={36} className="text-subtle" strokeWidth={1.3} />
         <div className="text-[11.5px] text-fg text-center font-medium leading-tight line-clamp-2 break-all">

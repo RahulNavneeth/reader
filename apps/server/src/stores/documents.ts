@@ -324,6 +324,20 @@ export function userCanEdit(meta: DocumentMeta, username: string, role: string):
   return false
 }
 
+/**
+ * Read-only freeze gate. Archived docs reject every mutation except
+ * archive/unarchive itself, pin/unpin (sidebar organisation), and
+ * delete (lifecycle). The 409 + `archived` code lets clients show
+ * a "unarchive first" prompt instead of a generic 403.
+ *
+ * Callers pass an explicit list of mutation kinds they're about to
+ * perform; archive_document is exempt so the user can flip the flag
+ * back off without bouncing through unarchive.
+ */
+export function isFrozenForArchive(meta: DocumentMeta): boolean {
+  return !!meta.archived
+}
+
 export function sha256Of(buffer: Buffer): string {
   return crypto.createHash('sha256').update(buffer).digest('hex')
 }

@@ -21,6 +21,13 @@ export type ReaderEvent =
   | { type: 'tags'; path: string; tags: string[] }
   | { type: 'trash'; path: string }
   | { type: 'restore'; path: string }
+  /** Body bytes changed — MCP granular edits, chat apply-edit /
+   *  apply-op, version restore, watcher pick-up of an external
+   *  in-place edit. Path is vault-relative. Listeners (PathViewer,
+   *  FolderGrid, sidebar tree) refetch their slice on this. */
+  | { type: 'edit'; path: string; docId?: string }
+  /** Archive flag flipped on a file or folder. */
+  | { type: 'archive'; path: string; archived: boolean }
 
 type Listener = (e: ReaderEvent) => void
 

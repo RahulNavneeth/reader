@@ -143,6 +143,14 @@ export default defineConfig({
         target: `http://localhost:${SERVER_PORT}`,
         changeOrigin: true,
       },
+      // CRDT WebSocket. `ws: true` flips the proxy into upgrade
+      // mode so the HTTP 101 handshake makes it through to the
+      // backend instead of getting served as a 404 page.
+      '/ws/crdt': {
+        target: `ws://localhost:${SERVER_PORT}`,
+        changeOrigin: true,
+        ws: true,
+      },
       // OAuth endpoints + RFC 8414 / 9728 discovery docs. These MUST
       // hit the backend; the SPA only owns /oauth/consent.
       '/oauth/register': {

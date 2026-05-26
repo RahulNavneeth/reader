@@ -156,6 +156,14 @@ export function ChatDock({
   const abortRef = useRef<AbortController | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const threadEndRef = useRef<HTMLDivElement | null>(null)
+  /** The scrollable thread container — used to detect whether the
+   *  user is pinned to the bottom so auto-scroll only kicks in when
+   *  they actually want to follow new content. */
+  const threadScrollRef = useRef<HTMLDivElement | null>(null)
+  /** Sticky-bottom flag. True while the user is reading from the
+   *  bottom of the thread; flips off as soon as they scroll up
+   *  manually. Re-arms when they scroll back to the bottom. */
+  const pinnedToBottomRef = useRef(true)
   /** Prevents the consume-pending effect from firing twice for the
    *  same message — strict mode runs effects twice on mount, which
    *  would otherwise POST the same message to the server twice and
@@ -175,6 +183,16 @@ export function ChatDock({
     quote: string | null
     attachedDocs: MentionDoc[]
   } | null>(null)
+  /** When the user clicks Edit on a previous user turn we stash the
+   *  ids of the old Q + its paired A here. The actual server delete
+   *  is deferred until the user sends — that way clicking Edit and
+   *  reloading without resubmitting leaves the original transaction
+   *  intact. Cleared when the new send fires (whether it succeeds
+   *  or not) or when the user manually clears the composer. */
+  const pendingEditReplaceRef = useRef<{
+    userMsgId: string
+    assistantMsgId: string | null
+  } | null>(null)
 
   // Reset per-doc state when the doc changes. Critical that this
   // ONLY runs on meta.id change — the polling effect below also
@@ -190,6 +208,7 @@ export function ChatDock({
     setThreads([])
     setThreadMenuOpen(false)
     consumedRef.current = null
+    pendingEditReplaceRef.current = null
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meta?.id])
 
@@ -259,6 +278,20 @@ export function ChatDock({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meta?.id, activeThreadId])
 
+  // Detect bottom-pinned state on scroll. 40px tolerance so the
+  // sticky flag survives sub-pixel rounding + the bounce a smooth
+  // scroll leaves behind.
+  useEffect(() => {
+    const el = threadScrollRef.current
+    if (!el) return
+    const onScroll = () => {
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+      pinnedToBottomRef.current = dist < 40
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [meta?.id, activeThreadId])
+
   useEffect(() => {
     if (!threadEndRef.current) return
     // Skip auto-scroll-to-bottom when a regeneration is in flight —
@@ -267,6 +300,10 @@ export function ChatDock({
     // bottom would yank the user away from where they actually
     // wanted to look.
     if (regenAnchorUserId) return
+    // Sticky-bottom: only follow new content when the user is
+    // already at (or near) the bottom. If they've scrolled up to
+    // read older turns, don't yank them back down.
+    if (!pinnedToBottomRef.current) return
     threadEndRef.current.scrollIntoView({ block: 'end' })
   }, [messages.length, streamText, regenAnchorUserId])
 
@@ -380,18 +417,42 @@ export function ChatDock({
     setStreamMemoriesUsed([])
     setStreamToolTrace([])
     setStreamPhase('retrieving')
-    setMessages((cur) => [
-      ...cur,
-      {
-        id: `local-${Date.now()}`,
-        docId: meta.id,
-        userId: 'me',
-        role: 'user',
-        content: text,
-        citations: null,
-        createdAt: Date.now(),
-      },
-    ])
+    // If this send is replacing a previous Q+A pair (user clicked
+    // Edit on an earlier turn), delete the old pair NOW — not at
+    // click time. Defers the destructive step to the moment the
+    // user actually commits the rephrase. Done in parallel; the
+    // optimistic local removal happens below.
+    const replaceTarget = pendingEditReplaceRef.current
+    pendingEditReplaceRef.current = null
+    if (replaceTarget) {
+      void api.deleteChatMessage(meta.id, replaceTarget.userMsgId).catch(() => {/**/})
+      if (replaceTarget.assistantMsgId) {
+        void api
+          .deleteChatMessage(meta.id, replaceTarget.assistantMsgId)
+          .catch(() => {/**/})
+      }
+    }
+    setMessages((cur) => {
+      const filtered = replaceTarget
+        ? cur.filter(
+            (m) =>
+              m.id !== replaceTarget.userMsgId &&
+              m.id !== replaceTarget.assistantMsgId,
+          )
+        : cur
+      return [
+        ...filtered,
+        {
+          id: `local-${Date.now()}`,
+          docId: meta.id,
+          userId: 'me',
+          role: 'user',
+          content: text,
+          citations: null,
+          createdAt: Date.now(),
+        },
+      ]
+    })
     setStreaming(true)
     const ac = new AbortController()
     abortRef.current = ac
@@ -556,21 +617,23 @@ export function ChatDock({
    *  turn, so the thread stays `(Q, A')` rather than growing into
    *  `(Q, Q, A')`. */
   /** Lift a previous user question back into the composer so the
-   *  user can edit it and resend. Deletes the old user turn + its
-   *  paired assistant turn from the server so the chat history
-   *  doesn't accumulate stale Q+A pairs every time the user edits.
-   *  The composer's textarea gets focused at the end. */
+   *  user can rephrase and resend. The actual replace (delete old
+   *  Q+A, persist new Q+A) is deferred until the user sends — that
+   *  way clicking Edit and reloading without resubmitting keeps
+   *  the original transaction intact. */
   const handleEditQuestion = async (userMsgId: string) => {
     if (streaming || !meta) return
     const idx = messages.findIndex((m) => m.id === userMsgId)
     if (idx < 0) return
     const userMsg = messages[idx]
     if (userMsg.role !== 'user') return
-    // The assistant turn that followed (if any). Edit drops both.
+    // Stash the old pair so handleSend knows to delete them when the
+    // new question is actually submitted.
     const assistantAfter = messages[idx + 1]?.role === 'assistant' ? messages[idx + 1] : null
-    // Re-fill the composer with the original content. If the
-    // message was a Reply-quote (`> "…"` prefix), restore the
-    // quote chip + the freeform question separately.
+    pendingEditReplaceRef.current = {
+      userMsgId: userMsg.id,
+      assistantMsgId: assistantAfter?.id ?? null,
+    }
     const replyMatch = userMsg.content.match(/^\s*>\s*"([^]*?)"\s*\n+([^]*)$/)
     if (replyMatch) {
       setQuote(replyMatch[1])
@@ -578,22 +641,6 @@ export function ChatDock({
     } else {
       setQuote(null)
       setDraft(userMsg.content)
-    }
-    // Optimistically drop the pair locally so the UI updates
-    // immediately. Server delete + history refresh confirms.
-    setMessages((cur) => cur.filter((m) => {
-      if (m.id === userMsg.id) return false
-      if (assistantAfter && m.id === assistantAfter.id) return false
-      return true
-    }))
-    try {
-      await api.deleteChatMessage(meta.id, userMsg.id)
-      if (assistantAfter) {
-        await api.deleteChatMessage(meta.id, assistantAfter.id).catch(() => {/**/})
-      }
-    } catch {
-      /* if server delete fails, the next history refresh will
-       * surface the rows again — UX is recoverable. */
     }
     setTimeout(() => inputRef.current?.focus(), 0)
   }
@@ -863,7 +910,12 @@ export function ChatDock({
         <button
           className="btn-ghost h-6 w-6 px-0"
           onClick={handleNewThread}
-          title="New chat"
+          disabled={messages.length === 0}
+          title={
+            messages.length === 0
+              ? 'Start chatting first — empty threads aren’t kept'
+              : 'New chat'
+          }
           aria-label="New chat"
         >
           <Sparkles size={11} />
@@ -880,6 +932,7 @@ export function ChatDock({
           <ThreadMenu
             threads={threads}
             activeId={activeThreadId}
+            createDisabled={messages.length === 0}
             triggerRef={threadTriggerRef}
             onPick={(id) => {
               setThreadMenuOpen(false)
@@ -933,6 +986,7 @@ export function ChatDock({
       </div>
 
       <div
+        ref={threadScrollRef}
         className="flex-1 text-[13px]"
         style={{ overflowY: threadMenuOpen ? 'hidden' : 'auto' }}
       >
@@ -1728,6 +1782,7 @@ function distinctSourceCount(citations: ChatCitationDTO[]): number {
 function ThreadMenu({
   threads,
   activeId,
+  createDisabled = false,
   triggerRef,
   onPick,
   onCreate,
@@ -1737,6 +1792,10 @@ function ThreadMenu({
 }: {
   threads: ChatThreadDTO[]
   activeId: string | null
+  /** Gate the "New chat" row when the current thread is still empty —
+   *  matches the icon-button gate on the header so the user can't sneak
+   *  past one entrypoint via the other. */
+  createDisabled?: boolean
   /** The button that toggles this menu. Excluded from the close-on-
    *  outside-click check; without this, clicking the trigger to
    *  close fires the document listener (close), then the trigger's
@@ -1775,11 +1834,17 @@ function ThreadMenu({
       <button
         type="button"
         onClick={onCreate}
-        onMouseEnter={() => setHover(-1)}
-        className="w-full flex items-center gap-2 px-2.5 h-8 text-[12.5px] text-left text-fg"
+        disabled={createDisabled}
+        title={
+          createDisabled
+            ? 'Start chatting first — empty threads aren’t kept'
+            : undefined
+        }
+        onMouseEnter={() => setHover(createDisabled ? -2 : -1)}
+        className="w-full flex items-center gap-2 px-2.5 h-8 text-[12.5px] text-left text-fg disabled:opacity-50 disabled:cursor-not-allowed"
         style={{
           borderBottom: threads.length > 0 ? '1px solid var(--border)' : undefined,
-          ...(hover === -1 ? { background: 'var(--hover)' } : null),
+          ...(!createDisabled && hover === -1 ? { background: 'var(--hover)' } : null),
         }}
       >
         <Plus size={11} className="text-accent" />

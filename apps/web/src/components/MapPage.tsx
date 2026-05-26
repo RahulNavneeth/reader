@@ -205,10 +205,13 @@ export function MapPage() {
   }, [view, size, pins, clusters])
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden surface">
+    <div
+      className="flex-1 flex flex-col overflow-hidden"
+      style={{ background: 'var(--surface-3)' }}
+    >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
-        style={{ background: 'var(--panel-2)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <button className="btn-ghost h-7 w-7 px-0 shrink-0" onClick={() => navigate('/')} title="Back to vault">
           <ArrowLeft size={14} />
@@ -248,7 +251,7 @@ export function MapPage() {
           <div className="absolute inset-0 flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
             >
               <MapPin size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No geotagged photos yet</div>
@@ -335,6 +338,18 @@ export function MapPage() {
             onOpen={(pin) => {
               const segs = pin.path.split('/').map(encodeURIComponent).join('/')
               navigate(`/${segs}`)
+            }}
+            onZoomIn={() => {
+              // Drill into the cluster by zooming the map two
+              // levels deeper, recentred on the cluster centroid.
+              // The clustering math will re-split this bundle at
+              // the new zoom and the user can pick the sub-bundle
+              // they care about. Closes the panel so the user can
+              // see the spatial expansion.
+              const next = Math.min(20, zoom + 2)
+              setView({ center: [selected.lat, selected.lng], zoom: next })
+              setViewKey((k) => k + 1)
+              setSelected(null)
             }}
           />
         )}
@@ -510,10 +525,12 @@ function ClusterSidebar({
   cluster,
   onClose,
   onOpen,
+  onZoomIn,
 }: {
   cluster: Cluster
   onClose: () => void
   onOpen: (p: Pin) => void
+  onZoomIn?: () => void
 }) {
   // Group pins by date (newest day first) — Photos / Immich-style
   // date headers make a big grid of photos scannable. Within a date,
@@ -569,6 +586,16 @@ function ClusterSidebar({
                 {cluster.lat.toFixed(5)}, {cluster.lng.toFixed(5)}
               </div>
             </div>
+            {onZoomIn && (
+              <button
+                className="btn-ghost h-7 px-2 shrink-0 text-[11.5px]"
+                onClick={onZoomIn}
+                title="Zoom in here — re-clusters this bundle so you can pick a sub-group"
+                aria-label="Zoom in to this cluster"
+              >
+                Zoom in
+              </button>
+            )}
             <button
               className="btn-ghost h-7 w-7 px-0 shrink-0"
               onClick={onClose}

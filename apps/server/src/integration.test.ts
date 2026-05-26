@@ -5486,7 +5486,7 @@ describe('integration: mcp expanded toolkit', () => {
     return r.json()
   }
 
-  it('mcp tools/list exposes all 36 tools', async () => {
+  it('mcp tools/list exposes the full toolkit', async () => {
     const r = await app.inject({
       method: 'POST',
       url: '/mcp',
@@ -5495,11 +5495,61 @@ describe('integration: mcp expanded toolkit', () => {
     })
     expect(r.statusCode).toBe(200)
     const names = (r.json().result.tools as Array<{ name: string }>).map((t) => t.name).sort()
-    expect(names.length).toBe(36)
-    // Sample-check a few of the new entries to catch typos
-    for (const n of ['delete_document', 'unpin', 'resolve_path', 'move_file', 'mkdir', 'rmdir', 'csv_query', 'set_visibility', 'list_pins', 'list_tags', 'list_versions', 'get_pdf_outline', 'restore_version', 'append_to_section']) {
+    // Snapshot-style sample check — covers the load-bearing tools
+    // without anchoring on a brittle integer that changes every
+    // time we add a new MCP capability.
+    for (const n of [
+      'delete_document', 'unpin', 'resolve_path', 'move_file', 'mkdir', 'rmdir',
+      'csv_query', 'set_visibility', 'list_pins', 'list_tags', 'list_versions',
+      'get_pdf_outline', 'restore_version', 'append_to_section',
+      'archive_document', 'unarchive_document',
+      'list_templates', 'instantiate_template', 'save_as_template', 'refresh_template',
+    ]) {
       expect(names).toContain(n)
     }
+    // Floor only — we add tools regularly; this catches a regression
+    // where the list shrinks unexpectedly.
+    expect(names.length).toBeGreaterThanOrEqual(38)
+  })
+
+  it('archive_document hides from default list_documents; includeArchived surfaces it again', async () => {
+    const path = `archive-smoke-${Date.now()}.md`
+    const up = await call('upload_text', { path, content: '# Archive smoke' })
+    const docId = up.result.structuredContent.document.id
+
+    // Pre-archive: appears in default list.
+    const before = await call('list_documents', { limit: 500 })
+    const beforeIds = (before.result.structuredContent.documents as Array<{ id: string }>).map((d) => d.id)
+    expect(beforeIds).toContain(docId)
+
+    // Archive.
+    const arch = await call('archive_document', { id: docId })
+    expect(arch.result.structuredContent.changed).toBe(true)
+    expect(arch.result.structuredContent.document.archived).toBe(true)
+
+    // Post-archive: gone from default list.
+    const after = await call('list_documents', { limit: 500 })
+    const afterIds = (after.result.structuredContent.documents as Array<{ id: string }>).map((d) => d.id)
+    expect(afterIds).not.toContain(docId)
+
+    // includeArchived: back in the list.
+    const incl = await call('list_documents', { limit: 500, includeArchived: true })
+    const inclIds = (incl.result.structuredContent.documents as Array<{ id: string }>).map((d) => d.id)
+    expect(inclIds).toContain(docId)
+
+    // onlyArchived: filtered to just archived docs (includes ours).
+    const only = await call('list_documents', { limit: 500, onlyArchived: true })
+    const onlyIds = (only.result.structuredContent.documents as Array<{ id: string }>).map((d) => d.id)
+    expect(onlyIds).toContain(docId)
+
+    // Unarchive flips it back; second call is a no-op.
+    const un = await call('unarchive_document', { id: docId })
+    expect(un.result.structuredContent.changed).toBe(true)
+    const unAgain = await call('unarchive_document', { id: docId })
+    expect(unAgain.result.structuredContent.changed).toBe(false)
+
+    // Cleanup.
+    await call('delete_document', { id: docId })
   })
 
   // ── append_to_section: appends inside a section, before children ─

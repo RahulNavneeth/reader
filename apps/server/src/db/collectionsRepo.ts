@@ -9,6 +9,43 @@
  */
 import { db } from './sqlite.js'
 
+/**
+ * Smart-collection rule. NULL on a static collection (membership
+ * lives in `collection_members`); non-NULL turns the collection
+ * into a saved search that resolves at view time from the docs
+ * table. All fields are optional + ANDed together — a collection
+ * matching every doc is `{}`, a collection matching docs tagged
+ * "finance" inside the `invoices/` folder is
+ * `{tags: ['finance'], pathPrefix: 'invoices/'}`.
+ */
+export type SmartCollectionQuery = {
+  /** Doc must have at least one of these tags (any-of). Empty
+   *  array or missing key skips the tag filter. */
+  tags?: string[]
+  /** Doc storage key startsWith this prefix. Trailing slash
+   *  recommended for folder-shaped prefixes. */
+  pathPrefix?: string
+  /** Filter by content kind. `markdown` covers `.md` / `.markdown`
+   *  / `.mdx`. Skip the field for "any kind". */
+  mimeKind?: 'image' | 'video' | 'file' | 'markdown'
+  /** Inclusive lower bound on `createdAt`, unix-ms. */
+  dateFromTs?: number | null
+  /** Inclusive upper bound on `createdAt`, unix-ms. */
+  dateToTs?: number | null
+  /** When true → include archived docs; false → only non-archived;
+   *  omitted → match the rest of the app (hide archived). */
+  archived?: boolean
+  /** Natural-language semantic query. Resolved via the same
+   *  Ollama-backed `searchKnowledge` the search bar uses — picks
+   *  docs whose chunk text is semantically similar to the prompt.
+   *  Layered as an intersection over the structural filters
+   *  above. Empty / missing skips this dimension. */
+  semanticQuery?: string
+  /** Maximum docs returned when `semanticQuery` is set. Defaults
+   *  to 50 so the page stays bounded for browsing. */
+  semanticLimit?: number
+}
+
 export type Collection = {
   id: string
   owner: string
@@ -21,6 +58,10 @@ export type Collection = {
   publicExpiresAt: number | null
   publicPasswordHash: string | null
   publicSlug: string | null
+  /** When set, this collection is "smart" — its membership is
+   *  computed live from this query rather than pulled from
+   *  `collection_members`. */
+  query: SmartCollectionQuery | null
 }
 
 export type CollectionMember = {
@@ -49,9 +90,22 @@ type CollectionRow = {
   public_expires_at: number | null
   public_password_hash: string | null
   public_slug: string | null
+  query: string | null
 }
 
 function rowToCollection(r: CollectionRow): Collection {
+  let query: SmartCollectionQuery | null = null
+  if (r.query) {
+    try {
+      query = JSON.parse(r.query) as SmartCollectionQuery
+    } catch {
+      // Malformed JSON in the column should never happen via our
+      // write path, but if it does, treat the collection as
+      // static and surface it normally rather than 500-ing every
+      // request that touches it.
+      query = null
+    }
+  }
   return {
     id: r.id,
     owner: r.owner,
@@ -64,6 +118,7 @@ function rowToCollection(r: CollectionRow): Collection {
     publicExpiresAt: r.public_expires_at,
     publicPasswordHash: r.public_password_hash,
     publicSlug: r.public_slug,
+    query,
   }
 }
 
@@ -85,7 +140,15 @@ export function create(opts: {
 
 export function update(
   id: string,
-  patch: { name?: string; description?: string | null; coverDocId?: string | null },
+  patch: {
+    name?: string
+    description?: string | null
+    coverDocId?: string | null
+    /** `undefined` leaves the query untouched; `null` clears it
+     *  (collection becomes static again); an object value
+     *  switches the collection into smart mode with that rule. */
+    query?: SmartCollectionQuery | null
+  },
 ): Collection | null {
   const cur = load(id)
   if (!cur) return null
@@ -94,15 +157,23 @@ export function update(
     name: patch.name ?? cur.name,
     description: patch.description === undefined ? cur.description : patch.description,
     coverDocId: patch.coverDocId === undefined ? cur.coverDocId : patch.coverDocId,
+    query: patch.query === undefined ? cur.query : patch.query,
     updatedAt: Date.now(),
   }
   db()
     .prepare(
       `UPDATE collections
-         SET name = ?, description = ?, cover_doc_id = ?, updated_at = ?
+         SET name = ?, description = ?, cover_doc_id = ?, query = ?, updated_at = ?
        WHERE id = ?`,
     )
-    .run(next.name, next.description, next.coverDocId, next.updatedAt, id)
+    .run(
+      next.name,
+      next.description,
+      next.coverDocId,
+      next.query ? JSON.stringify(next.query) : null,
+      next.updatedAt,
+      id,
+    )
   return next
 }
 

@@ -77,6 +77,28 @@ export type DocumentMeta = {
   }
   /** If true, the file's raw, text, and meta endpoints are readable without auth. */
   public?: boolean
+  /** Soft hide from default listings + search. Distinct from Trash:
+   *  archived files never auto-purge, stay searchable when the caller
+   *  opts in (`?archived=true` on list / search, MCP `includeArchived`
+   *  arg), and unarchive is one click. For old projects, tax records,
+   *  any content the owner wants out of daily flow without deleting. */
+  archived?: boolean
+  /** Timestamp the doc was archived. Cleared on unarchive. */
+  archivedAt?: number | null
+  /** Provenance for docs created from a template. Captures the
+   *  source template path and the vars the user (or agent) passed
+   *  in. Powers the "Refresh from template" affordance — we re-run
+   *  the engine over the same template + vars + (re-computed
+   *  built-ins) and overwrite the doc. Snapshotted before the
+   *  overwrite, so refresh is reversible. */
+  templateSource?: {
+    template: string
+    vars: Record<string, string>
+    /** Title the user originally passed when instantiating. Re-fed
+     *  to `applyTemplate` on refresh so any `{{title}}` in the
+     *  template resolves to the same string it did the first time. */
+    title?: string
+  } | null
   /** Optional absolute timestamp past which the public link stops working. */
   publicExpiresAt?: number | null
   /** Optional scrypt-hashed password ("salt:digest" hex). When set, anonymous

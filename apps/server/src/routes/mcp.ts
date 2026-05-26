@@ -25,6 +25,7 @@ import {
   sha256Of,
   userCanRead,
   userCanEdit,
+  isFrozenForArchive,
 } from '../stores/documents.js'
 import { searchKnowledge } from '../services/search.js'
 import { ensureUserVault, resolveUserVault } from '../lib/userVault.js'
@@ -33,6 +34,8 @@ import { ingestDocument } from '../services/ingest.js'
 import { nanoid } from 'nanoid'
 import { audit } from '../stores/audit.js'
 import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
+import { publish as publishEvent } from '../services/events.js'
+import { broadcastEdit, flushDocSync } from '../services/crdtRegistry.js'
 import { config } from '../config.js'
 import { addPin, listPins, removePin } from '../stores/pins.js'
 import { moveToTrash } from '../stores/trash.js'
@@ -46,6 +49,14 @@ import { createRateLimit } from '../lib/rateLimit.js'
 import { findAccessToken, touchAccessToken } from '../db/oauthRepo.js'
 import { hasScope, scopeForTool } from '../services/oauth.js'
 import { getUser } from '../stores/users.js'
+import { applyTemplate, applyTemplateAsync } from '../services/templateEngine.js'
+import {
+  makeVaultIncludeResolver,
+  makeUrlFetchResolver,
+} from '../services/templateResolvers.js'
+import { readFile } from 'node:fs/promises'
+import { userVaultRoot } from '../lib/userVault.js'
+import { BUILTIN_KEYS, computeBuiltins } from './templates.js'
 
 type RpcRequest = {
   jsonrpc: '2.0'
@@ -81,7 +92,7 @@ const TOOLS = [
   {
     name: 'list_documents',
     description:
-      'List all documents accessible to the API token. Returns `documents` and `nextCursor`; pass `nextCursor` back as `cursor` to fetch the next page. `null` cursor means no more results.',
+      'List all documents accessible to the API token. Returns `documents` and `nextCursor`; pass `nextCursor` back as `cursor` to fetch the next page. `null` cursor means no more results. Archived documents are excluded by default — pass `includeArchived: true` to include them, or `onlyArchived: true` to filter to JUST archived docs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -90,6 +101,14 @@ const TOOLS = [
           type: 'string',
           description:
             'Opaque pagination cursor from a previous response. Omit for the first page.',
+        },
+        includeArchived: {
+          type: 'boolean',
+          description: 'When true, return archived docs alongside non-archived. Default false.',
+        },
+        onlyArchived: {
+          type: 'boolean',
+          description: 'When true, return ONLY archived docs (ignored if includeArchived is also true).',
         },
       },
     },
@@ -481,6 +500,26 @@ const TOOLS = [
     },
   },
   {
+    name: 'archive_document',
+    description:
+      "Hide a document from default listings + search without deleting it. Archived docs persist indefinitely (no auto-purge like Trash), stay accessible via `list_documents({ includeArchived: true })`, and can be unarchived with one call. Use for completed projects, old tax records, historical content the owner wants out of daily flow.",
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Document id.' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'unarchive_document',
+    description:
+      "Restore an archived document to default visibility. Reversible counterpart to `archive_document`. No-op if the doc isn't currently archived.",
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Document id.' } },
+      required: ['id'],
+    },
+  },
+  {
     name: 'set_visibility',
     description:
       "Toggle a document's public-link visibility. With `public:true`, anyone with the URL can read; pass `password` to gate it; pass `expiresInSeconds` to auto-expire. With `public:false`, link is revoked.",
@@ -506,6 +545,63 @@ const TOOLS = [
         ts: { type: 'number', description: 'Snapshot timestamp from list_versions.' },
       },
       required: ['id', 'ts'],
+    },
+  },
+  {
+    name: 'list_templates',
+    description:
+      "List markdown templates the user has saved under `_templates/*.md`. Each entry includes a preview, byte count, and modified time. Templates can use {{var}} placeholders, {{#if x}}…{{/if}} conditionals, and {{#each csv}}…{{/each}} loops; use `instantiate_template` to render one into a real document.",
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'instantiate_template',
+    description:
+      "Render a template into a new document at `target`. Substitutes built-ins (date, slug, user, …) and any user-supplied `vars`. Honors {{#if}}/{{else}}/{{/if}} and {{#each csv}}…{{/each}} — loops iterate a comma- or newline-separated string with {{this}}, {{@index}}, {{@index1}} in scope. Refuses to overwrite an existing file at `target`.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        template: {
+          type: 'string',
+          description: "Template path under `_templates/`, e.g. `_templates/journal.md`.",
+        },
+        target: {
+          type: 'string',
+          description: "Destination doc path. Placeholders allowed, e.g. `journal/{{date}}-{{slug}}.md`.",
+        },
+        title: { type: 'string', description: 'Title for the new doc; substituted before the path resolves.' },
+        vars: {
+          type: 'object',
+          description: "Per-instance values keyed by placeholder name. User vars win over built-ins on key conflict.",
+          additionalProperties: { type: 'string' },
+        },
+      },
+      required: ['template', 'target'],
+    },
+  },
+  {
+    name: 'refresh_template',
+    description:
+      "Re-render a document that was originally created via `instantiate_template`. Uses the same source template + the originally-supplied user vars; date/time/uuid built-ins recompute to now. Snapshots the pre-refresh version first so the change is reversible via `restore_version`. Refuses if the doc has no template provenance, the source template was deleted, or the doc is archived.",
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Document id of the template-instantiated doc.' } },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'save_as_template',
+    description:
+      "Copy an existing markdown document into the user's `_templates/` so it can be re-instantiated later. The body is kept verbatim — any {{var}} placeholders already in the source survive into the template. Refuses to clobber an existing template; rename and retry.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Source doc path (vault-relative, markdown only).' },
+        name: {
+          type: 'string',
+          description: 'Template filename. `.md` is added if omitted; path metacharacters are stripped.',
+        },
+      },
+      required: ['source', 'name'],
     },
   },
   {
@@ -754,9 +850,19 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         throw new Error('invalid cursor')
       }
     }
-    const filtered = (await listAllDocuments()).filter((d) =>
-      userCanRead(d, principal.username, principal.role),
-    )
+    const includeArchived = !!args?.includeArchived
+    const onlyArchived = !!args?.onlyArchived
+    const filtered = (await listAllDocuments())
+      .filter((d) => userCanRead(d, principal.username, principal.role))
+      // Archived filter: hide archived by default; show all when
+      // includeArchived; show only archived when onlyArchived (and
+      // includeArchived isn't already showing everything).
+      .filter((d) => {
+        const isArch = !!d.archived
+        if (onlyArchived && !includeArchived) return isArch
+        if (includeArchived) return true
+        return !isArch
+      })
     const page = filtered.slice(skip, skip + limit).map((d) => ({
       id: d.id,
       title: d.title,
@@ -843,6 +949,12 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     {
       const existingForSnap = await findDocByPath(actingUser, rel)
       if (existingForSnap) {
+        // Archive freeze: refuse to overwrite an archived doc via
+        // upload_text. Brand-new uploads to a path that isn't
+        // archived stay fine.
+        if (isFrozenForArchive(existingForSnap)) {
+          throw new Error('document is archived — unarchive to edit')
+        }
         const { snapshotVersion } = await import('../stores/versions.js')
         await snapshotVersion(existingForSnap.id, {
           actor: actingUser,
@@ -906,6 +1018,15 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         ? { type: 'edit', path: rel, actor: actingUser, bytes: buffer.length, source: 'mcp' }
         : { type: 'upload', path: rel, actor: actingUser, bytes: buffer.length },
     ).catch(() => null)
+    publishEvent({ type: 'edit', path: rel, docId: meta.id })
+    if (/\.(md|markdown|mdx|txt|csv|json)$/i.test(rel)) {
+      broadcastEdit(
+        meta.id,
+        { owner: meta.owner, storageKey: rel },
+        content,
+        'mcp:upload_text',
+      )
+    }
     await audit({
       actor: actingUser,
       action: 'mcp.upload_text',
@@ -1054,6 +1175,7 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         ? { type: 'edit', path: rel, actor: actingUser, bytes: buffer.length, source: 'mcp' }
         : { type: 'upload', path: rel, actor: actingUser, bytes: buffer.length },
     ).catch(() => null)
+    publishEvent({ type: 'edit', path: rel, docId: meta.id })
     // Strip any embedded basic-auth creds from the source URL before
     // it lands in the audit log — passwords don't belong there.
     const { sanitizeUrlForLog } = await import('../lib/safeFetch.js')
@@ -1090,6 +1212,7 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     const meta = await loadMeta(id)
     if (!meta) throw new Error('document not found')
     if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    if (isFrozenForArchive(meta)) throw new Error('document is archived — unarchive to edit')
     const next: DocumentMeta = { ...meta, tags: Array.from(new Set(tags)), updatedAt: Date.now() }
     await saveMeta(next)
     await audit({
@@ -1168,6 +1291,9 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
       if (!userCanRead(meta, actingUser, token.role)) throw new Error('forbidden')
     } else {
       if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+      // Archive freeze applies to writes only; reads of archived docs
+      // stay open so agents can still inspect them via get_section etc.
+      if (isFrozenForArchive(meta)) throw new Error('document is archived — unarchive to edit')
     }
 
     // Heuristic: granular edits only make sense for markdown-ish
@@ -1190,7 +1316,7 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     // doc — wrong file, or worse, a phantom write under a path that
     // doesn't exist in their namespace.
     const abs = resolveUserVault(meta.owner, meta.storageKey)
-    const { readFile, writeFile } = await import('node:fs/promises')
+    const { readFile } = await import('node:fs/promises')
     let buffer: Buffer
     try {
       buffer = await readFile(abs)
@@ -1304,10 +1430,10 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         auditMeta = { ...auditMeta, bytes: content.length }
       }
 
-      const nextBuffer = Buffer.from(nextText, 'utf8')
-      // Snapshot the pre-edit doc before applying this granular
-      // MCP edit. snapshotVersion dedupes by sha256 so the
-      // watcher's later fire on the file change is a no-op.
+      // Snapshot the pre-edit doc so version history has an
+      // entry pointing at the bytes we're about to overwrite.
+      // snapshotVersion dedupes by sha256 so a watcher fire on
+      // the materialiser's writeFile won't duplicate this one.
       {
         const { snapshotVersion } = await import('../stores/versions.js')
         await snapshotVersion(meta.id, {
@@ -1316,19 +1442,18 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
           reason: auditAction,
         }).catch(() => null)
       }
-      // Tell the watcher this sha is an in-app write so its
-      // chokidar fire doesn't double-dispatch the edit webhook.
-      markExpectedWrite(abs, sha256Of(nextBuffer))
-      await writeFile(abs, nextBuffer)
-      const nextMeta: DocumentMeta = {
-        ...meta,
-        bytes: nextBuffer.length,
-        sha256: sha256Of(nextBuffer),
-        updatedAt: Date.now(),
-        ingest: { status: 'pending', embedded: false },
-      }
-      await saveMeta(nextMeta)
-      const finalMeta = await ingestDocument(nextMeta, nextBuffer)
+      // Push the new body through the CRDT — the registry's
+      // materialiser is the canonical disk writer + ingest
+      // trigger now. We force-flush so the route can return the
+      // updated meta synchronously.
+      broadcastEdit(
+        meta.id,
+        { owner: meta.owner, storageKey: meta.storageKey },
+        nextText,
+        `mcp:${name}`,
+      )
+      await flushDocSync(meta.id)
+      const finalMeta = (await loadMeta(meta.id)) ?? meta
       // Use storageKey (path) as the audit target so the per-file
       // activity panel — which keys off path via /api/file/activity —
       // surfaces every MCP-driven edit alongside in-app edits. Keep
@@ -1343,14 +1468,14 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         type: 'edit',
         path: meta.storageKey,
         actor: actingUser,
-        bytes: nextBuffer.length,
+        bytes: finalMeta.bytes,
         source: 'mcp',
       }).catch(() => null)
       return {
         content: [
           {
             type: 'text',
-            text: `Updated ${meta.storageKey} (${nextBuffer.length} bytes)`,
+            text: `Updated ${meta.storageKey} (${finalMeta.bytes} bytes)`,
           },
         ],
         structuredContent: { document: finalMeta },
@@ -1743,6 +1868,7 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     const meta = await loadMeta(id)
     if (!meta) throw new Error('document not found')
     if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    if (isFrozenForArchive(meta)) throw new Error('document is archived — unarchive to edit')
     if (meta.storageKey === to) throw new Error('source and destination are identical')
     const absFrom = resolveUserVault(meta.owner, meta.storageKey)
     const absTo = resolveUserVault(meta.owner, to)
@@ -1795,6 +1921,57 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     }
   }
 
+  if (name === 'archive_document' || name === 'unarchive_document') {
+    const id = String(args?.id ?? '')
+    const meta = await loadMeta(id)
+    if (!meta) throw new Error('document not found')
+    if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    const archived = name === 'archive_document'
+    if (!!meta.archived === archived) {
+      // No-op fast-path so an agent calling archive twice doesn't
+      // bump updatedAt + fire a duplicate webhook.
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Document was already ${archived ? 'archived' : 'unarchived'}.`,
+          },
+        ],
+        structuredContent: { document: meta, changed: false },
+      }
+    }
+    const next: DocumentMeta = {
+      ...meta,
+      archived,
+      archivedAt: archived ? Date.now() : null,
+      updatedAt: Date.now(),
+    }
+    await saveMeta(next)
+    invalidateSearchCache()
+    dispatchWebhook({
+      type: 'archive',
+      path: meta.storageKey,
+      actor: actingUser,
+      archived,
+    }).catch(() => null)
+    publishEvent({ type: 'archive', path: meta.storageKey, archived })
+    await audit({
+      actor: actingUser,
+      action: archived ? 'mcp.archive_document' : 'mcp.unarchive_document',
+      target: meta.storageKey,
+      meta: { docId: id },
+    })
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `${archived ? 'Archived' : 'Unarchived'} ${meta.storageKey}.`,
+        },
+      ],
+      structuredContent: { document: next, changed: true },
+    }
+  }
+
   if (name === 'set_visibility') {
     const id = String(args?.id ?? '')
     const isPublic = !!args?.public
@@ -1804,6 +1981,7 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     const meta = await loadMeta(id)
     if (!meta) throw new Error('document not found')
     if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    if (isFrozenForArchive(meta)) throw new Error('document is archived — unarchive to edit')
     let publicExpiresAt: number | null = null
     if (isPublic && typeof expiresInSeconds === 'number') {
       publicExpiresAt = Date.now() + Math.max(60, Math.floor(expiresInSeconds)) * 1000
@@ -1854,6 +2032,7 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     const meta = await loadMeta(id)
     if (!meta) throw new Error('document not found')
     if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    if (isFrozenForArchive(meta)) throw new Error('document is archived — unarchive to edit')
     const text = await readVersionText(id, ts)
     if (text == null) throw new Error('version has no extractable text (binary snapshot)')
     // Snapshot the current state BEFORE overwriting so the restore
@@ -2021,6 +2200,303 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         },
       ],
       structuredContent: { path: rel, recursive, trashedFiles },
+    }
+  }
+
+  if (name === 'list_templates') {
+    const dir = path.join(userVaultRoot(actingUser), '_templates')
+    let entries: import('node:fs').Dirent[] = []
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    }
+    const out: Array<{
+      path: string
+      name: string
+      title: string
+      bytes: number
+      updatedAt: number
+      preview: string
+    }> = []
+    for (const e of entries) {
+      if (!e.isFile()) continue
+      if (!/\.(md|markdown|mdx)$/i.test(e.name)) continue
+      const abs = path.join(dir, e.name)
+      const st = await stat(abs).catch(() => null)
+      if (!st) continue
+      const head = await readFile(abs, { encoding: 'utf8' }).catch(() => '')
+      out.push({
+        path: `_templates/${e.name}`,
+        name: e.name,
+        title: e.name.replace(/\.(md|markdown|mdx)$/i, ''),
+        bytes: st.size,
+        updatedAt: st.mtimeMs,
+        preview: head.slice(0, 4096),
+      })
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            out.length === 0
+              ? 'No templates yet. Save one with `save_as_template` or drop a `.md` file in `_templates/`.'
+              : out.map((t) => `- ${t.path} (${t.bytes}B)`).join('\n'),
+        },
+      ],
+      structuredContent: { templates: out, builtins: BUILTIN_KEYS },
+    }
+  }
+
+  if (name === 'instantiate_template') {
+    const templateRel = String(args?.template ?? '').trim()
+    let targetRel = String(args?.target ?? '').trim()
+    let title = String(args?.title ?? '').trim()
+    const callerVars: Record<string, string> = {}
+    const rawVars = (args?.vars ?? {}) as Record<string, unknown>
+    for (const [k, v] of Object.entries(rawVars)) {
+      if (v == null) continue
+      callerVars[k] = String(v)
+    }
+    if (!templateRel || !targetRel) throw new Error('template and target are required')
+    if (!templateRel.startsWith('_templates/')) {
+      throw new Error('template must live under _templates/')
+    }
+    const earlyVars = {
+      ...computeBuiltins({
+        now: new Date(),
+        title: title || 'untitled',
+        user: actingUser,
+        targetRel,
+      }),
+      ...callerVars,
+    }
+    title = applyTemplate(title, earlyVars)
+    targetRel = applyTemplate(targetRel, {
+      ...computeBuiltins({
+        now: new Date(),
+        title: title || 'untitled',
+        user: actingUser,
+        targetRel,
+      }),
+      ...callerVars,
+    })
+    if (!targetRel) throw new Error('target resolves to empty after substitution')
+    const templateAbs = resolveUserVault(actingUser, templateRel)
+    const targetAbs = resolveUserVault(actingUser, targetRel)
+    const tplBuf = await readFile(templateAbs).catch((e) => {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error('template not found')
+      }
+      throw e
+    })
+    const existing = await stat(targetAbs).catch(() => null)
+    if (existing) throw new Error('destination already exists')
+    const fullVars = {
+      ...computeBuiltins({
+        now: new Date(),
+        title: title || path.basename(targetRel, path.extname(targetRel)),
+        user: actingUser,
+        targetRel,
+      }),
+      ...callerVars,
+    }
+    let rendered: string
+    try {
+      rendered = await applyTemplateAsync(tplBuf.toString('utf8'), fullVars, {
+        loadInclude: makeVaultIncludeResolver(actingUser),
+        loadFetch: makeUrlFetchResolver(),
+      })
+    } catch (e) {
+      throw new Error(`template: ${(e as Error).message}`)
+    }
+    await mkdir(path.dirname(targetAbs), { recursive: true })
+    const buf = Buffer.from(rendered, 'utf8')
+    markExpectedWrite(targetAbs, sha256Of(buf))
+    await writeFile(targetAbs, buf)
+    const id = nanoid()
+    const meta: DocumentMeta = {
+      id,
+      owner: actingUser,
+      storageKey: targetRel.replace(/^\/+|\/+$/g, ''),
+      title: title || path.basename(targetRel, path.extname(targetRel)),
+      originalFilename: path.basename(targetRel),
+      mime: 'text/markdown',
+      bytes: buf.length,
+      sha256: sha256Of(buf),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      acl: { readers: [], editors: [] },
+      tags: [],
+      ingest: { status: 'pending', embedded: false },
+      templateSource: {
+        template: templateRel,
+        vars: callerVars,
+        title: title || undefined,
+      },
+    } as unknown as DocumentMeta
+    await saveMeta(meta)
+    const finalMeta = await ingestDocument(meta, buf)
+    invalidateSearchCache()
+    await audit({
+      actor: actingUser,
+      action: 'mcp.template.instantiate',
+      target: meta.storageKey,
+      meta: { template: templateRel },
+    })
+    dispatchWebhook({
+      type: 'template',
+      path: meta.storageKey,
+      actor: actingUser,
+      template: templateRel,
+      title: meta.title,
+    }).catch(() => null)
+    publishEvent({ type: 'edit', path: meta.storageKey, docId: meta.id })
+    broadcastEdit(
+      meta.id,
+      { owner: meta.owner, storageKey: meta.storageKey },
+      rendered,
+      'mcp:instantiate_template',
+    )
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Created ${meta.storageKey} from ${templateRel} (${buf.length} bytes).`,
+        },
+      ],
+      structuredContent: { document: finalMeta },
+    }
+  }
+
+  if (name === 'refresh_template') {
+    const docId = String(args?.id ?? '').trim()
+    if (!docId) throw new Error('id is required')
+    const meta = await loadMeta(docId)
+    if (!meta) throw new Error('document not found')
+    if (!userCanEdit(meta, actingUser, token.role)) throw new Error('forbidden')
+    if (isFrozenForArchive(meta)) {
+      throw new Error('document is archived — unarchive to refresh')
+    }
+    const src = meta.templateSource
+    if (!src) throw new Error('document was not created from a template')
+    const templateAbs = resolveUserVault(meta.owner, src.template)
+    const tplBuf = await readFile(templateAbs).catch((e) => {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error('source template no longer exists')
+      }
+      throw e
+    })
+    const builtins = computeBuiltins({
+      now: new Date(),
+      title: src.title || meta.title,
+      user: actingUser,
+      targetRel: meta.storageKey,
+    })
+    const vars = { ...builtins, ...src.vars }
+    let rendered: string
+    try {
+      rendered = await applyTemplateAsync(tplBuf.toString('utf8'), vars, {
+        loadInclude: makeVaultIncludeResolver(meta.owner),
+        loadFetch: makeUrlFetchResolver(),
+      })
+    } catch (e) {
+      throw new Error(`template: ${(e as Error).message}`)
+    }
+    await snapshotVersion(meta.id).catch(() => null)
+    const targetAbs = resolveUserVault(meta.owner, meta.storageKey)
+    const buf = Buffer.from(rendered, 'utf8')
+    markExpectedWrite(targetAbs, sha256Of(buf))
+    await writeFile(targetAbs, buf)
+    const next: DocumentMeta = {
+      ...meta,
+      bytes: buf.length,
+      sha256: sha256Of(buf),
+      updatedAt: Date.now(),
+      ingest: { status: 'pending', embedded: false },
+    }
+    await saveMeta(next)
+    const finalMeta = await ingestDocument(next, buf)
+    invalidateSearchCache()
+    await audit({
+      actor: actingUser,
+      action: 'mcp.template.refresh',
+      target: meta.storageKey,
+      meta: { template: src.template, docId: meta.id },
+    })
+    dispatchWebhook({
+      type: 'edit',
+      path: meta.storageKey,
+      actor: actingUser,
+      bytes: buf.length,
+      source: 'mcp',
+    }).catch(() => null)
+    publishEvent({ type: 'edit', path: meta.storageKey, docId: meta.id })
+    broadcastEdit(
+      meta.id,
+      { owner: meta.owner, storageKey: meta.storageKey },
+      rendered,
+      'mcp:refresh_template',
+    )
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Refreshed ${meta.storageKey} from ${src.template} (${buf.length} bytes).`,
+        },
+      ],
+      structuredContent: { document: finalMeta },
+    }
+  }
+
+  if (name === 'save_as_template') {
+    const sourceRel = String(args?.source ?? '').trim().replace(/^\/+|\/+$/g, '')
+    const rawName = String(args?.name ?? '').trim()
+    if (!sourceRel || !rawName) throw new Error('source and name are required')
+    if (!/\.(md|markdown|mdx)$/i.test(sourceRel)) {
+      throw new Error('only markdown documents can be saved as templates')
+    }
+    let safe = rawName.replace(/[^a-zA-Z0-9 ._-]+/g, '').replace(/^[. ]+|[. ]+$/g, '')
+    if (!safe) throw new Error('name resolves to empty after sanitising')
+    if (!/\.(md|markdown|mdx)$/i.test(safe)) safe = `${safe}.md`
+    const templateRel = `_templates/${safe}`
+    const sourceAbs = resolveUserVault(actingUser, sourceRel)
+    const templateAbs = resolveUserVault(actingUser, templateRel)
+    const body = await readFile(sourceAbs).catch((e) => {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error('source not found')
+      }
+      throw e
+    })
+    const existing = await stat(templateAbs).catch(() => null)
+    if (existing) throw new Error('template with that name already exists')
+    await mkdir(path.dirname(templateAbs), { recursive: true })
+    markExpectedWrite(templateAbs, sha256Of(body))
+    await writeFile(templateAbs, body)
+    await audit({
+      actor: actingUser,
+      action: 'mcp.template.save_as',
+      target: templateRel,
+      meta: { source: sourceRel, bytes: body.length },
+    })
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Saved ${sourceRel} as ${templateRel} (${body.length} bytes).`,
+        },
+      ],
+      structuredContent: {
+        template: {
+          path: templateRel,
+          name: safe,
+          title: safe.replace(/\.(md|markdown|mdx)$/i, ''),
+          bytes: body.length,
+          updatedAt: Date.now(),
+        },
+      },
     }
   }
 

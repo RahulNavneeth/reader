@@ -22,7 +22,7 @@
 import type { FastifyInstance } from 'fastify'
 import { nanoid } from 'nanoid'
 import { config } from '../config.js'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import {
   appendMessage,
   clearThread,
@@ -50,17 +50,16 @@ import {
 import {
   loadMeta,
   readText,
-  saveMeta,
-  sha256Of,
   userCanEdit,
   userCanRead,
+  isFrozenForArchive,
 } from '../stores/documents.js'
 import { resolveUserVault } from '../lib/userVault.js'
 import { withEditLock } from '../lib/editLock.js'
 import { audit } from '../stores/audit.js'
-import { ingestDocument } from '../services/ingest.js'
-import { invalidateSearchCache } from '../services/search.js'
-import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
+import { dispatch as dispatchWebhook } from '../services/webhooks.js'
+import { recordChange } from '../services/syncChanges.js'
+import { broadcastEdit, flushDocSync } from '../services/crdtRegistry.js'
 import * as mdx from '../lib/mdx.js'
 import {
   addUserMemory,
@@ -884,6 +883,12 @@ export async function chatRoutes(app: FastifyInstance) {
     if (!userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'you do not have edit access on this document' })
     }
+    if (isFrozenForArchive(meta)) {
+      return reply.code(409).send({
+        error: 'document is archived — unarchive to edit',
+        code: 'archived',
+      })
+    }
 
     // sha256 conflict check — pre-lock, so we fail fast.
     if (turn.editTargetSha256 && turn.editTargetSha256 !== meta.sha256) {
@@ -906,6 +911,10 @@ export async function chatRoutes(app: FastifyInstance) {
           code: 'sha_mismatch',
         })
       }
+      // Read current bytes — we need them to apply mdx ops, AND
+      // we feed them through the registry's seed-from-disk path
+      // so the Y.Doc reflects the on-disk state before we
+      // transact the new content.
       const abs = resolveUserVault(live.owner, live.storageKey)
       let buf: Buffer
       try {
@@ -930,14 +939,11 @@ export async function chatRoutes(app: FastifyInstance) {
         text = applyOp(text, op)
         return { ...op, appliedAt: now }
       })
-      const nextBuf = Buffer.from(text, 'utf8')
-      // Snapshot the PRE-edit state explicitly. The vault watcher
-      // also fires snapshotVersion on the resulting file change,
-      // but that race captures the NEW meta (because we call
-      // saveMeta before the watcher reads). Calling it here
-      // guarantees the snapshot reflects the state before this
-      // Reader AI edit. Deduped by sha256 inside snapshotVersion,
-      // so the watcher's subsequent fire is a no-op.
+      // Snapshot the PRE-edit state explicitly so the rollback
+      // surface in the doc rail has an entry pointing at the
+      // bytes we're about to overwrite. Deduped by sha256 inside
+      // snapshotVersion, so a watcher-fired snapshot from the
+      // materialiser's writeFile won't duplicate this one.
       {
         const { snapshotVersion } = await import('../stores/versions.js')
         await snapshotVersion(docId, {
@@ -946,20 +952,19 @@ export async function chatRoutes(app: FastifyInstance) {
           reason: 'apply-edit',
         }).catch(() => null)
       }
-      // Tell the watcher this sha is an in-app write so its
-      // chokidar fire doesn't double-dispatch the edit webhook.
-      markExpectedWrite(abs, sha256Of(nextBuf))
-      await writeFile(abs, nextBuf)
-      const nextMeta = {
-        ...live,
-        bytes: nextBuf.length,
-        sha256: sha256Of(nextBuf),
-        updatedAt: Date.now(),
-        ingest: { status: 'pending' as const, embedded: false },
-      }
-      await saveMeta(nextMeta)
-      const finalMeta = await ingestDocument(nextMeta, nextBuf)
-      invalidateSearchCache()
+      // Push the new body through the CRDT. The registry's
+      // materialiser owns the disk write + saveMeta + ingest now
+      // — this route used to do all three inline; flushDocSync
+      // forces the debounced materialise to run synchronously so
+      // we can return the freshly-ingested meta.
+      broadcastEdit(
+        live.id,
+        { owner: live.owner, storageKey: live.storageKey },
+        text,
+        'chat',
+      )
+      await flushDocSync(live.id)
+      const finalMeta = (await loadMeta(live.id)) ?? live
       // Persist the per-op appliedAt stamps, then mark the whole
       // turn applied so the message-level pill renders.
       setPendingEdit(messageId, user.username, docId, stamped)
@@ -980,9 +985,20 @@ export async function chatRoutes(app: FastifyInstance) {
         type: 'edit',
         path: live.storageKey,
         actor: user.username,
-        bytes: nextBuf.length,
+        bytes: finalMeta.bytes,
         source: 'chat',
       }).catch(() => null)
+      recordChange({
+        owner: live.owner,
+        actor: user.username,
+        entityId: live.storageKey,
+        payload: {
+          kind: 'doc.upsert',
+          sha256: finalMeta.sha256,
+          bytes: finalMeta.bytes,
+          source: 'chat',
+        },
+      })
       return finalMeta
     }).catch((e) => {
       const status = (e as { status?: number }).status ?? 500
@@ -1143,6 +1159,12 @@ export async function chatRoutes(app: FastifyInstance) {
     if (!userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'you do not have edit access on this document' })
     }
+    if (isFrozenForArchive(meta)) {
+      return reply.code(409).send({
+        error: 'document is archived — unarchive to edit',
+        code: 'archived',
+      })
+    }
     if (turn.editTargetSha256 && turn.editTargetSha256 !== meta.sha256) {
       return reply.code(409).send({
         error: 'document changed since this edit was proposed',
@@ -1191,7 +1213,6 @@ export async function chatRoutes(app: FastifyInstance) {
       const buf = await readFile(abs)
       const op = freshTurn.pendingEdit[opIndex]
       const nextText = applyOp(buf.toString('utf8'), op)
-      const nextBuf = Buffer.from(nextText, 'utf8')
       {
         const { snapshotVersion } = await import('../stores/versions.js')
         await snapshotVersion(docId, {
@@ -1200,21 +1221,17 @@ export async function chatRoutes(app: FastifyInstance) {
           reason: 'apply-op',
         }).catch(() => null)
       }
-      // Tell the watcher this sha is an in-app write so its
-      // chokidar fire doesn't double-dispatch the edit webhook.
-      markExpectedWrite(abs, sha256Of(nextBuf))
-      await writeFile(abs, nextBuf)
-      const newSha = sha256Of(nextBuf)
-      const nextMeta = {
-        ...live,
-        bytes: nextBuf.length,
-        sha256: newSha,
-        updatedAt: Date.now(),
-        ingest: { status: 'pending' as const, embedded: false },
-      }
-      await saveMeta(nextMeta)
-      const finalMeta = await ingestDocument(nextMeta, nextBuf)
-      invalidateSearchCache()
+      // Push the new body through the CRDT — the registry's
+      // materialiser does the disk write + saveMeta + ingest.
+      broadcastEdit(
+        live.id,
+        { owner: live.owner, storageKey: live.storageKey },
+        nextText,
+        'chat',
+      )
+      await flushDocSync(live.id)
+      const finalMeta = (await loadMeta(live.id)) ?? live
+      const newSha = finalMeta.sha256
       // Stamp THIS op as applied, preserve the array shape. If every
       // op now carries an appliedAt, flip the message-level applied
       // flag (matches bulk apply-edit semantics).
@@ -1247,9 +1264,20 @@ export async function chatRoutes(app: FastifyInstance) {
         type: 'edit',
         path: live.storageKey,
         actor: user.username,
-        bytes: nextBuf.length,
+        bytes: finalMeta.bytes,
         source: 'chat',
       }).catch(() => null)
+      recordChange({
+        owner: live.owner,
+        actor: user.username,
+        entityId: live.storageKey,
+        payload: {
+          kind: 'doc.upsert',
+          sha256: newSha,
+          bytes: finalMeta.bytes,
+          source: 'chat',
+        },
+      })
       return finalMeta
     }).catch((e) => {
       const status = (e as { status?: number }).status ?? 500

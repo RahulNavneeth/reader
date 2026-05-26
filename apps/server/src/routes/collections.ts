@@ -28,6 +28,7 @@ import type { FastifyInstance } from 'fastify'
 import { audit } from '../stores/audit.js'
 import { loadMeta, readPreview, readThumbnail, readText as readDocText } from '../stores/documents.js'
 import * as collections from '../db/collectionsRepo.js'
+import { resolveSmartCollection } from '../services/smartCollections.js'
 import { hashPassword, verifyPassword } from '../lib/sharePassword.js'
 import { resolveUserVault } from '../lib/userVault.js'
 
@@ -127,7 +128,10 @@ export async function collectionsRoutes(app: FastifyInstance) {
       // Hydrate the members with the latest doc meta. Drop dangling
       // entries quietly — a doc may have been deleted but the row
       // hasn't been swept yet (FK cascade catches it eventually).
-      const members = collections.listMembers(c.id)
+      //
+      // Smart collections short-circuit the membership table — the
+      // query resolves live from the docs corpus, so adds/removes
+      // happen automatically as docs change tags / paths / etc.
       const items: Array<{
         docId: string
         path: string
@@ -138,26 +142,45 @@ export async function collectionsRoutes(app: FastifyInstance) {
         addedAt: number
         position: number | null
       }> = []
-      for (const m of members) {
-        const meta = await loadMeta(m.docId)
-        if (!meta) continue
-        const ext = meta.originalFilename.toLowerCase().match(/\.[^./\\]+$/)?.[0] ?? ''
-        const kind: 'image' | 'video' | 'file' =
-          /\.(png|jpe?g|webp|gif|avif|bmp|ico|heic|heif|tiff?|jxl)$/.test(ext)
-            ? 'image'
-            : /\.(mp4|mov|m4v|mkv|webm|avi|3gp|3gpp|mts|m2ts|mpg|mpeg|wmv|flv|ogv)$/.test(ext)
-              ? 'video'
-              : 'file'
-        items.push({
-          docId: m.docId,
-          path: meta.storageKey,
-          title: meta.title,
-          mime: meta.mime,
-          bytes: meta.bytes,
-          kind,
-          addedAt: m.addedAt,
-          position: m.position,
-        })
+      const kindOf = (filename: string): 'image' | 'video' | 'file' => {
+        const ext = filename.toLowerCase().match(/\.[^./\\]+$/)?.[0] ?? ''
+        if (/\.(png|jpe?g|webp|gif|avif|bmp|ico|heic|heif|tiff?|jxl)$/.test(ext)) return 'image'
+        if (/\.(mp4|mov|m4v|mkv|webm|avi|3gp|3gpp|mts|m2ts|mpg|mpeg|wmv|flv|ogv)$/.test(ext)) return 'video'
+        return 'file'
+      }
+      if (c.query) {
+        const matches = await resolveSmartCollection(c.query, c.owner)
+        for (const meta of matches) {
+          items.push({
+            docId: meta.id,
+            path: meta.storageKey,
+            title: meta.title,
+            mime: meta.mime,
+            bytes: meta.bytes,
+            kind: kindOf(meta.originalFilename),
+            // Smart collections have no add-time — surface the
+            // doc's createdAt so timeline-ish UIs still have a
+            // sort key. Position stays null (no manual order).
+            addedAt: meta.createdAt,
+            position: null,
+          })
+        }
+      } else {
+        const members = collections.listMembers(c.id)
+        for (const m of members) {
+          const meta = await loadMeta(m.docId)
+          if (!meta) continue
+          items.push({
+            docId: m.docId,
+            path: meta.storageKey,
+            title: meta.title,
+            mime: meta.mime,
+            bytes: meta.bytes,
+            kind: kindOf(meta.originalFilename),
+            addedAt: m.addedAt,
+            position: m.position,
+          })
+        }
       }
       const shares = c.owner === me || role === 'admin'
         ? collections.listShares(c.id)
@@ -183,6 +206,7 @@ export async function collectionsRoutes(app: FastifyInstance) {
           createdAt: c.createdAt,
           updatedAt: c.updatedAt,
           role: canEdit ? (c.owner === me ? 'owner' : 'editor') : 'viewer',
+          query: c.query,
           ...publicView,
         },
         items,
@@ -206,6 +230,7 @@ export async function collectionsRoutes(app: FastifyInstance) {
         name?: string
         description?: string | null
         coverDocId?: string | null
+        query?: collections.SmartCollectionQuery | null
       }
       const patch: Parameters<typeof collections.update>[1] = {}
       if (body?.name !== undefined) {
@@ -216,6 +241,16 @@ export async function collectionsRoutes(app: FastifyInstance) {
       }
       if (body?.description !== undefined) patch.description = body.description
       if (body?.coverDocId !== undefined) patch.coverDocId = body.coverDocId
+      if (body?.query !== undefined) {
+        // Loose validation — the smart resolver tolerates extra
+        // fields. Reject obviously malformed shapes (non-object,
+        // non-null) so a typo doesn't silently turn the collection
+        // smart in a way the UI can't read back.
+        if (body.query !== null && typeof body.query !== 'object') {
+          return reply.code(400).send({ error: 'query must be an object or null' })
+        }
+        patch.query = body.query
+      }
       const next = collections.update(c.id, patch)
       await audit({
         actor: me,

@@ -219,6 +219,17 @@ export async function adminRoutes(app: FastifyInstance) {
             retainDays: z.number().int().min(0).optional(),
           })
           .optional(),
+        templates: z
+          .object({
+            allowFetch: z.boolean().optional(),
+            fetchAllowlist: z.array(z.string()).optional(),
+          })
+          .optional(),
+        clip: z
+          .object({
+            enabled: z.boolean().optional(),
+          })
+          .optional(),
       })
       .parse(req.body)
     const current = await loadSettings()
@@ -238,6 +249,8 @@ export async function adminRoutes(app: FastifyInstance) {
       server: { ...(current.server ?? {}), ...(body.server ?? {}) },
       smtp: { ...(current.smtp ?? {}), ...(body.smtp ?? {}) },
       backup: { ...(current.backup ?? {}), ...(body.backup ?? {}) },
+      templates: { ...(current.templates ?? {}), ...(body.templates ?? {}) },
+      clip: { ...(current.clip ?? {}), ...(body.clip ?? {}) },
     }
     try {
       await saveSettings(next)
@@ -544,6 +557,10 @@ export async function adminRoutes(app: FastifyInstance) {
         chatModel: config.ollama.chatModel,
         available: ollamaUp,
       },
+      clip: {
+        enabled: config.clip.enabled,
+        model: config.clip.model,
+      },
       storage: {
         backend: config.storage.backend,
         s3: {
@@ -806,6 +823,7 @@ export async function adminRoutes(app: FastifyInstance) {
           'template',
           'export',
           'ingest',
+          'archive',
         ])).min(1),
         // Secret is REQUIRED for admin hooks — without it any third
         // party that discovers the receiver URL can forge events.
@@ -866,6 +884,7 @@ export async function adminRoutes(app: FastifyInstance) {
           'template',
           'export',
           'ingest',
+          'archive',
         ]))
           .min(1)
           .optional(),

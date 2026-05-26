@@ -31,6 +31,13 @@ type Props = {
   /** Called after a successful per-op apply so the parent can
    *  refetch the doc body (the underlying text just changed). */
   onDocChanged?: () => void
+  /** Called when every op in the preview has reached a terminal
+   *  state (accepted, rejected, or already-applied server-side).
+   *  The parent uses this to exit preview mode and return to the
+   *  normal doc viewer so the user isn't left staring at a fully
+   *  resolved card. Fires once per resolution session, after a
+   *  short delay so the final state flashes briefly first. */
+  onAllResolved?: () => void
 }
 
 export type PreviewData = {
@@ -93,6 +100,7 @@ export function ProposedEditPreview({
   refreshKey,
   onOpMutated,
   onDocChanged,
+  onAllResolved,
 }: Props) {
   const [data, setData] = useState<PreviewData | null>(seedData ?? null)
   const [error, setError] = useState<string | null>(null)
@@ -111,6 +119,33 @@ export function ProposedEditPreview({
    *  array is now stale (e.g. count shrank since we previewed) so the
    *  preview re-fetches and renders the actual current truth. */
   const [localRefreshTick, setLocalRefreshTick] = useState(0)
+  /** One-shot guard so the all-resolved callback fires exactly once
+   *  per preview session — without it the useEffect below would keep
+   *  re-firing as React re-renders after the parent exits. */
+  const allResolvedFiredRef = useRef(false)
+
+  // Auto-exit once every op has a terminal decision (accepted /
+  // rejected / already-applied server-side). The brief setTimeout
+  // lets the accepted-state visual flash before the preview tears
+  // down — without it the card resolves and disappears in the same
+  // frame, which reads as a glitch.
+  const onAllResolvedRef = useRef(onAllResolved)
+  useEffect(() => {
+    onAllResolvedRef.current = onAllResolved
+  })
+  useEffect(() => {
+    if (allResolvedFiredRef.current) return
+    if (!data || data.opPreviews.length === 0) return
+    const allDone = data.opPreviews.every((op, i) => {
+      if (op.applied || op.op.appliedAt) return true
+      const d = decisions[i]
+      return d === 'accepted' || d === 'rejected'
+    })
+    if (!allDone) return
+    allResolvedFiredRef.current = true
+    const t = window.setTimeout(() => onAllResolvedRef.current?.(), 600)
+    return () => window.clearTimeout(t)
+  }, [data, decisions])
 
   // Live refs for the callbacks + seedData. The useEffect below
   // intentionally OMITS these from its deps — PathViewer passes

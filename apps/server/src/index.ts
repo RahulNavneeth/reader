@@ -4,6 +4,7 @@ import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
 import formbody from '@fastify/formbody'
 import fastifyStatic from '@fastify/static'
+import fastifyWebsocket from '@fastify/websocket'
 import path from 'node:path'
 import { config } from './config.js'
 import { ensureDir } from './lib/fs.js'
@@ -21,6 +22,8 @@ import { oauthRoutes } from './routes/oauth.js'
 import { eventsRoutes } from './routes/events.js'
 import { viewsRoutes } from './routes/views.js'
 import { templatesRoutes } from './routes/templates.js'
+import { syncRoutes } from './routes/sync.js'
+import { crdtRoutes } from './routes/crdt.js'
 import { intakeRoutes } from './routes/intake.js'
 import { userSharesRoutes } from './routes/userShares.js'
 import { pinsRoutes } from './routes/pins.js'
@@ -329,6 +332,15 @@ export async function buildApp(opts: BuildAppOptions = {}) {
 
   await app.register(authPlugin)
 
+  // WebSocket transport for the CRDT relay. Registered AFTER
+  // authPlugin so the route's req.currentUser is populated by the
+  // session-cookie onRequest hook. `maxPayload` caps a runaway
+  // peer dumping huge updates; the actual Y.Doc updates we see in
+  // practice are <1KB.
+  await app.register(fastifyWebsocket, {
+    options: { maxPayload: 1 * 1024 * 1024 },
+  })
+
   await app.register(healthRoutes)
   await app.register(authRoutes)
   await app.register(vaultRoutes)
@@ -350,6 +362,8 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await app.register(chatRoutes)
   await app.register(aiMemoriesRoutes)
   await app.register(templatesRoutes)
+  await app.register(syncRoutes)
+  await app.register(crdtRoutes)
   await app.register(intakeRoutes)
 
   // Serve the built web bundle in production (single-container deploy).
@@ -553,6 +567,11 @@ async function main() {
     shuttingDown = true
     app.log.info({ signal }, 'shutting down')
     try {
+      // Force a synchronous persist of every Y.Doc with pending
+      // updates — otherwise the 2s persist debounce can swallow
+      // the last batch of edits on a graceful restart.
+      const { flushAll } = await import('./services/crdtRegistry.js')
+      flushAll()
       await app.close()
       process.exit(0)
     } catch (err) {

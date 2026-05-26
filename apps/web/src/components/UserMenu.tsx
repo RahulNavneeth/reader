@@ -5,6 +5,7 @@ import {
   User as UserIcon,
   Settings,
   Trash2,
+  Archive,
   MapPin,
   Clock,
   Layers,
@@ -120,6 +121,16 @@ export function UserMenu({ user, onLogout }: Props) {
           >
             <MapPin size={13} className="text-muted" />
             Map
+          </button>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+            onClick={() => {
+              setOpen(false)
+              navigate('/archive')
+            }}
+          >
+            <Archive size={13} className="text-muted" />
+            Archive
           </button>
           <button
             className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"

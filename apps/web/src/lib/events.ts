@@ -13,6 +13,8 @@ export type ReaderEvent =
   | { type: 'tags'; path: string; tags: string[] }
   | { type: 'trash'; path: string }
   | { type: 'restore'; path: string }
+  | { type: 'edit'; path: string; docId?: string }
+  | { type: 'archive'; path: string; archived: boolean }
 
 /**
  * Subscribe to the server's SSE stream. The browser EventSource auto-

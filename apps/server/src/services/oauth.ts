@@ -59,8 +59,14 @@ export const TOOL_SCOPES: ScopeDef[] = [
   { scope: 'tool:move_file',        label: 'Move / rename',   description: 'Move or rename a file in the vault.', write: true },
   { scope: 'tool:mkdir',            label: 'Create folder',   description: 'Create an empty folder in the vault.', write: true },
   { scope: 'tool:set_visibility',   label: 'Set visibility',  description: 'Toggle a document’s public link (with optional password + expiry).', write: true },
+  { scope: 'tool:archive_document', label: 'Archive document',description: 'Hide a document from default listings + search (no auto-purge).', write: true },
+  { scope: 'tool:unarchive_document', label: 'Unarchive document', description: 'Restore an archived document to default visibility.', write: true },
   { scope: 'tool:restore_version',  label: 'Restore version', description: 'Roll a document back to a prior snapshot.', write: true },
   { scope: 'tool:rmdir',            label: 'Remove folder',   description: 'Remove an empty folder, or recursively trash its contents.', write: true },
+  { scope: 'tool:list_templates',   label: 'List templates',  description: 'Enumerate the user’s saved templates under _templates/.', write: false },
+  { scope: 'tool:instantiate_template', label: 'Instantiate template', description: 'Render a template into a new document with substituted placeholders.', write: true },
+  { scope: 'tool:save_as_template', label: 'Save as template',description: 'Copy a markdown document into _templates/ for later reuse.', write: true },
+  { scope: 'tool:refresh_template', label: 'Refresh from template', description: 'Re-render a template-instantiated document with the originally-supplied vars.', write: true },
 ]
 
 const TOOL_SCOPE_SET = new Set(TOOL_SCOPES.map((s) => s.scope))

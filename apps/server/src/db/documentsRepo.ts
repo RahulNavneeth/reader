@@ -48,6 +48,9 @@ type DocRow = {
   p_hash: string | null
   live_photo_pair: string | null
   hls_ready: number
+  archived: number
+  archived_at: number | null
+  template_source: string | null
 }
 
 function rowToMeta(
@@ -103,6 +106,9 @@ function rowToMeta(
     pHash,
     livePhotoPair: row.live_photo_pair,
     hlsReady: row.hls_ready === 1,
+    archived: row.archived === 1,
+    archivedAt: row.archived_at,
+    templateSource: row.template_source ? JSON.parse(row.template_source) : null,
   }
 }
 
@@ -114,7 +120,8 @@ const UPSERT_SQL = `
     ingest_status, ingest_error, ingest_chunk_count, ingest_embed_dim,
     ingest_embedded, ingest_extracted_at, ingest_embedded_at,
     entities_json, gps_lat, gps_lng, gps_tried,
-    p_hash, live_photo_pair, hls_ready
+    p_hash, live_photo_pair, hls_ready,
+    archived, archived_at, template_source
   ) VALUES (
     @id, @owner, @storage_key, @title, @original_filename, @mime, @bytes, @sha256,
     @created_at, @updated_at,
@@ -122,7 +129,8 @@ const UPSERT_SQL = `
     @ingest_status, @ingest_error, @ingest_chunk_count, @ingest_embed_dim,
     @ingest_embedded, @ingest_extracted_at, @ingest_embedded_at,
     @entities_json, @gps_lat, @gps_lng, @gps_tried,
-    @p_hash, @live_photo_pair, @hls_ready
+    @p_hash, @live_photo_pair, @hls_ready,
+    @archived, @archived_at, @template_source
   )
   ON CONFLICT(id) DO UPDATE SET
     owner = excluded.owner,
@@ -151,7 +159,10 @@ const UPSERT_SQL = `
     gps_tried = excluded.gps_tried,
     p_hash = excluded.p_hash,
     live_photo_pair = excluded.live_photo_pair,
-    hls_ready = excluded.hls_ready
+    hls_ready = excluded.hls_ready,
+    archived = excluded.archived,
+    archived_at = excluded.archived_at,
+    template_source = excluded.template_source
 `
 
 function metaToParams(m: DocumentMeta): Record<string, unknown> {
@@ -190,6 +201,9 @@ function metaToParams(m: DocumentMeta): Record<string, unknown> {
     p_hash,
     live_photo_pair: m.livePhotoPair ?? null,
     hls_ready: m.hlsReady ? 1 : 0,
+    archived: m.archived ? 1 : 0,
+    archived_at: m.archivedAt ?? null,
+    template_source: m.templateSource ? JSON.stringify(m.templateSource) : null,
   }
 }
 

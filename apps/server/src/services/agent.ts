@@ -722,7 +722,7 @@ function buildAllTools(): OllamaTool[] {
       function: {
         name: 'propose_edit',
         description:
-          "Propose a structured edit to the current document. The edit is NOT applied immediately — it is shown to the user as a card they can Apply or Discard. Use this when the user asks to rewrite, rephrase, edit, fix, add, remove, or replace content in the document.\n\nOp selection:\n  • Markdown docs with headings → `replace_section` / `insert_after` / `append_to_section` / `delete_section` (preferred — surgical) or `append_text` / `prepend_text` for whole-file tail/head additions.\n  • `append_to_section` lands content at the END of a section's immediate body (before any nested sub-section). Use it to add a row to a table, a bullet to a list, or a paragraph to notes that live inside the section.\n  • CSV / JSON / YAML / TOML / any non-markdown text file → `rewrite_file` with the FULL new content (no section semantics apply).",
+          "Propose a structured edit to the current document. The edit is NOT applied immediately — it is shown to the user as a card they can Apply or Discard. Use this when the user asks to rewrite, rephrase, edit, fix, add, remove, or replace content in the document.\n\nOp selection:\n  • Markdown docs with headings → `replace_section` / `insert_after` / `append_to_section` / `delete_section` (preferred — surgical) or `append_text` / `prepend_text` for whole-file tail/head additions.\n  • `append_to_section` lands content at the END of a section's immediate body (before any nested sub-section). Use it to add a row to a table, a bullet to a list, or a paragraph to notes that live inside the section.\n  • CSV / JSON / YAML / TOML / any non-markdown text file → `rewrite_file` with the FULL new content (no section semantics apply).\n\nMarkdown table rules — strict. If the section contains a markdown table and you're editing it:\n  • Keep the FULL table intact in your content: header row + `---` separator row + every existing body row + your changes.\n  • Every row must have the same number of `|`-separated cells as the header. Mismatched cell counts corrupt the table.\n  • To add ONE row to a table, prefer `append_to_section` with just `| cell | cell | … |` as the content — the existing table absorbs it.\n  • Never emit a partial table (body rows without the header + separator). That renders as plain text and breaks the doc.",
         parameters: {
           type: 'object',
           properties: {
@@ -930,6 +930,21 @@ function describeOp(op: ProposedEditOp): string {
 /** Validate the {op, heading, content} blob the model passed to
  *  propose_edit. Returns either the parsed op or an error string the
  *  model can read back. Heading must match an existing ATX heading. */
+/** Cheap detector for a GFM table: at least one `|`-leading row
+ *  followed by a `---` (or `:---:`, etc.) separator row. Used by
+ *  the validator to refuse table-mangling replace_section ops. */
+function hasMarkdownTable(s: string): boolean {
+  const lines = s.split('\n')
+  for (let i = 0; i < lines.length - 1; i++) {
+    const row = lines[i].trim()
+    const sep = lines[i + 1].trim()
+    if (!row.startsWith('|') || !row.endsWith('|')) continue
+    // Separator row: pipe-delimited cells of optional `:` + `-`s.
+    if (/^\|(\s*:?-+:?\s*\|)+$/.test(sep)) return true
+  }
+  return false
+}
+
 function validateProposedEdit(
   op: string,
   heading: string | undefined,
@@ -960,6 +975,21 @@ function validateProposedEdit(
       const canonicalHeading = match.heading
       if (op === 'delete_section') return { op: { op: 'delete_section', heading: canonicalHeading } }
       if (!content) return { error: `${op} requires a "content" argument.` }
+      // Table safety net: if the existing section contains a markdown
+      // table (`|...|` rows with a `---` separator), a `replace_section`
+      // that drops the header + separator silently corrupts the doc on
+      // apply. Refuse with a hint so the model can retry with the
+      // complete table.
+      if (op === 'replace_section') {
+        const lines = docText.split('\n')
+        const oldBody = lines.slice(match.bodyStart, match.endLine).join('\n')
+        if (hasMarkdownTable(oldBody) && !hasMarkdownTable(content)) {
+          return {
+            error:
+              `The "${canonicalHeading}" section contains a markdown table. Your replace_section content drops the header + \`---\` separator row, which would corrupt the table. Re-emit the complete table (header row, separator row, every body row) and keep the cell counts consistent.`,
+          }
+        }
+      }
       return { op: { op, heading: canonicalHeading, content } }
     }
     case 'append_text':

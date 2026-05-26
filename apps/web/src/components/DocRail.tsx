@@ -154,7 +154,13 @@ export function DocRail({
   }, [bucketedRows, versionsOpen, path, text])
 
   const hasVersions = (versions?.length ?? 0) > 0 || !!versionsError
-  const eitherOpen = outlineOpen || (versionsOpen && hasVersions)
+  // Mirror the versions auto-hide: when the doc has no headings to
+  // outline, skip the Outline section entirely. Without this an
+  // empty doc would still show a rail icon that opens an empty pane.
+  const eitherOpen = (outlineOpen && hasOutlineList) || (versionsOpen && hasVersions)
+
+  // No outline + no versions → the entire rail is dead weight. Hide.
+  if (!hasOutlineList && !hasVersions) return null
 
   return (
     <>
@@ -163,17 +169,17 @@ export function DocRail({
           className="w-8 shrink-0 border-l flex flex-col items-stretch"
           style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
         >
-          <RailIconButton
-            label="Expand outline"
-            icon={<List size={12} />}
-            onClick={() => {
-              // Mutually exclusive — opening outline closes versions
-              // (which is already closed here, but keep the symmetry
-              // so behaviour matches the in-rail toggles below).
-              setVersionsOpen(false)
-              setOutlineOpen(true)
-            }}
-          />
+          {hasOutlineList && (
+            <RailIconButton
+              label="Expand outline"
+              icon={<List size={12} />}
+              onClick={() => {
+                // Mutually exclusive — opening outline closes versions.
+                setVersionsOpen(false)
+                setOutlineOpen(true)
+              }}
+            />
+          )}
           {hasVersions && (
             <RailIconButton
               label="Expand versions"
@@ -190,7 +196,7 @@ export function DocRail({
           className="w-[240px] shrink-0 border-l overflow-y-auto"
           style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
         >
-          {outlineOpen && (
+          {outlineOpen && hasOutlineList && (
             <>
               <SectionHeader
                 icon={<List size={11} />}
@@ -258,7 +264,7 @@ export function DocRail({
                               onPickVersion?.(v.ts)
                             }}
                             disabled={text === null}
-                            className="block w-full text-left px-2 py-1.5 rounded text-[12px] hover:bg-hover transition-colors text-fg disabled:opacity-50 disabled:hover:bg-transparent"
+                            className="block w-full text-left px-2 py-2 mb-0.5 rounded text-[12px] hover:bg-hover transition-colors text-fg disabled:opacity-50 disabled:hover:bg-transparent"
                             style={
                               activeDiffTs === v.ts
                                 ? { background: 'var(--selected)', color: 'var(--accent)' }
@@ -270,8 +276,8 @@ export function DocRail({
                                 : `Show diff against current — ${new Date(v.ts).toLocaleString()}`
                             }
                           >
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-[12px] font-medium tabular-nums leading-none">
+                            <div className="flex items-center gap-1.5 leading-tight">
+                              <span className="text-[12px] font-medium tabular-nums">
                                 {formatRowTime(v.ts)}
                               </span>
                               {v.isLatest && (
@@ -293,7 +299,7 @@ export function DocRail({
                                 </span>
                               )}
                             </div>
-                            <div className="text-[10.5px] mt-0.5 leading-none flex items-center gap-1.5 text-subtle">
+                            <div className="text-[10.5px] mt-1 leading-tight flex items-center gap-1.5 text-subtle">
                               <span>{formatRelative(v.ts)}</span>
                               <span>·</span>
                               <span>{formatBytes(v.bytes)}</span>

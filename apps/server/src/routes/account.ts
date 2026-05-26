@@ -394,6 +394,7 @@ export async function accountRoutes(app: FastifyInstance) {
             'template',
             'export',
             'ingest',
+            'archive',
           ]))
           .min(1),
         // Secret is optional, but when present we enforce a 16-char
@@ -479,6 +480,7 @@ export async function accountRoutes(app: FastifyInstance) {
             'template',
             'export',
             'ingest',
+            'archive',
           ]))
           .min(1)
           .optional(),

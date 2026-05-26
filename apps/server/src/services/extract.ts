@@ -111,16 +111,60 @@ async function extractDocx(buffer: Buffer): Promise<string> {
 }
 
 async function extractXlsx(buffer: Buffer): Promise<string> {
-  const XLSX = await import('xlsx')
-  const wb = XLSX.read(buffer, { type: 'buffer' })
+  // Swapped off SheetJS (`xlsx`) after the prototype-pollution + ReDoS
+  // CVE — no npm fix available since SheetJS pulled itself from the
+  // registry. ExcelJS is the maintained drop-in for the spreadsheet-
+  // reading slice we use here (we only flatten cells into CSV, no
+  // formula evaluation or chart parsing).
+  const ExcelJS = (await import('exceljs')).default
+  const wb = new ExcelJS.Workbook()
+  await wb.xlsx.load(buffer as unknown as ArrayBuffer)
   const out: string[] = []
-  for (const name of wb.SheetNames) {
-    const sheet = wb.Sheets[name]
-    if (!sheet) continue
-    out.push(`# ${name}`)
-    out.push(XLSX.utils.sheet_to_csv(sheet))
+  for (const sheet of wb.worksheets) {
+    out.push(`# ${sheet.name}`)
+    const lines: string[] = []
+    // `eachRow({ includeEmpty: false })` skips blank rows so empty
+    // bottom padding (very common in human-edited sheets) doesn't
+    // bloat the extracted text or the embedding budget.
+    sheet.eachRow({ includeEmpty: false }, (row) => {
+      // `row.values` is 1-indexed and starts with `undefined` at [0];
+      // slice it off and stringify each cell. ExcelJS hands back
+      // rich types (Date, Hyperlink {text,href}, formula objects);
+      // collapse to the human-readable form.
+      const cells = (row.values as unknown[]).slice(1).map(stringifyCell)
+      // Quote any cell that contains a comma / quote / newline so
+      // the output is RFC-4180-ish — same as XLSX.utils.sheet_to_csv
+      // produced.
+      lines.push(cells.map(csvQuote).join(','))
+    })
+    out.push(lines.join('\n'))
   }
   return out.join('\n\n').trim()
+}
+
+function stringifyCell(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  if (v instanceof Date) return v.toISOString()
+  if (typeof v === 'object') {
+    const o = v as { text?: unknown; result?: unknown; richText?: Array<{ text?: string }> }
+    // Hyperlink cell: { text, hyperlink }
+    if (typeof o.text === 'string') return o.text
+    // Formula cell: { formula, result }
+    if (o.result != null) return stringifyCell(o.result)
+    // Rich-text cell: { richText: [{ text, font }, ...] }
+    if (Array.isArray(o.richText)) {
+      return o.richText.map((r) => r?.text ?? '').join('')
+    }
+  }
+  return String(v)
+}
+
+function csvQuote(s: string): string {
+  if (s === '') return ''
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  return s
 }
 
 function extractHtml(buffer: Buffer): string {

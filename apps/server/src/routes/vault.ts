@@ -31,6 +31,7 @@ import {
   sha256Of,
   userCanRead,
   userCanEdit,
+  isFrozenForArchive,
 } from '../stores/documents.js'
 import { generateThumbnail } from '../services/thumbnail.js'
 import { writeThumbnail, writePreview } from '../stores/documents.js'
@@ -46,6 +47,8 @@ import {
 } from '../services/livePhoto.js'
 import { invalidateSearchCache } from '../services/search.js'
 import { publish } from '../services/events.js'
+import { recordChange } from '../services/syncChanges.js'
+import { broadcastEdit } from '../services/crdtRegistry.js'
 import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
 import type { DocumentMeta } from '../types.js'
 import { resolveUserVault, userVaultRel, ensureUserVault, userVaultRoot } from '../lib/userVault.js'
@@ -162,6 +165,26 @@ function redactPublicMeta(meta: DocumentMeta): DocumentMeta {
   const { publicPasswordHash, ...rest } = meta
   void publicPasswordHash
   return { ...rest, publicPasswordHash: null } as DocumentMeta
+}
+
+/**
+ * 409 if the doc is archived — Archive is a read-only freeze, so
+ * every mutation surface that calls this short-circuits with a
+ * structured response the UI can map to "unarchive first" instead
+ * of a generic 403. Returns true when the request was rejected; the
+ * caller should `return` to abort. archive/unarchive itself, trash,
+ * and pin bypass this gate (lifecycle + sidebar org are allowed).
+ */
+function rejectIfArchived(
+  meta: DocumentMeta,
+  reply: import('fastify').FastifyReply,
+): boolean {
+  if (!isFrozenForArchive(meta)) return false
+  reply.code(409).send({
+    error: 'document is archived — unarchive to edit',
+    code: 'archived',
+  })
+  return true
 }
 
 /** Stricter redaction for callers that aren't the owner — drops the ACL,
@@ -501,6 +524,7 @@ type TreeNode = {
   public?: boolean
   publicExpiresAt?: number | null
   tags?: string[]
+  archived?: boolean
 }
 
 // ─── filename helpers ───────────────────────────────────────────────────────
@@ -1129,6 +1153,7 @@ export async function vaultRoutes(app: FastifyInstance) {
           public: fm?.public ?? false,
           publicExpiresAt: fm?.publicExpiresAt ?? null,
           tags: fm?.tags ?? [],
+          archived: !!fm?.archived,
         })
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase()
@@ -1155,6 +1180,7 @@ export async function vaultRoutes(app: FastifyInstance) {
           public: indexed?.public ?? false,
           publicExpiresAt: indexed?.publicExpiresAt ?? null,
           tags: indexed?.tags ?? [],
+          archived: !!indexed?.archived,
         })
       }
     }
@@ -1165,11 +1191,27 @@ export async function vaultRoutes(app: FastifyInstance) {
     //     have no grant on): show only the immediate children whose
     //     subtree they actually have a grant for.
     //   - otherwise: show everything.
-    const visibleItems = anonymous
-      ? items.filter((it) => it.public)
-      : partialAccess
-      ? items.filter((it) => accessibleSubpaths.has(it.path))
-      : items
+    // Archived filter on top — caller can pass `archived=true` /
+    // `archived=only` to override the default (hidden).
+    const archParam = (req.query as { archived?: string }).archived?.trim()
+    const archMode: 'hide' | 'show' | 'only' =
+      archParam === 'only' ? 'only' : archParam === 'true' ? 'show' : 'hide'
+    const visibleItems = (
+      anonymous
+        ? items.filter((it) => it.public)
+        : partialAccess
+          ? items.filter((it) => accessibleSubpaths.has(it.path))
+          : items
+    ).filter((it) => {
+      // Files + folders both carry an `archived` flag now; same
+      // tristate applies to either. Anonymous + partial-access
+      // never see archived items regardless of the caller's hint.
+      const isArch = it.archived === true
+      if (anonymous || partialAccess) return !isArch
+      if (archMode === 'only') return isArch
+      if (archMode === 'show') return true
+      return !isArch
+    })
     visibleItems.sort((a, b) => {
       if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
       return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
@@ -1224,9 +1266,27 @@ export async function vaultRoutes(app: FastifyInstance) {
       const buffer = await readFile(abs)
       const text = buffer.toString('utf8')
       const s = onDisk
-      // First-read auto-ingest: if this vault file has never been embedded, kick
-      // off a background ingest so it shows up in semantic search next time.
-      if ((!meta || !meta.ingest.embedded) && req.currentUser) {
+      // First-read auto-ingest: if this vault file has never been
+      // *ingested*, kick off a background ingest so it shows up in
+      // semantic search next time.
+      //
+      // Critical: we gate on the ingest *status* (whether the
+      // pipeline has run), NOT on `embedded`. Embedding can fail
+      // permanently (Ollama down, no embed model pulled, soft-
+      // failed text type) while the doc is otherwise fully
+      // ingested. If we re-ran the pipeline on every read until
+      // `embedded` flipped true, an Ollama-down workspace would
+      // walk into an infinite loop the moment any client
+      // listened to the `ingest:ready` SSE event and refetched
+      // the body (which the doc viewer does).
+      //
+      // Terminal statuses (`ready`, `failed`, `no-text`) mean the
+      // ingest finished — the user can hit the "Re-index" button
+      // to force a retry once their embed backend is back up.
+      const status = meta?.ingest.status
+      const needsIngest =
+        !meta || status === 'pending' || status === 'extracting' || status === 'embedding'
+      if (needsIngest && req.currentUser) {
         const u = req.currentUser
         ;(async () => {
           try {
@@ -1251,6 +1311,14 @@ export async function vaultRoutes(app: FastifyInstance) {
               createdAt: existing?.createdAt ?? Date.now(),
               updatedAt: Date.now(),
               ingest: { status: 'pending', embedded: false },
+              // Preserve the archive state across this auto-ingest
+              // rewrite — without these two lines, the seed clobbered
+              // archived → false, which is exactly why a file opened
+              // from the Archive page would silently un-archive itself
+              // on the very first read.
+              archived: existing?.archived,
+              archivedAt: existing?.archivedAt ?? null,
+              templateSource: existing?.templateSource ?? null,
             }
             await saveMeta(seed)
             await ingestDocument(seed, buffer)
@@ -1719,6 +1787,11 @@ export async function vaultRoutes(app: FastifyInstance) {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       ingest: { status: 'pending', embedded: false },
+      // Same reasoning as visibility above — re-index keeps archive
+      // state intact so an admin clicking "Index" doesn't un-archive.
+      archived: existing?.archived,
+      archivedAt: existing?.archivedAt ?? null,
+      templateSource: existing?.templateSource ?? null,
     }
     await saveMeta(meta)
     const finalMeta = await ingestDocument(meta, buffer)
@@ -1767,6 +1840,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     }
     invalidateSearchCache()
     publish({ type: 'trash', path: rel })
+    recordChange({
+      owner: user.username,
+      actor: user.username,
+      entityId: rel,
+      payload: { kind: 'doc.delete' },
+    })
     // Distinct from `delete` so receivers can differentiate the
     // recoverable Trash move from a permanent purge.
     dispatchWebhook({ type: 'trash', path: rel, actor: user.username }).catch(() => null)
@@ -1852,6 +1931,12 @@ export async function vaultRoutes(app: FastifyInstance) {
     await purgeTrash(entry.id)
     invalidateSearchCache()
     publish({ type: 'restore', path: entry.storageKey })
+    recordChange({
+      owner: user.username,
+      actor: user.username,
+      entityId: entry.storageKey,
+      payload: { kind: 'doc.restore', originalPath: entry.storageKey },
+    })
     // Restore = the file reappears at its old path. From the receiver's
     // POV that's equivalent to a fresh upload — fire the `upload` event
     // so downstream mirrors see the resurrected file. No `trash` /
@@ -2357,6 +2442,109 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { ok, errors }
   })
 
+  /**
+   * Bulk archive / unarchive. Accepts a mix of file and folder paths.
+   * Files flip their own doc.archived flag; folders flip their own
+   * folder-meta archived flag — there is no per-file cascade. A
+   * folder being archived hides everything under it by containment
+   * (the folder isn't visible, so its children aren't either), and
+   * unarchiving the folder restores every descendant in one shot.
+   */
+  app.post('/api/file/bulk-archive', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { paths?: string[]; archived?: boolean }
+    if (!Array.isArray(body?.paths) || body.paths.length === 0) {
+      return reply.code(400).send({ error: 'paths[] required' })
+    }
+    if (typeof body.archived !== 'boolean') {
+      return reply.code(400).send({ error: 'missing archived flag' })
+    }
+    const docs = await listAllDocuments()
+    let ok = 0
+    const errors: Array<{ path: string; reason: string }> = []
+    for (const rel of body.paths) {
+      let abs: string
+      try {
+        abs = resolveVault(rel, user.username)
+      } catch {
+        errors.push({ path: rel, reason: 'invalid path' })
+        continue
+      }
+      const s = await stat(abs).catch(() => null)
+      if (!s) {
+        errors.push({ path: rel, reason: 'not found' })
+        continue
+      }
+      try {
+        if (s.isDirectory()) {
+          const existing = await getFolderMeta(user.username, rel)
+          await saveFolderMeta({
+            ...(existing ?? freshFolderMeta(user.username, rel)),
+            archived: body.archived,
+            archivedAt: body.archived ? Date.now() : null,
+            updatedAt: Date.now(),
+          })
+        } else if (s.isFile()) {
+          let meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
+          if (!meta) {
+            // Stub a minimal doc the same way /api/file/visibility +
+            // /api/file/tags do so the archive flag persists for
+            // freshly-uploaded / watcher-pending files. The next
+            // ingest pass fills in the embedded/chunk fields without
+            // overwriting our archived state.
+            const filename = path.basename(abs)
+            meta = {
+              id: nanoid(),
+              title: filename.replace(/\.[^.]+$/, ''),
+              originalFilename: filename,
+              mime: inferMime(filename),
+              bytes: s.size,
+              sha256: '',
+              storageKey: rel,
+              owner: user.username,
+              acl: { readers: [], editors: [] },
+              tags: [],
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              ingest: { status: 'pending', embedded: false },
+            }
+          } else if (!userCanEdit(meta, user.username, user.role)) {
+            errors.push({ path: rel, reason: 'forbidden' })
+            continue
+          }
+          await saveMeta({
+            ...meta,
+            archived: body.archived,
+            archivedAt: body.archived ? Date.now() : null,
+            updatedAt: Date.now(),
+          })
+        } else {
+          errors.push({ path: rel, reason: 'not a file or folder' })
+          continue
+        }
+        dispatchWebhook({
+          type: 'archive',
+          path: rel,
+          actor: user.username,
+          archived: body.archived,
+        }).catch(() => null)
+        publish({ type: 'archive', path: rel, archived: body.archived })
+        ok++
+      } catch (e) {
+        errors.push({ path: rel, reason: (e as Error).message ?? 'failed' })
+      }
+    }
+    invalidateSearchCache()
+    await audit({
+      actor: user.username,
+      action: body.archived ? 'vault.bulk-archive' : 'vault.bulk-unarchive',
+      meta: { paths: body.paths.length, ok, errorCount: errors.length },
+    })
+    return { ok, errors }
+  })
+
   app.post('/api/folder', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
@@ -2400,6 +2588,17 @@ export async function vaultRoutes(app: FastifyInstance) {
     // so a move never destroys an existing file/folder at `to`.
     const dstStat = await stat(absTo).catch(() => null)
     if (dstStat) return reply.code(409).send({ error: 'destination already exists' })
+    // Archive freeze: refuse to move an archived file. For folder
+    // moves we let it through — the archive flag is per-doc, the
+    // folder itself doesn't carry one yet (the wider folder-archive
+    // story is a separate task).
+    if (srcStat.isFile()) {
+      const docs = await listAllDocuments()
+      const srcMeta = docs.find(
+        (d) => d.storageKey === from && d.owner === user.username,
+      )
+      if (srcMeta && rejectIfArchived(srcMeta, reply)) return
+    }
     await mkdir(path.dirname(absTo), { recursive: true })
     await rename(absFrom, absTo)
 
@@ -2598,6 +2797,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     } else if (!userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
+    if (rejectIfArchived(meta, reply)) return
     // Resolve expiry: null/undefined → no expiry (or carry over existing if
     // unchanged); a number → seconds from now. Password: empty/null → clear.
     let publicExpiresAt: number | null = null
@@ -2629,6 +2829,16 @@ export async function vaultRoutes(app: FastifyInstance) {
     // cache so the next public query reflects the new state.
     invalidateSearchCache()
     publish({ type: 'visibility', path: body.path, public: body.public })
+    recordChange({
+      owner: user.username,
+      actor: user.username,
+      entityId: body.path,
+      payload: {
+        kind: 'doc.visibility',
+        public: body.public,
+        expiresAt: body.public ? publicExpiresAt : null,
+      },
+    })
     dispatchWebhook({
       type: 'visibility',
       path: body.path,
@@ -2644,6 +2854,106 @@ export async function vaultRoutes(app: FastifyInstance) {
         hasPassword: !!publicPasswordHash,
         expiresAt: publicExpiresAt,
       },
+    })
+    return { document: redactPublicMeta(next) }
+  })
+
+  // ---- archive ------------------------------------------------------------
+
+  /**
+   * Flip the archive flag on a file. Archived docs are filtered out
+   * of default listings and search; the caller can opt them back in
+   * with `?archived=true` on the relevant endpoints (or via the
+   * Archive sidebar entry in the web UI). Distinct from Trash —
+   * archived files never auto-purge, and a single click restores
+   * them to default visibility.
+   *
+   * Body: `{ path: string, archived: boolean }`. Owner / editor ACL
+   * required; viewers can't archive even their shared docs.
+   */
+  app.post('/api/file/archive', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { path?: string; archived?: boolean }
+    if (!body?.path) return reply.code(400).send({ error: 'missing path' })
+    if (typeof body.archived !== 'boolean') {
+      return reply.code(400).send({ error: 'missing archived flag' })
+    }
+    // Path resolves to either a file or a folder. The two surfaces
+    // have distinct archive states (doc.archived vs folderMeta.archived);
+    // folders flip a single folder-meta record and everything under
+    // the folder is hidden by *containment* — no per-file cascade.
+    const abs = resolveVault(body.path, user.username)
+    const s = await stat(abs).catch(() => null)
+    if (!s) return reply.code(404).send({ error: 'not found' })
+
+    if (s.isDirectory()) {
+      const existing = await getFolderMeta(user.username, body.path)
+      const next = {
+        ...(existing ?? freshFolderMeta(user.username, body.path)),
+        archived: body.archived,
+        archivedAt: body.archived ? Date.now() : null,
+        updatedAt: Date.now(),
+      }
+      await saveFolderMeta(next)
+      invalidateSearchCache()
+      dispatchWebhook({
+        type: 'archive',
+        path: body.path,
+        actor: user.username,
+        archived: body.archived,
+      }).catch(() => null)
+      publish({ type: 'archive', path: body.path, archived: body.archived })
+      recordChange({
+        owner: user.username,
+        actor: user.username,
+        entityId: body.path,
+        payload: { kind: 'folder.archive', archived: body.archived },
+      })
+      await audit({
+        actor: user.username,
+        action: body.archived ? 'vault.archive' : 'vault.unarchive',
+        target: body.path,
+        meta: { kind: 'folder' },
+      })
+      return { folder: next }
+    }
+
+    const docs = await listAllDocuments()
+    const meta = docs.find((d) => d.storageKey === body.path && d.owner === user.username)
+    if (!meta) return reply.code(404).send({ error: 'not indexed' })
+    if (!userCanEdit(meta, user.username, user.role)) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const next: DocumentMeta = {
+      ...meta,
+      archived: body.archived,
+      archivedAt: body.archived ? Date.now() : null,
+      updatedAt: Date.now(),
+    }
+    await saveMeta(next)
+    // Archived docs drop out of default search; flush the cache so
+    // the next query sees the new state.
+    invalidateSearchCache()
+    dispatchWebhook({
+      type: 'archive',
+      path: body.path,
+      actor: user.username,
+      archived: body.archived,
+    }).catch(() => null)
+    publish({ type: 'archive', path: body.path, archived: body.archived })
+    recordChange({
+      owner: user.username,
+      actor: user.username,
+      entityId: body.path,
+      payload: { kind: 'doc.archive', archived: body.archived },
+    })
+    await audit({
+      actor: user.username,
+      action: body.archived ? 'vault.archive' : 'vault.unarchive',
+      target: body.path,
+      meta: { docId: meta.id, kind: 'file' },
     })
     return { document: redactPublicMeta(next) }
   })
@@ -2703,10 +3013,17 @@ export async function vaultRoutes(app: FastifyInstance) {
     } else if (effectiveOwner === user.username && !userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
+    if (rejectIfArchived(meta, reply)) return
     const next: DocumentMeta = { ...meta, tags, updatedAt: Date.now() }
     await saveMeta(next)
     invalidateSearchCache()
     publish({ type: 'tags', path: body.path, tags })
+    recordChange({
+      owner: effectiveOwner,
+      actor: user.username,
+      entityId: body.path,
+      payload: { kind: 'doc.tags', tags },
+    })
     dispatchWebhook({
       type: 'tags',
       path: body.path,
@@ -3066,6 +3383,7 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!userCanEdit(meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
+    if (rejectIfArchived(meta, reply)) return
     const { readVersionText, snapshotVersion } = await import('../stores/versions.js')
     const text = await readVersionText(meta.id, ts)
     if (text == null) {
@@ -3102,6 +3420,15 @@ export async function vaultRoutes(app: FastifyInstance) {
       bytes: buffer.length,
       source: 'web',
     }).catch(() => null)
+    publish({ type: 'edit', path: meta.storageKey, docId: meta.id })
+    if (/\.(md|markdown|mdx|txt|csv|json)$/i.test(meta.storageKey)) {
+      broadcastEdit(
+        meta.id,
+        { owner: meta.owner, storageKey: meta.storageKey },
+        text,
+        'version-restore',
+      )
+    }
     await audit({
       actor: user.username,
       action: 'vault.version.restore',

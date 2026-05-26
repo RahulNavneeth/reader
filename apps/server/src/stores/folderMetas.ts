@@ -19,6 +19,13 @@ export type FolderMeta = {
   public?: boolean
   publicExpiresAt?: number | null
   publicPasswordHash?: string | null
+  /** Folder-level archive. Distinct from per-doc archive — archiving
+   *  the folder hides it (and everything inside it, transitively) from
+   *  default vault listings, sidebar tree, search, and timeline.
+   *  Doesn't touch individual doc archive flags, so unarchiving the
+   *  folder is a single-state-flip that restores all descendants. */
+  archived?: boolean
+  archivedAt?: number | null
   createdAt: number
   updatedAt: number
 }

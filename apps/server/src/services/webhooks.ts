@@ -87,6 +87,10 @@ export type WebhookEvent =
   | { type: 'folder-visibility'; path: string; actor: string; public: boolean }
   // Pin / unpin to the sidebar. `pinned: false` means an unpin.
   | { type: 'pin'; path: string; actor: string; pinned: boolean; isFolder: boolean }
+  // Archive / un-archive. Distinct from `trash` (soft-delete with auto-
+  // purge) and `delete` (permanent removal) — archived files stay in
+  // the vault indefinitely, hidden from default listings.
+  | { type: 'archive'; path: string; actor: string; archived: boolean }
   // File created via the HTTP email-intake endpoint.
   | { type: 'intake'; path: string; actor: string; subject?: string; from?: string }
   // File created by instantiating a `_templates/*.md` template.
@@ -175,6 +179,12 @@ export const EVENT_SHAPES: Array<{
     type: 'pin',
     description: 'Pin or unpin to the sidebar. `pinned: false` means an unpin.',
     sample: { type: 'pin', path: 'Inbox/today.md', actor: 'alice', pinned: true, isFolder: false },
+  },
+  {
+    type: 'archive',
+    description:
+      'File archived or unarchived. Distinct from `trash` (soft delete with 30d purge) and `delete` (permanent removal) — archived files persist indefinitely, just hidden from default views.',
+    sample: { type: 'archive', path: 'Projects/Q1-2024-report.md', actor: 'alice', archived: true },
   },
   {
     type: 'intake',

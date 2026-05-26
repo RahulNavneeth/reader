@@ -59,17 +59,42 @@ export function PublicButton({
         folderExpiresAt={meta.publicExpiresAt}
         folderHasPassword={!!meta.publicPasswordHash || !!meta.hasPassword}
         onRevoke={async () => {
-          if (kind === 'folder') {
-            await api.setFolderVisibility(path, false)
-          } else {
-            await api.setVisibility(path, false)
-          }
-          onSaved({
+          const reverted: PublicMetaShape = {
             public: false,
             publicExpiresAt: null,
             publicPasswordHash: null,
             hasPassword: false,
-          })
+          }
+          const queue = async () => {
+            if (kind === 'folder') return // folder visibility not in sync schema
+            const { enqueueAndTryDrain } = await import('../lib/sync/helpers')
+            await enqueueAndTryDrain({
+              entityId: path,
+              kind: 'doc.visibility',
+              body: { public: false },
+            })
+          }
+          if (kind !== 'folder' && typeof navigator !== 'undefined' && !navigator.onLine) {
+            await queue()
+            onSaved(reverted)
+            return
+          }
+          try {
+            if (kind === 'folder') {
+              await api.setFolderVisibility(path, false)
+            } else {
+              await api.setVisibility(path, false)
+            }
+            onSaved(reverted)
+          } catch (e) {
+            const { isNetworkError } = await import('../lib/sync/helpers')
+            if (kind !== 'folder' && isNetworkError(e)) {
+              await queue()
+              onSaved(reverted)
+            } else {
+              throw e
+            }
+          }
         }}
       />
     )
@@ -79,11 +104,43 @@ export function PublicButton({
       title="Public link"
       confirmLabel="Make public"
       onConfirm={async (opts) => {
-        const saved =
-          kind === 'folder'
-            ? (await api.setFolderVisibility(path, true, opts)).folder
-            : ((await api.setVisibility(path, true, opts)).document as PublicMetaShape)
-        onSaved(saved)
+        // Offline path only handles the no-options case (plain
+        // make-public). Password / expiry need a server round-trip
+        // to mint the hash + compute the absolute expiry, so we
+        // refuse to queue those — they fail loud while offline.
+        const hasOpts = !!(opts?.password || opts?.expiresInSeconds)
+        const queue = async () => {
+          if (kind === 'folder' || hasOpts) return false
+          const { enqueueAndTryDrain } = await import('../lib/sync/helpers')
+          await enqueueAndTryDrain({
+            entityId: path,
+            kind: 'doc.visibility',
+            body: { public: true },
+          })
+          onSaved({
+            public: true,
+            publicExpiresAt: null,
+            publicPasswordHash: null,
+            hasPassword: false,
+          } as PublicMetaShape)
+          return true
+        }
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          const queued = await queue()
+          if (queued) return
+          throw new Error('Offline — password / expiry require the server')
+        }
+        try {
+          const saved =
+            kind === 'folder'
+              ? (await api.setFolderVisibility(path, true, opts)).folder
+              : ((await api.setVisibility(path, true, opts)).document as PublicMetaShape)
+          onSaved(saved)
+        } catch (e) {
+          const { isNetworkError } = await import('../lib/sync/helpers')
+          if (isNetworkError(e) && (await queue())) return
+          throw e
+        }
       }}
       trigger={
         <button

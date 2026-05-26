@@ -95,12 +95,12 @@ export function AdminPanel() {
   return (
     <div className="flex-1 flex overflow-hidden">
       <aside
-        className="panel border-r border-app shrink-0 w-[240px] flex flex-col"
-        style={{ background: 'var(--panel)' }}
+        className="border-r border-app shrink-0 w-[240px] flex flex-col"
+        style={{ background: 'var(--surface-3)' }}
       >
         <div
           className="h-11 px-2 flex items-center gap-1.5 border-b shrink-0"
-          style={{ borderColor: 'var(--border)', background: 'var(--panel-2)' }}
+          style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
         >
           <button
             className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -125,15 +125,17 @@ export function AdminPanel() {
                   <button
                     key={item.id}
                     onClick={() => setSection(item.id)}
-                    /* No `transition-colors` on the active row: when the
-                       user switches theme, `--selected` and `--accent`
-                       both flip values; a colour transition would animate
-                       the selected row over ~150ms while everything else
-                       snaps instantly, producing a visible lag. Non-active
-                       rows still get hover smoothing. */
+                    /* Scope the hover smoothing to background-color
+                       only. Tailwind's `transition-colors` also
+                       includes `color`, which made every row's text +
+                       icon lag visibly behind the rest of the chrome
+                       on theme toggle (the var swap is instant
+                       everywhere else, the colour eased over ~150ms
+                       here). Active row keeps no transition at all
+                       so --selected / --accent flips snap. */
                     className={clsx(
                       'w-full flex items-center gap-2 px-2 h-7 rounded text-[13px] text-left',
-                      !isActive && 'transition-colors hover:bg-hover',
+                      !isActive && 'transition-[background-color] hover:bg-hover',
                     )}
                     style={{
                       background: isActive ? 'var(--selected)' : 'transparent',
@@ -151,10 +153,13 @@ export function AdminPanel() {
         </nav>
       </aside>
 
-      <main className="flex-1 overflow-hidden flex flex-col surface">
+      <main
+        className="flex-1 overflow-hidden flex flex-col"
+        style={{ background: 'var(--surface-3)' }}
+      >
         <header
           className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
-          style={{ background: 'var(--panel-2)' }}
+          style={{ background: 'var(--surface-2)' }}
         >
           <activeItem.icon size={14} className="text-accent" />
           <div className="text-[13.5px] font-semibold text-fg">{activeItem.label}</div>
@@ -451,6 +456,10 @@ function EmbeddingsPanel() {
   const [embedModel, setEmbedModel] = useState('')
   const [chatEnabled, setChatEnabled] = useState<boolean>(true)
   const [chatModel, setChatModel] = useState('')
+  // CLIP image-text embeddings — fuses photo similarity into the
+  // semantic search rank when on. Process-resident model, so a
+  // toggle here triggers the restart-required banner on save.
+  const [clipEnabled, setClipEnabled] = useState<boolean>(false)
   const [chunkChars, setChunkChars] = useState<number | ''>('')
   const [chunkOverlap, setChunkOverlap] = useState<number | ''>('')
   const [saving, setSaving] = useState(false)
@@ -467,6 +476,7 @@ function EmbeddingsPanel() {
       setEmbedModel(r.ollama.embedModel)
       setChatEnabled(r.ollama.chatEnabled)
       setChatModel(r.ollama.chatModel)
+      setClipEnabled(!!r.clip?.enabled)
       setChunkChars(r.ingest.chunkChars)
       setChunkOverlap(r.ingest.chunkOverlap)
     } catch (e) {
@@ -497,6 +507,7 @@ function EmbeddingsPanel() {
           chatEnabled,
           chatModel: chatModel.trim(),
         },
+        clip: { enabled: clipEnabled },
         ingest: {
           chunkChars: typeof chunkChars === 'number' ? chunkChars : undefined,
           chunkOverlap: typeof chunkOverlap === 'number' ? chunkOverlap : undefined,
@@ -604,6 +615,39 @@ function EmbeddingsPanel() {
             />
           )}
         </FieldRow>
+      </Card>
+
+      <Card title="CLIP image search">
+        <div className="flex items-center gap-3">
+          <Toggle
+            checked={clipEnabled}
+            onChange={() => setClipEnabled((v) => !v)}
+            disabled={saving}
+          />
+          <span className="text-[12.5px] text-fg font-medium flex-1">
+            Match images by description
+          </span>
+          {sys.clip?.enabled ? (
+            <Badge color="#00875A" icon={<CheckCircle2 size={11} />}>on</Badge>
+          ) : (
+            <Badge color="#6B778C">off</Badge>
+          )}
+        </div>
+        <div className="text-[11.5px] text-muted mt-2 leading-relaxed">
+          When on, the ingest pipeline drops a CLIP image-text vector
+          per image (≈512 dims) and the semantic search fuses
+          image similarity into the rank. So "sunset over ocean" in
+          the search bar — or in a smart-collection's semantic
+          query — surfaces matching photos alongside text docs.
+          <br />
+          <span style={{ color: 'var(--subtle)' }}>
+            Model: <code>{sys.clip?.model ?? 'Xenova/clip-vit-base-patch32'}</code>.
+            Loaded lazily on first use; ~150 MB resident once warm.
+            Flipping the toggle on or off needs a server restart to
+            take effect — existing images need a re-ingest before
+            their vectors are populated.
+          </span>
+        </div>
       </Card>
 
       <Card title="Chunking">
@@ -1106,7 +1150,7 @@ function BackupPanel() {
         <div className="flex items-center gap-3">
           <Toggle checked={enabled} onChange={() => setEnabled((v) => !v)} disabled={saving} />
           <span className="text-[12.5px] text-fg font-medium">
-            Run a tar.gz snapshot of <code className="text-[11.5px]">/data</code> + <code className="text-[11.5px]">/vault</code> on a schedule
+            Run a tar.gz snapshot of the data + vault directories on a schedule
           </span>
         </div>
         <FieldRow label="Cadence">
@@ -1208,7 +1252,7 @@ function StatusLine({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-baseline gap-2">
       <span className="text-subtle min-w-[110px]">{label}</span>
-      <span className="text-fg font-mono text-[11.5px] break-all">{value}</span>
+      <span className="text-fg text-[12.5px] break-all">{value}</span>
     </div>
   )
 }
@@ -1532,7 +1576,7 @@ function UsersPanel() {
       >
         <div className="rounded border border-app overflow-hidden">
           <table className="w-full text-[13px]">
-            <thead style={{ background: 'var(--panel)' }}>
+            <thead style={{ background: 'var(--table-header-bg)' }}>
               <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
                 <th className="px-3 py-2 font-semibold">Username</th>
                 <th className="px-3 py-2 font-semibold">Role</th>
@@ -1596,7 +1640,7 @@ function UsersPanel() {
                   </tr>
                   {editing === u.username && (
                     <tr style={{ borderTop: '1px solid var(--border)' }}>
-                      <td colSpan={5} className="px-3 py-2" style={{ background: 'var(--panel)' }}>
+                      <td colSpan={5} className="px-3 py-2" style={{ background: 'var(--table-stripe-bg)' }}>
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
                             Quota
@@ -1722,7 +1766,7 @@ function DuplicatesPanel() {
           </code>
           <div className="rounded border border-app overflow-hidden">
             <table className="w-full text-[12.5px]">
-              <thead style={{ background: 'var(--panel)' }}>
+              <thead style={{ background: 'var(--table-header-bg)' }}>
                 <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
                   <th className="px-3 py-1.5 font-semibold">Path</th>
                   <th className="px-3 py-1.5 font-semibold">Owner</th>
@@ -1898,7 +1942,14 @@ function Muted({ text }: { text: string }) {
 
 function ErrText({ text }: { text: string }) {
   return (
-    <div className="text-[12.5px] px-3 py-2 rounded" style={{ color: '#BF2600', background: '#FFEBE6' }}>
+    <div
+      className="text-[12.5px] px-3 py-2 rounded"
+      style={{
+        color: 'var(--danger-fg)',
+        background: 'var(--danger-bg)',
+        border: '1px solid color-mix(in srgb, var(--danger-fg) 25%, transparent)',
+      }}
+    >
       {text}
     </div>
   )

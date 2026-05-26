@@ -82,11 +82,11 @@ export function TrashPage() {
   return (
     <div
       className="flex-1 flex flex-col overflow-hidden"
-      style={{ background: 'var(--rail)' }}
+      style={{ background: 'var(--surface-3)' }}
     >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
-        style={{ background: 'var(--panel-2)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -128,12 +128,8 @@ export function TrashPage() {
           </div>
         ) : (
           <div
-            className="rounded-md overflow-hidden divide-y"
-            style={{
-              background: 'var(--viewer)',
-              border: '1px solid var(--border)',
-              borderColor: 'var(--border)',
-            }}
+            className="rounded-md overflow-hidden settings-list-card"
+            style={{ background: 'var(--viewer)', border: '1px solid var(--border)' }}
           >
             {entries.map((e) => {
               const lastSlash = e.storageKey.lastIndexOf('/')
@@ -178,10 +174,9 @@ export function TrashPage() {
                     Restore
                   </button>
                   <button
-                    className="btn-ghost shrink-0"
+                    className="btn-ghost-danger shrink-0"
                     onClick={() => purge(e)}
                     disabled={busyId === e.id}
-                    style={{ color: '#BF2600' }}
                     title="Permanently delete"
                     aria-label="Permanently delete"
                   >

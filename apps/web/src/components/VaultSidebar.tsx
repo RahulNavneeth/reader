@@ -214,12 +214,12 @@ export function VaultSidebar() {
           show/hide) is unaffected. */}
       {collapsed && (
         <aside
-          style={{ background: 'var(--rail)' }}
+          style={{ background: 'var(--surface-3)' }}
           className="hidden md:flex w-8 shrink-0 border-r border-app flex-col items-stretch"
         >
           <button
-            className="h-11 w-full inline-flex items-center justify-center border-b border-app transition-[background-color] hover:bg-hover bg-[var(--panel-2)]"
-            style={{ color: 'var(--fg-subtle)' }}
+            className="h-11 w-full inline-flex items-center justify-center border-b border-app transition-[background-color] hover:bg-hover"
+            style={{ color: 'var(--fg-subtle)', background: 'var(--surface-2)' }}
             onClick={() => setCollapsed(false)}
             title="Expand vault"
             aria-label="Expand vault"
@@ -229,7 +229,7 @@ export function VaultSidebar() {
         </aside>
       )}
       <aside
-        style={{ background: 'var(--rail)' }}
+        style={{ background: 'var(--surface-3)' }}
         className={clsx(
           'border-r border-app overflow-y-auto flex flex-col',
           // Mobile: fixed-position drawer that slides in from the left.
@@ -242,7 +242,7 @@ export function VaultSidebar() {
       >
       <div
         className="h-11 px-2 flex items-center gap-1.5 border-b border-app sticky top-0 z-10"
-        style={{ background: 'var(--panel-2)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <div className="relative flex-1 min-w-0">
           <Filter size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-subtle pointer-events-none" />

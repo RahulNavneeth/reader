@@ -179,6 +179,11 @@ export type SearchFilters = {
   /** Restrict to docs whose storageKey is at or under this folder.
    *  Empty string / unset = no folder scope. */
   folder?: string
+  /** Archived-doc handling. Default (`undefined` / `false`) hides
+   *  archived docs from results — matches the rest of the app's
+   *  "out of daily flow" semantics. Pass `true` to include them
+   *  alongside non-archived; pass `'only'` to filter to just archived. */
+  archived?: boolean | 'only'
 }
 
 export async function searchKnowledge(opts: {
@@ -220,6 +225,18 @@ export async function searchKnowledge(opts: {
       shareAllows(d) ||
       collectionAllows(d),
   )
+  // Archived filter applied right after auth so subsequent filters
+  // operate on the visibility-correct set. Default hides archived;
+  // `archived: true` keeps both; `archived: 'only'` flips to just
+  // archived (for the dedicated /archive view in the web UI).
+  {
+    const arch = f?.archived
+    if (arch === 'only') {
+      allowed = allowed.filter((d) => !!d.archived)
+    } else if (arch !== true) {
+      allowed = allowed.filter((d) => !d.archived)
+    }
+  }
   if (f) {
     // Mime prefix match: any of the supplied prefixes match.
     if (f.mime && f.mime.length > 0) {

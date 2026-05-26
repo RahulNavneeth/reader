@@ -12,6 +12,8 @@ import {
 } from '../stores/documents.js'
 import { ingestDocument } from './ingest.js'
 import { invalidateSearchCache } from './search.js'
+import { publish as publishEvent } from './events.js'
+import { broadcastEdit } from './crdtRegistry.js'
 import { ownerFromAbs } from '../lib/userVault.js'
 import type { DocumentMeta } from '../types.js'
 
@@ -119,6 +121,15 @@ export async function reingestPath(absPath: string, log: FastifyBaseLogger): Pro
     createdAt: existing?.createdAt ?? Date.now(),
     updatedAt: Date.now(),
     ingest: { status: 'pending', embedded: false },
+    // Archive state survives in-place edits picked up by the watcher
+    // too — same reasoning as the public-flag preservation.
+    archived: existing?.archived,
+    archivedAt: existing?.archivedAt ?? null,
+    // Template provenance must survive too — without this, the
+    // watcher firing on instantiate's own writeFile would null
+    // out the templateSource we just stored, hiding the refresh
+    // button. Same clobber pattern that bit the archive flag.
+    templateSource: existing?.templateSource ?? null,
   }
   // Snapshot the current meta + text + chunks before we overwrite them. Only
   // for existing docs — first-time ingest has nothing to preserve.
@@ -173,6 +184,30 @@ export async function reingestPath(absPath: string, log: FastifyBaseLogger): Pro
     log.info({ rel }, 'watcher: re-ingested')
   } catch (err) {
     log.warn({ err, rel }, 'watcher: re-ingest failed')
+  }
+  // Notify open viewers so an external editor's save shows up in the
+  // doc viewer without a manual refresh. `dedup` would have suppressed
+  // the webhook above for in-app writes that already publish their own
+  // event, so we mirror that: only emit for *truly* external edits.
+  if (existing && !dedup) {
+    publishEvent({ type: 'edit', path: rel, docId: meta.id })
+    // Push the new bytes into the Y.Doc so connected WebSocket
+    // peers (other browser tabs of the same user) see the
+    // change live. Only meaningful for text files; binary edits
+    // through chokidar are rare and CRDT-wrapping them gives no
+    // benefit.
+    if (/\.(md|markdown|mdx|txt|csv|json)$/i.test(rel)) {
+      try {
+        broadcastEdit(
+          meta.id,
+          { owner: meta.owner, storageKey: rel },
+          buffer.toString('utf8'),
+          'watcher',
+        )
+      } catch {
+        /* see ingest failure handling above — best-effort. */
+      }
+    }
   }
 }
 

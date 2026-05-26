@@ -2,6 +2,12 @@ import { useEffect, useState } from 'react'
 import { Loader2, Plug, AlertCircle, Trash2 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
+import {
+  MetaDot,
+  SettingsListCard,
+  SettingsListEmpty,
+  SettingsListRow,
+} from './SettingsList'
 
 type Client = {
   clientId: string
@@ -21,6 +27,12 @@ type Client = {
  * by policy so admins need a way to inspect what's been registered
  * and delete anything rogue or stale. Delete cascades through FK to
  * drop the client's auth codes, access tokens, and refresh tokens.
+ *
+ * Visual style follows the Trash page: each entry is a row inside a
+ * single bordered viewer-surface card, two lines of text per row
+ * (title + dot-separated subtle metadata), inline action buttons.
+ * Drops the previous per-id badge chip in favour of plain text so
+ * the list reads as a continuous list, not a wall of pills.
  */
 export function AdminOauthClientsPanel(): JSX.Element {
   const [clients, setClients] = useState<Client[]>([])
@@ -83,86 +95,89 @@ export function AdminOauthClientsPanel(): JSX.Element {
 
       {error && (
         <div
-          className="flex items-start gap-2 px-3 py-2 rounded text-[12px]"
+          className="px-3 py-2 rounded text-[12.5px] inline-flex items-center gap-2"
           style={{
-            background: 'color-mix(in srgb, #BF2600 12%, transparent)',
-            color: '#BF2600',
+            background: 'var(--danger-bg)',
+            color: 'var(--danger-fg)',
+            border: '1px solid color-mix(in srgb, var(--danger-fg) 25%, transparent)',
           }}
         >
-          <AlertCircle size={12} className="mt-0.5" />
+          <AlertCircle size={13} />
           <span className="flex-1">{error}</span>
-          <button onClick={() => setError(null)} className="text-[11px] underline">
+          <button onClick={() => setError(null)} className="text-[11.5px] underline">
             dismiss
           </button>
         </div>
       )}
 
       {loading ? (
-        <div className="text-subtle text-[12px] py-4">Loading…</div>
+        <div className="text-subtle text-[12.5px] py-4">Loading…</div>
       ) : clients.length === 0 ? (
-        <div className="text-subtle text-[12px] py-4">
-          No clients registered yet. Apps appear here automatically when they
-          complete the OAuth flow.
-        </div>
+        <SettingsListEmpty
+          title="No clients registered"
+          hint="Apps show up here automatically when they complete an OAuth flow."
+        />
       ) : (
-        <ul className="divide-y" style={{ borderColor: 'var(--border)' }}>
-          {clients.map((c) => (
-            <li key={c.clientId} className="py-3 flex items-start gap-3">
-              <Plug size={13} className="text-muted mt-1 shrink-0" />
-              <div className="flex-1 min-w-0">
-                <div className="text-[13px] font-medium text-fg break-all">
-                  {c.clientName}
-                </div>
-                <div className="text-[11.5px] text-subtle mt-0.5 break-all">
-                  <span style={{ background: 'var(--panel-2)', padding: '0 4px', borderRadius: 3 }}>
-                    {c.clientId}
-                  </span>
-                  {c.softwareId && (
-                    <>
-                      {' · '}
-                      {c.softwareId}
-                      {c.softwareVersion ? ` ${c.softwareVersion}` : ''}
-                    </>
-                  )}
-                </div>
-                <div className="text-[11.5px] text-subtle mt-1">
-                  {c.activeGrants > 0 ? (
-                    <span style={{ color: 'var(--accent)' }}>
-                      {c.activeGrants} active grant{c.activeGrants === 1 ? '' : 's'}
+        <SettingsListCard>
+          {clients.map((c) => {
+            const idShort = c.clientId.length > 28 ? c.clientId.slice(0, 26) + '…' : c.clientId
+            const grants =
+              c.activeGrants > 0
+                ? `${c.activeGrants} active grant${c.activeGrants === 1 ? '' : 's'}`
+                : 'no active grants'
+            const sw = c.softwareId
+              ? `${c.softwareId}${c.softwareVersion ? ` ${c.softwareVersion}` : ''}`
+              : null
+            return (
+              <SettingsListRow
+                key={c.clientId}
+                icon={<Plug size={14} className="text-subtle" />}
+                title={c.clientName}
+                meta={
+                  <>
+                    <span>{idShort}</span>
+                    <MetaDot />
+                    <span style={c.activeGrants > 0 ? { color: 'var(--accent)' } : undefined}>
+                      {grants}
                     </span>
-                  ) : (
-                    'no active grants'
-                  )}
-                  {' · '}registered {timeAgo(c.createdAt)}
-                  {c.lastUsedAt ? ` · last used ${timeAgo(c.lastUsedAt)}` : ''}
-                  {c.hasSecret ? ' · confidential' : ' · public (PKCE)'}
-                </div>
-                <div className="text-[11px] text-subtle mt-1">
-                  {c.redirectUris.map((u, i) => (
-                    <span key={u}>
-                      {i > 0 && ', '}
-                      <span className="break-all">{u}</span>
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <button
-                className="btn-ghost h-7 px-2 text-[11.5px] inline-flex items-center gap-1 shrink-0"
-                style={{ color: '#BF2600' }}
-                onClick={() => remove(c)}
-                disabled={deletingId === c.clientId}
-                title="Delete client + cascade-revoke every grant"
-              >
-                {deletingId === c.clientId ? (
-                  <Loader2 size={11} className="animate-spin" />
-                ) : (
-                  <Trash2 size={11} />
-                )}
-                Delete
-              </button>
-            </li>
-          ))}
-        </ul>
+                    <MetaDot />
+                    <span>registered {timeAgo(c.createdAt)}</span>
+                    <MetaDot />
+                    <span>{c.hasSecret ? 'confidential' : 'public (PKCE)'}</span>
+                    {sw && (
+                      <>
+                        <MetaDot />
+                        <span>{sw}</span>
+                      </>
+                    )}
+                    {c.lastUsedAt && (
+                      <>
+                        <MetaDot />
+                        <span>last used {timeAgo(c.lastUsedAt)}</span>
+                      </>
+                    )}
+                  </>
+                }
+                actions={
+                  <button
+                    className="btn-ghost-danger"
+                    onClick={() => remove(c)}
+                    disabled={deletingId === c.clientId}
+                    title="Delete client + cascade-revoke every grant"
+                    aria-label="Delete OAuth client"
+                  >
+                    {deletingId === c.clientId ? (
+                      <Loader2 size={12} className="animate-spin" />
+                    ) : (
+                      <Trash2 size={12} />
+                    )}
+                    Delete
+                  </button>
+                }
+              />
+            )
+          })}
+        </SettingsListCard>
       )}
     </section>
   )

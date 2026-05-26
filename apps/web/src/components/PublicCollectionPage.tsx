@@ -110,7 +110,7 @@ export function PublicCollectionPage() {
       <div className="flex-1 flex items-center justify-center surface">
         <div
           className="rounded-xl p-6 max-w-[400px] text-center"
-          style={{ background: 'var(--panel)', border: '1px dashed var(--border)' }}
+          style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
         >
           <AlertCircle size={20} className="text-subtle mx-auto mb-2" />
           <div className="text-[14px] text-fg">{error ?? 'Collection unavailable'}</div>

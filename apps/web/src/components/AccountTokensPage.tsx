@@ -13,6 +13,12 @@ import {
 import { ApiError, api, type ApiTokenInfo } from '../lib/api'
 import { useConfirm } from '../lib/confirm'
 import { copyText } from '../lib/clipboard'
+import {
+  MetaDot,
+  SettingsListCard,
+  SettingsListEmpty,
+  SettingsListRow,
+} from './SettingsList'
 
 /**
  * User-scoped API token management at /account/tokens. Mints + lists
@@ -76,11 +82,11 @@ export function AccountTokensPage() {
   return (
     <div
       className="flex-1 flex flex-col overflow-hidden"
-      style={{ background: 'var(--rail)' }}
+      style={{ background: 'var(--surface-3)' }}
     >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
-        style={{ background: 'var(--panel-2)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -119,7 +125,7 @@ export function AccountTokensPage() {
           <section
             className="rounded-md p-3 space-y-2"
             style={{
-              background: 'var(--viewer)',
+              background: 'var(--surface-2)',
               border: '1px solid var(--border)',
               borderLeft: '2px solid var(--accent)',
             }}
@@ -185,40 +191,45 @@ export function AccountTokensPage() {
 
         <Section title={`Your tokens${tokens && tokens.length > 0 ? ` · ${tokens.length}` : ''}`}>
           {!tokens ? null : tokens.length === 0 ? (
-            <div className="text-[12.5px] text-subtle py-2">
-              No tokens yet. Create one above to call the MCP / REST API as yourself.
-            </div>
+            <SettingsListEmpty
+              title="No tokens yet"
+              hint="Create one above to call the MCP / REST API as yourself."
+            />
           ) : (
-            <ul className="divide-y" style={{ borderColor: 'var(--border)' }}>
+            <SettingsListCard>
               {tokens.map((t) => (
-                <li
+                <SettingsListRow
                   key={t.id}
-                  className="flex items-center gap-3 py-3 first:pt-0"
-                >
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[13px] font-medium text-fg truncate">{t.name}</div>
-                    <div className="text-[11.5px] text-subtle mt-0.5">
-                      {t.id}…
-                      <span className="mx-1.5 opacity-60">·</span>
-                      {t.role}
-                      <span className="mx-1.5 opacity-60">·</span>
-                      {t.lastUsedAt ? `last used ${timeAgo(t.lastUsedAt)}` : 'never used'}
-                      <span className="mx-1.5 opacity-60">·</span>
-                      {t.expiresAt ? `expires ${new Date(t.expiresAt).toLocaleDateString()}` : 'no expiry'}
-                    </div>
-                  </div>
-                  <button
-                    className="btn-ghost shrink-0"
-                    onClick={() => remove(t)}
-                    style={{ color: '#BF2600' }}
-                    title="Revoke token"
-                    aria-label="Revoke token"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                </li>
+                  icon={<KeyRound size={14} className="text-subtle" />}
+                  title={t.name}
+                  meta={
+                    <>
+                      <span>{t.id}…</span>
+                      <MetaDot />
+                      <span>{t.role}</span>
+                      <MetaDot />
+                      <span>{t.lastUsedAt ? `last used ${timeAgo(t.lastUsedAt)}` : 'never used'}</span>
+                      <MetaDot />
+                      <span>
+                        {t.expiresAt
+                          ? `expires ${new Date(t.expiresAt).toLocaleDateString()}`
+                          : 'no expiry'}
+                      </span>
+                    </>
+                  }
+                  actions={
+                    <button
+                      className="btn-ghost-danger"
+                      onClick={() => remove(t)}
+                      title="Revoke token"
+                      aria-label="Revoke token"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  }
+                />
               ))}
-            </ul>
+            </SettingsListCard>
           )}
         </Section>
         </div>

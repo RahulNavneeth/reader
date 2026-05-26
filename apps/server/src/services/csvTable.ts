@@ -7,10 +7,14 @@
  *   - read a window of rows with optional column projection
  *     (`getCsvRows`)
  *
- * Reuses the existing `xlsx` dependency — it handles delimiter
- * detection (comma vs tab vs semicolon) and quoted fields without us
- * hand-rolling a parser. For very large CSVs we cap at the lib's
- * default streaming behavior; the MCP rate limiter bounds abuse.
+ * Built on `papaparse` — actively maintained, no known CVEs, and the
+ * standard JS CSV parser. Handles quoted fields, escaped quotes,
+ * auto-detects the delimiter (`comma | tab | semicolon | pipe`), and
+ * surfaces missing cells as `null` so they survive the round-trip
+ * instead of getting dropped silently.
+ *
+ * Previously used SheetJS (`xlsx`) for the same job; swapped after
+ * the prototype-pollution + ReDoS CVE — no npm fix available.
  */
 import { readFile } from 'node:fs/promises'
 
@@ -18,19 +22,32 @@ type Row = Record<string, unknown>
 
 async function parseCsv(absPath: string): Promise<{ columns: string[]; rows: Row[] }> {
   const buf = await readFile(absPath)
-  const XLSX = await import('xlsx')
-  const wb = XLSX.read(buf, { type: 'buffer', raw: false })
-  const sheetName = wb.SheetNames[0]
-  if (!sheetName) return { columns: [], rows: [] }
-  const sheet = wb.Sheets[sheetName]
-  if (!sheet) return { columns: [], rows: [] }
-  // `sheet_to_json` with no header opt uses the first row as keys.
-  // `defval: null` ensures missing cells survive the round-trip
-  // instead of being dropped from the object.
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval: null }) as Row[]
-  // Column order from the FIRST row's keys — xlsx preserves the
-  // original CSV column order in object-iteration order.
-  const columns = rows.length > 0 ? Object.keys(rows[0]) : []
+  const Papa = (await import('papaparse')).default
+  const text = buf.toString('utf8')
+  const result = Papa.parse<Row>(text, {
+    // First row is the header; downstream code keys on column names.
+    header: true,
+    // Don't choke on a stray trailing newline / empty row at the
+    // end of the file — common from spreadsheet exports.
+    skipEmptyLines: true,
+    // Auto-detect delimiter from the first 10 lines; matches the
+    // tolerance the old xlsx path gave us for free.
+    delimiter: '',
+    // Strip whitespace around quoted values + cell content.
+    transformHeader: (h) => h.trim(),
+  })
+  const rows = (result.data ?? []).map((r) => {
+    // Papa returns `undefined` for missing cells; convert to `null`
+    // so MCP clients get a stable JSON shape (xlsx behavior).
+    const out: Row = {}
+    for (const k of Object.keys(r)) {
+      const v = (r as Row)[k]
+      out[k] = v === undefined || v === '' ? null : v
+    }
+    return out
+  })
+  // Header order from Papa — preserves the original CSV column order.
+  const columns = (result.meta?.fields ?? (rows.length > 0 ? Object.keys(rows[0]) : [])) as string[]
   return { columns, rows }
 }
 

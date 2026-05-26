@@ -91,6 +91,29 @@ export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props)
   const persist = async (next: string[]) => {
     setBusy(true)
     setError(null)
+    // Optimistic local update — the chip list flips immediately
+    // regardless of online state. The server-confirmed list lands
+    // after the network round-trip (or after the offline replay).
+    const previous = local
+    setLocal(next)
+    const queueTags = async () => {
+      // Folder tag flips aren't carried by the sync push schema
+      // yet — fall back to the optimistic-only path and let the
+      // user retry manually when online.
+      if (kind === 'folder') return
+      const { enqueueAndTryDrain } = await import('../lib/sync/helpers')
+      await enqueueAndTryDrain({
+        entityId: path,
+        kind: 'doc.tags',
+        body: { tags: next },
+      })
+      onSaved?.(next)
+    }
+    if (kind !== 'folder' && typeof navigator !== 'undefined' && !navigator.onLine) {
+      await queueTags()
+      setBusy(false)
+      return
+    }
     try {
       const saved =
         kind === 'folder'
@@ -99,7 +122,13 @@ export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props)
       setLocal(saved)
       onSaved?.(saved)
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
+      const { isNetworkError } = await import('../lib/sync/helpers')
+      if (kind !== 'folder' && isNetworkError(e)) {
+        await queueTags()
+      } else {
+        setLocal(previous)
+        setError(e instanceof ApiError ? e.message : String(e))
+      }
     } finally {
       setBusy(false)
     }

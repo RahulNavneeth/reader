@@ -227,10 +227,14 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
       )}
       {expanded && (
         <div>
+          {/* +27 accounts for the chevron (13px) + folder icon (14px)
+              that sibling rows render before their label — without it
+              the "Loading…" / "empty" text reads as flush with where
+              child carets would be, not where child labels start. */}
           {loading && (
             <div
               className="text-[12px] text-subtle px-2 py-1"
-              style={{ paddingLeft: 8 + (depth + 1) * 14 }}
+              style={{ paddingLeft: 8 + (depth + 1) * 14 + 27 }}
             >
               Loading…
             </div>
@@ -238,7 +242,7 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
           {children && children.length === 0 && !loading && (
             <div
               className="text-[12px] text-subtle px-2 py-1 italic"
-              style={{ paddingLeft: 8 + (depth + 1) * 14 }}
+              style={{ paddingLeft: 8 + (depth + 1) * 14 + 27 }}
             >
               empty
             </div>

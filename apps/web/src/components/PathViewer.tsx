@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle, ArrowUp, Pencil } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -33,7 +33,14 @@ import { MetadataPanel } from './MetadataPanel'
 import { ChatDock } from './ChatDock'
 import { SelectionPopover } from './SelectionPopover'
 import { PinButton } from './PinButton'
+import { ArchiveButton } from './ArchiveButton'
+import { SaveAsTemplateButton } from './SaveAsTemplateButton'
+import { RefreshTemplateButton } from './RefreshTemplateButton'
 import { MediaPlayer } from './MediaPlayer'
+import { useReaderEvents } from '../lib/events'
+import { useCrdtBody } from '../lib/crdt/useCrdtBody'
+import { CrdtEditor } from './CrdtEditor'
+import { AwarenessPill } from './AwarenessPill'
 
 type Props = {
   path: string
@@ -56,6 +63,11 @@ export function PathViewer({ path, canEdit = true }: Props) {
   const [copyBusy, setCopyBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
+  // Edit mode: when true, the viewer renders <CrdtEditor> instead
+  // of the read-only markdown render. Local typing flows into the
+  // Y.Text via useCrdtBody.replace, which broadcasts to every
+  // other connected viewer of this docId.
+  const [editing, setEditing] = useState(false)
   const [text, setText] = useState<string | null>(null)
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -106,6 +118,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
   useEffect(() => {
     setDiffTs(null)
     setPreviewMessageId(null)
+    setEditing(false)
     previewCacheRef.current.clear()
   }, [path])
   // PathViewer is no longer keyed on path (so the chat sidebar
@@ -165,7 +178,14 @@ export function PathViewer({ path, canEdit = true }: Props) {
   useEffect(() => {
     if (!meta) return
     if (meta.ingest.embedded) return
-    const terminal = meta.ingest.status === 'failed' || meta.ingest.status === 'no-text'
+    // Any terminal status (incl. `ready` with embedded=false when
+    // the embed backend was down at ingest time) means the
+    // pipeline finished — polling further would spam the server
+    // until the user clicks Re-index manually.
+    const terminal =
+      meta.ingest.status === 'ready' ||
+      meta.ingest.status === 'failed' ||
+      meta.ingest.status === 'no-text'
     if (terminal) return
     let cancelled = false
     const t = setInterval(async () => {
@@ -255,6 +275,60 @@ export function PathViewer({ path, canEdit = true }: Props) {
     }
   }, [path, isMarkdown, isText, isCsv, isJson, isHtml, wantsExtractedText, callerOpts?.owner])
 
+  // Path-scoped SSE refetch: when an MCP tool, chat apply-op, or an external
+  // editor changes *this* file we want the viewer to update without the user
+  // having to re-navigate. We watch for edit/ingest/visibility/tags/archive
+  // events whose path matches the one we're rendering.
+  const wantsBody = isMarkdown || isText || isCsv || isJson || isHtml || wantsExtractedText
+  // Phase 3 CRDT body overlay: open a Y.Doc for markdown files
+  // owned by the viewer. The hook handles the y-websocket
+  // lifecycle + IndexedDB persistence; when the live text differs
+  // from the fetched copy we render the CRDT version so changes
+  // from other devices / agents land without a refetch.
+  // Enable only for markdown docs the viewer owns. Cross-owner
+  // / public viewers stay on the existing HTTP fetch path until
+  // the server route grows non-owner ACL support.
+  const crdtEnabled = isMarkdown && !ownerOpt && !!meta
+  const crdt = useCrdtBody(meta?.id ?? null, crdtEnabled)
+  // Prefer CRDT text once it's available AND synced — otherwise
+  // a brand-new hook hasn't pulled the IDB cache yet and would
+  // briefly overwrite our fetched text with the empty string.
+  const displayText = (() => {
+    if (!crdt) return text
+    if (!crdt.synced && crdt.text === '') return text
+    if (!crdt.text) return text
+    return crdt.text
+  })()
+  const refetchForEvent = useCallback(
+    (e: { type: string; path?: string; status?: string }) => {
+      if (!e.path || e.path !== path) return
+      // Meta always — covers tag/visibility/archive toggles + ingest status.
+      api.fileMeta(path, callerOpts).then((r) => setMeta(r.meta)).catch(() => null)
+      // Any content-changing event also drops a new version row, so kick
+      // DocRail to refetch its versions list. Without this the rail keeps
+      // showing the pre-edit list until manual reload.
+      if (e.type === 'edit' || e.type === 'restore') {
+        setVersionsReloadKey((k) => k + 1)
+      }
+      // Body bytes only on actual content changes. Skip the intermediate
+      // ingest stages (extracting/embedding) so we don't thrash; the final
+      // `ingest:ready` covers slow extractors, and `edit` covers fast MCP
+      // / chat writes (they publish before the ingest pipeline kicks off).
+      if (!wantsBody) return
+      const shouldRefetch =
+        e.type === 'edit' ||
+        e.type === 'restore' ||
+        (e.type === 'ingest' && e.status === 'ready')
+      if (!shouldRefetch) return
+      api
+        .fileText(path, callerOpts)
+        .then((r) => setText(r.content))
+        .catch(() => null)
+    },
+    [path, callerOpts?.owner, wantsBody],
+  )
+  useReaderEvents(refetchForEvent)
+
   const filename = path.split('/').pop() || path
   const parentDir = useMemo(() => {
     const i = path.lastIndexOf('/')
@@ -323,6 +397,19 @@ export function PathViewer({ path, canEdit = true }: Props) {
   const showOutline = isMarkdown
   const hasOutlineList = isMarkdown && headings.length > 1
   const contentRef = useRef<HTMLDivElement>(null)
+  /** Show the floating "back to top" button only after the user has
+   *  scrolled past ~400px. Same threshold the Timeline uses so the
+   *  affordance feels consistent across long-scroll surfaces. */
+  const [showScrollTop, setShowScrollTop] = useState(false)
+  useEffect(() => {
+    const el = contentRef.current
+    if (!el) return
+    const onScroll = () => setShowScrollTop(el.scrollTop > 400)
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+    // Re-bind when the content body or path swaps — the ref points
+    // at a new element across route changes inside the same viewer.
+  }, [text, path])
 
   const jumpTo = (slug: string) => {
     const root = contentRef.current
@@ -342,7 +429,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
           the Share / Private / Tags popovers off below the header.
           `flex-wrap` already handles narrow layouts by wrapping to a
           new row, so horizontal scroll is not needed. */}
-      <header className="min-h-11 px-3 py-1.5 flex items-center gap-2 border-b border-app shrink-0 flex-wrap" style={{ background: 'var(--panel-2)' }}>
+      <header className="min-h-11 px-3 py-1.5 flex items-center gap-2 border-b border-app shrink-0 flex-wrap" style={{ background: 'var(--surface-2)' }}>
         <PathBreadcrumb
           dir={parentDir}
           currentName={filename}
@@ -443,6 +530,44 @@ export function PathViewer({ path, canEdit = true }: Props) {
           </>
         )}
         <PinButton path={path} owner={ownerOpt} isFolder={false} onChanged={refresh} />
+        {!ownerOpt && meta && (
+          <ArchiveButton
+            path={path}
+            meta={meta}
+            onSaved={(next) =>
+              setMeta((cur) =>
+                cur ? { ...cur, archived: next.archived, archivedAt: next.archivedAt ?? null } : cur,
+              )
+            }
+          />
+        )}
+        {!ownerOpt && isMarkdown && meta && (
+          <SaveAsTemplateButton
+            path={path}
+            defaultTitle={meta.title || filename.replace(/\.[^.]+$/, '')}
+          />
+        )}
+        {!ownerOpt && meta?.templateSource && (
+          <RefreshTemplateButton
+            meta={meta}
+            onRefreshed={(next) => setMeta(next)}
+          />
+        )}
+        {/* Live-collab edit toggle. Markdown + own-vault only —
+            the CRDT WS route is owner-gated and other surfaces
+            (PDFs, images, csv) don't have a sensible editor. */}
+        {!ownerOpt && isMarkdown && meta && crdt && (
+          <button
+            className="btn-ghost"
+            onClick={() => setEditing((v) => !v)}
+            title={editing ? 'Done editing' : 'Edit document'}
+            aria-label={editing ? 'Done editing' : 'Edit'}
+            style={editing ? { color: 'var(--accent)', background: 'var(--selected)' } : undefined}
+          >
+            {editing ? <Check size={13} /> : <Pencil size={13} />}
+          </button>
+        )}
+        {crdt?.awareness && <AwarenessPill awareness={crdt.awareness} />}
         {/* Copy the file's actual content to the system clipboard:
             text for markdown/csv/json/txt/html and any file we've
             extracted text for; PNG/JPEG/GIF/WebP go on as image
@@ -561,7 +686,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
 
       <div className="flex-1 overflow-hidden flex">
        <div className="flex-1 relative min-w-0">
-        <div ref={contentRef} className="h-full overflow-y-auto" style={{ background: 'var(--viewer)' }}>
+        <div ref={contentRef} className="h-full overflow-y-auto" style={{ background: 'var(--surface-3)' }}>
         {error && (
           <div className="px-10 py-10 text-muted">
             <div className="flex items-center gap-2 text-fg font-semibold mb-1">
@@ -576,12 +701,12 @@ export function PathViewer({ path, canEdit = true }: Props) {
             src={api.rawUrl(path, callerOpts)}
             title={filename}
             className="w-full h-full border-0"
-            style={{ background: 'var(--viewer)' }}
+            style={{ background: 'var(--surface-3)' }}
           />
         )}
 
         {!error && isImage && (
-          <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--viewer)' }}>
+          <div className="h-full flex items-center justify-center p-6" style={{ background: 'var(--surface-3)' }}>
             <img
               src={needsPreview ? api.previewUrl(path, callerOpts) : api.rawUrl(path, callerOpts)}
               alt={filename}
@@ -669,10 +794,20 @@ export function PathViewer({ path, canEdit = true }: Props) {
               if (m) setMeta(m.meta)
             }}
             onExit={() => setPreviewMessageId(null)}
+            onAllResolved={() => setPreviewMessageId(null)}
           />
         )}
 
-        {!error && isMarkdown && text != null && diffTs === null && previewMessageId === null && (
+        {!error && isMarkdown && text != null && diffTs === null && previewMessageId === null && editing && crdt && (
+          <div className="h-full">
+            <CrdtEditor
+              crdt={crdt}
+              userLabel={meta?.owner ?? null}
+              onExit={() => setEditing(false)}
+            />
+          </div>
+        )}
+        {!error && isMarkdown && text != null && diffTs === null && previewMessageId === null && !editing && (
           <div className="px-10 py-10">
             <article className="md">
               <ReactMarkdown
@@ -743,7 +878,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
                   },
                 }}
               >
-                {text}
+                {displayText}
               </ReactMarkdown>
             </article>
           </div>
@@ -810,25 +945,44 @@ export function PathViewer({ path, canEdit = true }: Props) {
         )}
 
         </div>
-        {/* Floating Chat button — sits in the bottom-right of the doc
-            pane (above the doc, not inside its scroll), opens the
-            sidebar. Hidden when the sidebar is already open OR when
-            the workspace has Reader AI turned off (admin → Ollama →
-            Chat toggle / CHAT_ENABLED=false). */}
-        {chatEnabled && !chatOpen && meta && (
-          <button
-            className="absolute bottom-5 right-5 z-30 h-11 w-11 rounded-full inline-flex items-center justify-center transition-transform hover:scale-105"
-            style={{
-              background: 'var(--accent)',
-              color: 'white',
-              boxShadow: '0 8px 20px rgba(15, 23, 42, 0.18)',
-            }}
-            onClick={() => setChatOpen(true)}
-            title="Ask Reader AI about this document"
-            aria-label="Open Reader AI"
-          >
-            <MessageCircle size={18} />
-          </button>
+        {/* Floating action stack — back-to-top sits above the chat FAB
+            when both are visible, slides into the corner alone when the
+            chat panel is open. Single column so the two affordances
+            never compete for the same visual slot. */}
+        {(showScrollTop || (chatEnabled && !chatOpen && meta)) && (
+          <div className="absolute bottom-5 right-5 z-30 flex flex-col items-end gap-2">
+            {showScrollTop && (
+              <button
+                type="button"
+                onClick={() => contentRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+                className="h-11 w-11 rounded-full shadow-card inline-flex items-center justify-center transition-opacity hover:opacity-90"
+                style={{
+                  background: 'var(--accent)',
+                  color: 'white',
+                  border: '1px solid var(--accent)',
+                }}
+                title="Back to top"
+                aria-label="Back to top"
+              >
+                <ArrowUp size={18} />
+              </button>
+            )}
+            {chatEnabled && !chatOpen && meta && (
+              <button
+                className="h-11 w-11 rounded-full inline-flex items-center justify-center transition-transform hover:scale-105"
+                style={{
+                  background: 'var(--accent)',
+                  color: 'white',
+                  boxShadow: '0 8px 20px rgba(15, 23, 42, 0.18)',
+                }}
+                onClick={() => setChatOpen(true)}
+                title="Ask Reader AI about this document"
+                aria-label="Open Reader AI"
+              >
+                <MessageCircle size={18} />
+              </button>
+            )}
+          </div>
         )}
         {/* Selection-driven "Explain with Reader AI" popover.
             Scoped to the doc content scroller via contentRef so
