@@ -33,7 +33,7 @@ import type { WebSocket } from '@fastify/websocket'
 import * as syncProtocol from 'y-protocols/sync'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
-import { leaseDoc } from '../services/crdtRegistry.js'
+import { leaseDoc, markEntryEditor } from '../services/crdtRegistry.js'
 import { loadMeta, userCanEdit, userCanRead } from '../stores/documents.js'
 import { findShareForPath } from '../stores/userShares.js'
 
@@ -216,6 +216,13 @@ export async function crdtRoutes(app: FastifyInstance) {
             if (encoding.length(replyEncoder) > 1) {
               try { socket.send(encoding.toUint8Array(replyEncoder)) } catch { /* gone */ }
             }
+            // Tag the entry with this user so the eventual
+            // debounced materialise can attribute its `crdt.autosave`
+            // audit row + version snapshot to whoever's typing.
+            // Read-only peers (role === 'r') don't reach this
+            // branch because their update frames were dropped
+            // above.
+            markEntryEditor(docId, user.username)
             // Now broadcast the raw frame to other peers.
             broadcast(docId, new Uint8Array(raw), socket)
           }

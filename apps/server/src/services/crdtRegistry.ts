@@ -68,6 +68,24 @@ type Entry = {
    *  overwrite the just-set fields with the materialise call's
    *  stale meta snapshot. */
   materialisePromise: Promise<void> | null
+  /** Username of the most recent mutator, or null if unknown.
+   *  Set by broadcastEdit (for server-side hand-offs that know
+   *  who) and by markEntryEditor (for raw WebSocket edits from
+   *  CodeMirror — the WS route tags each received update). The
+   *  materialiser reads this to attribute the autosave's snapshot
+   *  + audit entry. Resets are intentionally infrequent: holding
+   *  the last editor's identity across short idle windows
+   *  matches "I edited a minute ago, the doc just got flushed,
+   *  the activity row says it was me." */
+  lastEditor: string | null
+  /** Where the last edit came from. `'route'` means a server-side
+   *  mutator (chat apply-edit, MCP, template instantiate, watcher
+   *  re-broadcast) — those callers emit their own `audit()` entry
+   *  with a specific action, so the materialiser skips a duplicate
+   *  generic `crdt.autosave` row. `'ws'` means raw CodeMirror
+   *  typing through `/ws/crdt`; the materialiser is the only place
+   *  that knows about it, so audit there. */
+  lastEditSource: 'route' | 'ws' | null
 }
 
 const PERSIST_DEBOUNCE_MS = 2_000
@@ -116,8 +134,17 @@ function flush(docId: string, e: Entry): void {
     // call wasn't aware of.
     if (e.locator) {
       const locator = e.locator
+      // Capture the actor + source at schedule time — both fields
+      // could be overwritten by a fresh edit between now and when
+      // the chained materialise actually runs, and we want the
+      // audit / snapshot row to attribute the bytes that triggered
+      // THIS flush.
+      const actor = e.lastEditor
+      const source = e.lastEditSource
       const prev = e.materialisePromise ?? Promise.resolve()
-      e.materialisePromise = prev.then(() => materialise(docId, e.doc, locator))
+      e.materialisePromise = prev.then(() =>
+        materialise(docId, e.doc, locator, actor, source),
+      )
       e.materialisePromise.catch(() => null)
     }
   } catch {
@@ -143,6 +170,8 @@ async function materialise(
   docId: string,
   doc: Y.Doc,
   locator: DocLocator,
+  actor: string | null,
+  source: 'route' | 'ws' | null,
 ): Promise<void> {
   try {
     const body = doc.getText('body').toString()
@@ -168,6 +197,24 @@ async function materialise(
       markCrdtMaterialised(docId, Date.now())
       return
     }
+    // Snapshot the PRE-edit state before we overwrite it so the
+    // Versions panel has an "undo" anchor — but only for WS-direct
+    // typing. Route-layer callers (chat apply-edit, MCP write,
+    // template instantiate) already call snapshotVersion at their
+    // own seam with the right `source` tag; running ours on top
+    // duplicates rows that snapshotVersion's sha-dedupe SOMETIMES
+    // collapses (when both reads see the same disk sha) but can
+    // miss when the route's snapshot lands at the same ms as ours,
+    // overwriting the version dir partway through copyFile and
+    // leaving a row with `hasText: false`.
+    if (source === 'ws') {
+      const { snapshotVersion } = await import('../stores/versions.js')
+      await snapshotVersion(docId, {
+        actor,
+        source: 'crdt',
+        reason: 'autosave',
+      }).catch(() => null)
+    }
     await mkdir(path.dirname(abs), { recursive: true })
     markExpectedWrite(abs, newSha)
     await writeFile(abs, buf)
@@ -183,6 +230,22 @@ async function materialise(
     invalidateSearchCache()
     markCrdtMaterialised(docId, Date.now())
     publish({ type: 'edit', path: locator.storageKey, docId })
+    // Activity log entry — only for WS-direct typing. Route-level
+    // mutators (chat.apply_edit, mcp.upload_text, template.instantiate,
+    // watcher.vault.edit, …) emit their own audit row with a specific
+    // action, so a generic `crdt.autosave` on top would double-log.
+    // The chokidar watcher's `reingestPath` short-circuits when the
+    // on-disk sha matches (we just wrote it ourselves) so there's no
+    // audit gap to worry about from that side either.
+    if (source === 'ws') {
+      const { audit } = await import('../stores/audit.js')
+      await audit({
+        actor: actor ?? 'system',
+        action: 'crdt.autosave',
+        target: locator.storageKey,
+        meta: { docId, bytes: buf.length },
+      }).catch(() => null)
+    }
   } catch {
     /* see flush() — best-effort, retry on next persist. */
   }
@@ -251,6 +314,8 @@ function attach(docId: string, locator?: DocLocator): Entry {
       saveTimer: null,
       locator: locator ?? null,
       materialisePromise: null,
+      lastEditor: null,
+      lastEditSource: null,
     }
     // Async seed-from-disk for first-time CRDT lease against a
     // pre-existing markdown file. Fires the registry's update
@@ -371,8 +436,12 @@ export async function flushDocSync(docId: string): Promise<void> {
     // broadcastEdit's detach-flush) is awaited too. See the
     // matching comment in flush().
     const locator = e.locator
+    const actor = e.lastEditor
+    const source = e.lastEditSource
     const prev = e.materialisePromise ?? Promise.resolve()
-    e.materialisePromise = prev.then(() => materialise(docId, e.doc, locator))
+    e.materialisePromise = prev.then(() =>
+      materialise(docId, e.doc, locator, actor, source),
+    )
     await e.materialisePromise
   }
 }
@@ -403,11 +472,24 @@ export function broadcastEdit(
   locator: DocLocator,
   nextBody: string,
   origin = 'server-mutation',
+  actor: string | null = null,
 ): void {
   const lease = leaseDoc(docId, locator)
   try {
     const ytext = lease.doc.getText('body')
     if (ytext.toString() === nextBody) return
+    // Stash the originating actor on the entry so the materialiser
+    // can attribute its version-snapshot row to the mutation's
+    // owner. Also flag the source as `'route'` so the materialiser
+    // skips its `crdt.autosave` audit — route-level callers
+    // (chat apply-edit, MCP, template instantiate, watcher
+    // re-broadcast) already emit their own audit entries with a
+    // specific action and would double-log if we added one here.
+    const ent = entries.get(docId)
+    if (ent) {
+      if (actor) ent.lastEditor = actor
+      ent.lastEditSource = 'route'
+    }
     lease.doc.transact(() => {
       ytext.delete(0, ytext.length)
       ytext.insert(0, nextBody)
@@ -415,6 +497,19 @@ export function broadcastEdit(
   } finally {
     lease.release()
   }
+}
+
+/** Tag the doc's entry with the user whose WS update just
+ *  arrived. Called by the `/ws/crdt/:docId` route on every
+ *  syncStep2 / update message so the eventual debounced
+ *  materialise knows who to credit for the autosave. No-op
+ *  when the entry has been evicted (e.g. on a stale close
+ *  callback). */
+export function markEntryEditor(docId: string, actor: string): void {
+  const e = entries.get(docId)
+  if (!e) return
+  e.lastEditor = actor
+  e.lastEditSource = 'ws'
 }
 
 /** Test hook: drop every Y.Doc from memory + cancel the

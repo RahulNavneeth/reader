@@ -45,7 +45,7 @@ export async function snapshotVersion(
      *  and leave actor null; in-process callers (apply-edit, MCP
      *  write, etc.) pass their own actor + a source tag. */
     actor?: string | null
-    source?: 'watcher' | 'reader-ai' | 'mcp' | 'manual'
+    source?: 'watcher' | 'reader-ai' | 'mcp' | 'manual' | 'crdt'
     /** Optional cause label folded into audit meta (e.g. the
      *  parent action that prompted the snapshot). */
     reason?: string
