@@ -210,6 +210,15 @@ async function maybeSeedFromDisk(
     const buf = await readFile(abs)
     const content = buf.toString('utf8')
     if (!content) return
+    // Re-check ytext under the transaction guard: another caller
+    // (e.g. a synchronous broadcastEdit() fired right after the
+    // attach() that scheduled us) may have populated ytext while
+    // our readFile was in-flight. If we insert STALE disk content
+    // on top of that, the seed prepends pre-edit bytes ahead of
+    // the new bytes — and the next materialise then writes that
+    // mixed body straight back to disk. Caught by the chat
+    // apply-edit rewrite_file integration test on faster CI I/O.
+    if (ytext.length > 0) return
     // Single transaction so the seed is one CRDT op (not N
     // per-char ops) — keeps the state vector small.
     doc.transact(() => {
