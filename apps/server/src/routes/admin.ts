@@ -1037,4 +1037,5 @@ export async function adminRoutes(app: FastifyInstance) {
       return reply.code(409).send({ error: e?.message ?? String(e) })
     }
   })
+
 }

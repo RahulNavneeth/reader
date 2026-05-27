@@ -14,6 +14,11 @@ import { nanoid } from 'nanoid'
 import type { DocumentMeta } from '../types.js'
 import { applyTemplate, applyTemplateAsync } from '../services/templateEngine.js'
 import {
+  applyVarDefaults,
+  missingRequiredVars,
+  parseTemplateSource,
+} from '../services/templateMetadata.js'
+import {
   makeVaultIncludeResolver,
   makeUrlFetchResolver,
 } from '../services/templateResolvers.js'
@@ -155,6 +160,16 @@ export async function templatesRoutes(app: FastifyInstance) {
       bytes: number
       updatedAt: number
       preview: string
+      vars: Array<{
+        name: string
+        label?: string
+        help?: string
+        type?: 'text' | 'textarea' | 'select' | 'checkbox' | 'number' | 'date'
+        default?: string
+        options?: string[]
+        required?: boolean
+      }>
+      schedule?: string
     }> = []
     for (const e of entries) {
       if (!e.isFile()) continue
@@ -168,10 +183,17 @@ export async function templatesRoutes(app: FastifyInstance) {
       }
       // 4 KB preview — enough to show the user what's in the
       // template without loading the full body for a list view.
+      // Frontmatter is stripped so the preview reflects what the
+      // engine will render, not the YAML metadata header.
       let preview = ''
+      let vars: typeof templates[number]['vars'] = []
+      let schedule: string | undefined
       try {
         const head = await readFile(abs, { encoding: 'utf8' })
-        preview = head.slice(0, 4096)
+        const { metadata, body } = parseTemplateSource(head)
+        preview = body.slice(0, 4096)
+        vars = metadata.vars
+        schedule = metadata.schedule
       } catch {/* skip on read error */}
       templates.push({
         path: `${TEMPLATES_DIR}/${e.name}`,
@@ -180,6 +202,8 @@ export async function templatesRoutes(app: FastifyInstance) {
         bytes: s.size,
         updatedAt: s.mtimeMs,
         preview,
+        vars,
+        schedule,
       })
     }
     templates.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
@@ -275,10 +299,22 @@ export async function templatesRoutes(app: FastifyInstance) {
       user: user.username,
       targetRel,
     })
-    const vars = { ...builtins, ...(body.vars ?? {}) }
+    // Strip + parse frontmatter so the declared vars schema can
+    // contribute defaults and a `required` gate, and so the YAML
+    // metadata itself doesn't end up in the rendered doc.
+    const { metadata, body: tplBody } = parseTemplateSource(tplBuf.toString('utf8'))
+    const callerVars = body.vars ?? {}
+    const withDefaults = applyVarDefaults(metadata, callerVars)
+    const vars = { ...builtins, ...withDefaults }
+    const missing = missingRequiredVars(metadata, vars)
+    if (missing.length > 0) {
+      return reply.code(400).send({
+        error: `template: missing required var(s): ${missing.join(', ')}`,
+      })
+    }
     let content: string
     try {
-      content = await applyTemplateAsync(tplBuf.toString('utf8'), vars, {
+      content = await applyTemplateAsync(tplBody, vars, {
         loadInclude: makeVaultIncludeResolver(user.username),
         loadFetch: makeUrlFetchResolver(),
       })
@@ -473,10 +509,20 @@ export async function templatesRoutes(app: FastifyInstance) {
       user: user.username,
       targetRel: meta.storageKey,
     })
-    const vars = { ...builtins, ...src.vars }
+    const { metadata: refreshMeta, body: tplBody } = parseTemplateSource(
+      tplBuf.toString('utf8'),
+    )
+    const withDefaults = applyVarDefaults(refreshMeta, src.vars)
+    const vars = { ...builtins, ...withDefaults }
+    const missing = missingRequiredVars(refreshMeta, vars)
+    if (missing.length > 0) {
+      return reply.code(400).send({
+        error: `template: missing required var(s): ${missing.join(', ')}`,
+      })
+    }
     let content: string
     try {
-      content = await applyTemplateAsync(tplBuf.toString('utf8'), vars, {
+      content = await applyTemplateAsync(tplBody, vars, {
         loadInclude: makeVaultIncludeResolver(meta.owner),
         loadFetch: makeUrlFetchResolver(),
       })

@@ -12,6 +12,7 @@ import {
   KeyRound,
   Send,
   Plug,
+  CalendarClock,
   Download,
   RefreshCw,
   Check,
@@ -172,6 +173,16 @@ export function UserMenu({ user, onLogout }: Props) {
           >
             <Plug size={13} className="text-muted" />
             Connected apps
+          </button>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors"
+            onClick={() => {
+              setOpen(false)
+              navigate('/account/scheduled-templates')
+            }}
+          >
+            <CalendarClock size={13} className="text-muted" />
+            Scheduled templates
           </button>
           <a
             href={api.exportUrl()}

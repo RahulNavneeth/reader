@@ -347,6 +347,24 @@ export const api = {
     get<{ meta: DocumentMeta | null }>(
       `/api/file/meta${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
     ),
+  /** Validate a markdown file's YAML frontmatter from disk. Used
+   *  by surfaces that enumerate many templates at once. */
+  fileFrontmatter: (rel: string, opts?: { password?: string; owner?: string }) =>
+    get<
+      | { ok: true; yaml: string | null }
+      | { ok: false; yaml: string | null; error: string }
+    >(
+      `/api/file/frontmatter${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
+    ),
+  /** Validate a raw YAML string directly. The chip in the doc
+   *  viewer uses this on every edit so errors surface live, not
+   *  after the next materialiser flush + refetch (would be ~2s
+   *  late and very confusing). */
+  validateFrontmatter: (yaml: string) =>
+    post<{ ok: true } | { ok: false; error: string }>(
+      '/api/file/frontmatter/validate',
+      { yaml },
+    ),
   /** Bytes URL for a file. Bare path so users see a clean URL in the
    *  address bar (no `?path=…` exposing /api/file/raw); the backend's
    *  setNotFoundHandler picks it up and runs the same access checks
@@ -571,6 +589,16 @@ export const api = {
         bytes: number
         updatedAt: number
         preview: string
+        vars: {
+          name: string
+          label?: string
+          help?: string
+          type?: 'text' | 'textarea' | 'select' | 'checkbox' | 'number' | 'date'
+          default?: string
+          options?: string[]
+          required?: boolean
+        }[]
+        schedule?: string
       }[]
     }>('/api/templates'),
   instantiateTemplate: (b: {
@@ -593,6 +621,30 @@ export const api = {
     }>('/api/templates/save-as', b),
   refreshTemplate: (id: string) =>
     post<{ ok: true; document: DocumentMeta }>('/api/templates/refresh', { id }),
+  // Per-user variant — scoped to the caller's username
+  // so non-admins can author + manage their own scheduled templates.
+  accountScheduledTemplates: () =>
+    get<{
+      items: {
+        owner: string
+        template: string
+        cron: string
+        label?: string
+        nextFireAt: number | null
+        lastFiredAt: number | null
+        lastSuccessAt: number | null
+        lastError: string | null
+        lastTarget: string | null
+        vars: Record<string, string>
+        pathPreview: string
+      }[]
+      errors: { owner: string; template: string; error: string }[]
+    }>('/api/account/scheduled-templates'),
+  accountRunScheduledTemplate: (template: string, cron?: string) =>
+    post<{ ok: true; targetRel: string }>(
+      '/api/account/scheduled-templates/run-now',
+      { template, cron },
+    ),
 
   // calendar heatmap
   accountCalendar: (from?: string, to?: string) => {

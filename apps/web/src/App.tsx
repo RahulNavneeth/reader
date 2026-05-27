@@ -8,6 +8,7 @@ import { UserMenu } from './components/UserMenu'
 import { VaultView } from './components/VaultView'
 import { AdminPanel } from './components/AdminPanel'
 import { AccountTokensPage } from './components/AccountTokensPage'
+import { AccountScheduledTemplatesPage } from './components/AccountScheduledTemplatesPage'
 import { AccountWebhooksPage } from './components/AccountWebhooksPage'
 import { OAuthConsentPage } from './components/OAuthConsentPage'
 import { AccountConnectedAppsPage } from './components/AccountConnectedAppsPage'
@@ -495,6 +496,10 @@ export default function App() {
           <Route path="/" element={<VaultView />} />
           <Route path="/tags/:tag" element={<VaultView />} />
           <Route path="/account/tokens" element={<AccountTokensPage />} />
+          <Route
+            path="/account/scheduled-templates"
+            element={<AccountScheduledTemplatesPage />}
+          />
           <Route path="/account/webhooks" element={<AccountWebhooksPage />} />
           <Route path="/account/connected-apps" element={<AccountConnectedAppsPage />} />
           <Route path="/oauth/consent" element={<OAuthConsentPage onAuthed={(user) => onAuthed(user)} />} />

@@ -35,6 +35,42 @@ describe('templateEngine', () => {
     expect(applyTemplate('{{#if !x}}absent{{/if}}', { x: 'y' })).toBe('')
   })
 
+  it('evaluates {{#if name == "value"}} for equality', () => {
+    const src = '{{#if type == "Upper Body"}}upper{{else}}other{{/if}}'
+    expect(applyTemplate(src, { type: 'Upper Body' })).toBe('upper')
+    expect(applyTemplate(src, { type: 'Lower Body' })).toBe('other')
+    expect(applyTemplate(src, { type: '' })).toBe('other')
+    expect(applyTemplate(src, {})).toBe('other')
+  })
+
+  it('evaluates {{#if name != "value"}} for inequality', () => {
+    const src = '{{#if type != "Upper Body"}}not-upper{{/if}}'
+    expect(applyTemplate(src, { type: 'Lower Body' })).toBe('not-upper')
+    expect(applyTemplate(src, { type: 'Upper Body' })).toBe('')
+  })
+
+  it('accepts single quotes around the equality literal', () => {
+    expect(
+      applyTemplate(`{{#if t == 'a'}}A{{else}}B{{/if}}`, { t: 'a' }),
+    ).toBe('A')
+  })
+
+  it('trims the var before equality comparison (but not the literal)', () => {
+    // The author wrote the literal — we honour their spaces.
+    expect(
+      applyTemplate('{{#if t == "x"}}match{{/if}}', { t: '  x  ' }),
+    ).toBe('match')
+    expect(
+      applyTemplate('{{#if t == " x "}}match{{/if}}', { t: 'x' }),
+    ).toBe('')
+  })
+
+  it('treats == comparison as case-sensitive', () => {
+    const src = '{{#if t == "yes"}}y{{else}}n{{/if}}'
+    expect(applyTemplate(src, { t: 'yes' })).toBe('y')
+    expect(applyTemplate(src, { t: 'YES' })).toBe('n')
+  })
+
   it('iterates a comma-separated list with {{this}}', () => {
     expect(applyTemplate('{{#each items}}- {{this}}\n{{/each}}', { items: 'a, b, c' })).toBe(
       '- a\n- b\n- c\n',

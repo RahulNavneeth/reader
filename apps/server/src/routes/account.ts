@@ -579,4 +579,43 @@ export async function accountRoutes(app: FastifyInstance) {
     })
     return r
   })
+
+  // ── Scheduled templates (per-user view) ─────────────────────────
+  // Mirrors the admin endpoint but scopes to the caller's own
+  // templates. Users author + manage their templates without
+  // depending on an admin to surface schedule state.
+  app.get('/api/account/scheduled-templates', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const { listScheduledTemplates } = await import(
+      '../services/templateScheduler.js'
+    )
+    return await listScheduledTemplates(req.currentUser.username)
+  })
+
+  app.post<{ Body: { template?: string; cron?: string } }>(
+    '/api/account/scheduled-templates/run-now',
+    async (req, reply) => {
+      if (!req.currentUser) {
+        return reply.code(401).send({ error: 'auth required' })
+      }
+      const body = req.body ?? {}
+      const template = String(body.template ?? '').trim()
+      const cron = body.cron ? String(body.cron).trim() : undefined
+      if (!template) return reply.code(400).send({ error: 'template required' })
+      const { runScheduledTemplateNow } = await import(
+        '../services/templateScheduler.js'
+      )
+      try {
+        const r = await runScheduledTemplateNow(
+          req.currentUser.username,
+          template,
+          req.server.log,
+          cron,
+        )
+        return { ok: true, ...r }
+      } catch (e: any) {
+        return reply.code(409).send({ error: e?.message ?? String(e) })
+      }
+    },
+  )
 }

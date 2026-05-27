@@ -5,16 +5,22 @@
  *   {{ var }}                        — flat substitution; unknown names left literal
  *   {{#if name}} … {{/if}}           — render when vars[name] is truthy
  *   {{#if !name}} … {{/if}}          — render when vars[name] is falsy
+ *   {{#if name == "value"}} …        — render when vars[name] equals "value"
+ *   {{#if name != "value"}} …        — render when vars[name] does NOT equal "value"
  *   {{#if name}} … {{else}} … {{/if}}
  *   {{#each list}} … {{/each}}       — iterate a comma-or-newline-separated string
  *     • {{this}}   — current item value (trimmed)
  *     • {{@index}} — 0-based loop counter
  *     • {{@index1}} — 1-based loop counter
  *
- * Truthiness rule for `#if`: present + non-empty, AND not in
+ * Truthiness rule for `#if name`: present + non-empty, AND not in
  * { '0', 'false', 'no', 'off' } (case-insensitive). Matches what
  * a non-technical author intuitively expects from a checkbox-ish
  * placeholder.
+ *
+ * Equality rule for `#if name == "value"`: trimmed exact string
+ * match, case-sensitive (the author wrote the literal, so we don't
+ * second-guess casing). Single quotes are accepted too.
  *
  * Vars stay `Record<string, string>` — the engine never accepts a
  * nested object — so the substitution surface area for an MCP /
@@ -26,10 +32,16 @@ export type Vars = Record<string, string>
 
 type Token = { kind: 'text'; value: string } | { kind: 'tag'; body: string }
 
+/** Discriminated condition for `{{#if …}}`. The parser emits one of
+ *  these so the renderer evaluates without re-parsing. */
+type IfCond =
+  | { kind: 'truthy'; name: string; negate: boolean }
+  | { kind: 'eq'; name: string; value: string; negate: boolean }
+
 type Node =
   | { type: 'text'; value: string }
   | { type: 'var'; name: string }
-  | { type: 'if'; name: string; negate: boolean; then: Node[]; else: Node[] }
+  | { type: 'if'; cond: IfCond; then: Node[]; else: Node[] }
   | { type: 'each'; name: string; body: Node[] }
   | { type: 'include'; path: string; section?: string }
   | { type: 'fetch'; url: string }
@@ -71,12 +83,7 @@ function parseBlock(
     }
     const ifMatch = body.match(/^#if\s+(.+)$/)
     if (ifMatch) {
-      let cond = ifMatch[1].trim()
-      let negate = false
-      if (cond.startsWith('!')) {
-        negate = true
-        cond = cond.slice(1).trim()
-      }
+      const cond = parseIfCondition(ifMatch[1].trim())
       const first = parseBlock(tokens, i + 1)
       let thenNodes = first.nodes
       let elseNodes: Node[] = []
@@ -89,7 +96,7 @@ function parseBlock(
       } else if (first.closer !== '/if') {
         throw new Error('Unterminated {{#if}} block')
       }
-      nodes.push({ type: 'if', name: cond, negate, then: thenNodes, else: elseNodes })
+      nodes.push({ type: 'if', cond, then: thenNodes, else: elseNodes })
       i = after + 1
       continue
     }
@@ -148,6 +155,47 @@ function parseBlock(
   return { nodes, end: i, closer: null }
 }
 
+/** Parse the part of `{{#if …}}` between `#if` and `}}`.
+ *
+ *   name             → { kind: 'truthy', name, negate: false }
+ *   !name            → { kind: 'truthy', name, negate: true }
+ *   name == "value"  → { kind: 'eq',     name, value, negate: false }
+ *   name != "value"  → { kind: 'eq',     name, value, negate: true }
+ *
+ * Quotes can be `"` or `'`. The name must be a plain identifier so
+ * a typo'd template still produces a clear parse error rather than
+ * a silently-mis-evaluated condition. */
+function parseIfCondition(raw: string): IfCond {
+  // Equality / inequality. Done first so `name == "value"` doesn't
+  // get mis-parsed as the truthy form for a name like `name == …`.
+  const eqMatch = raw.match(
+    /^([a-zA-Z0-9_-]+)\s*(==|!=)\s*(?:"([^"]*)"|'([^']*)')\s*$/,
+  )
+  if (eqMatch) {
+    const name = eqMatch[1]
+    const value = eqMatch[3] ?? eqMatch[4] ?? ''
+    return { kind: 'eq', name, value, negate: eqMatch[2] === '!=' }
+  }
+  // Truthy + leading-! negation. Fallback path.
+  let name = raw
+  let negate = false
+  if (name.startsWith('!')) {
+    negate = true
+    name = name.slice(1).trim()
+  }
+  return { kind: 'truthy', name, negate }
+}
+
+function evalIf(cond: IfCond, vars: Vars): boolean {
+  if (cond.kind === 'eq') {
+    const actual = (vars[cond.name] ?? '').trim()
+    const matched = actual === cond.value
+    return cond.negate ? !matched : matched
+  }
+  const truthy = isTruthy(vars[cond.name])
+  return cond.negate ? !truthy : truthy
+}
+
 function isTruthy(v: string | undefined): boolean {
   if (v == null) return false
   const s = String(v).trim()
@@ -181,9 +229,7 @@ function render(nodes: Node[], vars: Vars): string {
         out += `{{${n.name}}}`
       }
     } else if (n.type === 'if') {
-      const truthy = isTruthy(vars[n.name])
-      const take = n.negate ? !truthy : truthy
-      out += render(take ? n.then : n.else, vars)
+      out += render(evalIf(n.cond, vars) ? n.then : n.else, vars)
     } else if (n.type === 'each') {
       const items = splitList(vars[n.name])
       items.forEach((item, idx) => {

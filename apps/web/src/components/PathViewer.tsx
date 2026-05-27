@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle, ArrowUp, Pencil } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle, ArrowUp, Pencil, Braces } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -50,6 +50,55 @@ type Props = {
   canEdit?: boolean
 }
 
+/** Split a markdown source on its leading YAML frontmatter block.
+ *  Returns `{ yaml, body }` where yaml is the raw YAML text (without
+ *  the `---` fences) or null when no block is present. We don't
+ *  parse the YAML — the doc viewer only needs the raw string to
+ *  render in the info chip, and only needs the body to render the
+ *  markdown. The closer must sit on its own line so a literal
+ *  `---` somewhere mid-doc isn't mis-detected as a closer. */
+function splitFrontmatter(src: string): { yaml: string | null; body: string } {
+  // BOM tolerance — some editors prepend U+FEFF.
+  const trimmed = src.startsWith('﻿') ? src.slice(1) : src
+  const openMatch = trimmed.match(/^---\s*\r?\n/)
+  if (!openMatch) return { yaml: null, body: src }
+  const after = trimmed.slice(openMatch[0].length)
+  const closer = after.match(/\r?\n---\s*(\r?\n|$)/)
+  if (!closer) return { yaml: null, body: src }
+  const yaml = after.slice(0, closer.index!)
+  const body = after.slice(closer.index! + closer[0].length)
+  return { yaml, body }
+}
+
+/** Compact one-line summary of frontmatter YAML for the info chip.
+ *  Counts top-level recognised keys (vars, schedules / schedule)
+ *  with a regex scan so we don't pull in a YAML parser on the
+ *  client. Falls back to "Frontmatter" when nothing recognisable
+ *  shows up. */
+function summariseFrontmatter(yaml: string): string {
+  const bits: string[] = []
+  // `vars:` followed by indented `- name:` entries. Count the
+  // entries so the chip reads "3 vars" not "vars: present".
+  const varsHeader = yaml.match(/^vars:\s*$/m)
+  if (varsHeader) {
+    const after = yaml.slice(varsHeader.index! + varsHeader[0].length)
+    const varCount = (after.match(/^\s+-\s+name:/gm) ?? []).length
+    if (varCount > 0) bits.push(`${varCount} var${varCount === 1 ? '' : 's'}`)
+  }
+  // `schedules:` array. Same shape.
+  const schedHeader = yaml.match(/^schedules:\s*$/m)
+  if (schedHeader) {
+    const after = yaml.slice(schedHeader.index! + schedHeader[0].length)
+    const count = (after.match(/^\s+-\s+cron:/gm) ?? []).length
+    if (count > 0) bits.push(`${count} schedule${count === 1 ? '' : 's'}`)
+  }
+  // Legacy single `schedule: "..."` line.
+  if (/^schedule:\s*['"]?\S/m.test(yaml) && !schedHeader) {
+    bits.push('1 schedule')
+  }
+  return bits.length > 0 ? bits.join(' · ') : 'Frontmatter'
+}
+
 export function PathViewer({ path, canEdit = true }: Props) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
@@ -68,6 +117,8 @@ export function PathViewer({ path, canEdit = true }: Props) {
   // Y.Text via useCrdtBody.replace, which broadcasts to every
   // other connected viewer of this docId.
   const [editing, setEditing] = useState(false)
+  const [frontmatterOpen, setFrontmatterOpen] = useState(false)
+  const [frontmatterError, setFrontmatterError] = useState<string | null>(null)
   const [text, setText] = useState<string | null>(null)
   const [meta, setMeta] = useState<DocumentMeta | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -299,6 +350,43 @@ export function PathViewer({ path, canEdit = true }: Props) {
     if (!crdt.text) return text
     return crdt.text
   })()
+  // Split off any leading YAML frontmatter — `---` … `---` at the
+  // top of a markdown file is metadata for the template engine /
+  // scheduler, not body content. Without this it renders as a
+  // literal bullet list under a horizontal rule. We hold onto the
+  // raw YAML so the info chip above the body can show a compact
+  // summary + expand-to-view. The edit surface (CodeMirror) still
+  // sees the raw text so the author can edit the metadata.
+  const { frontmatter, renderedText } = (() => {
+    if (!displayText) return { frontmatter: null as string | null, renderedText: displayText }
+    const { yaml, body } = splitFrontmatter(displayText)
+    return { frontmatter: yaml, renderedText: body }
+  })()
+  // Validate the YAML server-side whenever the frontmatter block
+  // changes. We send the CURRENT in-memory YAML (not the path) so
+  // a live edit in CodeMirror updates the chip immediately, not
+  // ~2s later after the materialiser writes + we refetch the disk
+  // copy. Uses the same strict parser as the scheduler so the
+  // error message here matches what the scheduler would log.
+  useEffect(() => {
+    if (!frontmatter) {
+      setFrontmatterError(null)
+      return
+    }
+    let cancelled = false
+    api
+      .validateFrontmatter(frontmatter)
+      .then((r) => {
+        if (cancelled) return
+        setFrontmatterError(r.ok ? null : r.error)
+      })
+      .catch(() => {
+        if (!cancelled) setFrontmatterError(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [frontmatter])
   const refetchForEvent = useCallback(
     (e: { type: string; path?: string; status?: string }) => {
       if (!e.path || e.path !== path) return
@@ -809,6 +897,73 @@ export function PathViewer({ path, canEdit = true }: Props) {
         )}
         {!error && isMarkdown && text != null && diffTs === null && previewMessageId === null && !editing && (
           <div className="px-10 py-10">
+            {frontmatter && (
+              <div className="mb-6">
+                <button
+                  type="button"
+                  onClick={() => setFrontmatterOpen((v) => !v)}
+                  className="w-full rounded-md px-3 py-2 flex items-center gap-2 text-left transition-colors hover:bg-[var(--hover)]"
+                  style={{
+                    background: frontmatterError ? 'var(--danger-bg)' : 'var(--viewer)',
+                    border: `1px solid ${
+                      frontmatterError
+                        ? 'color-mix(in srgb, var(--danger-fg) 35%, transparent)'
+                        : 'var(--border)'
+                    }`,
+                  }}
+                  title={frontmatterOpen ? 'Hide frontmatter' : 'Show frontmatter'}
+                >
+                  {frontmatterError ? (
+                    <AlertCircle
+                      size={12}
+                      className="shrink-0"
+                      style={{ color: 'var(--danger-fg)' }}
+                    />
+                  ) : (
+                    <Braces size={12} className="text-subtle shrink-0" />
+                  )}
+                  <span
+                    className="text-[12.5px] font-semibold"
+                    style={{
+                      color: frontmatterError ? 'var(--danger-fg)' : 'var(--fg)',
+                    }}
+                  >
+                    Frontmatter
+                  </span>
+                  <span className="opacity-60 text-subtle">·</span>
+                  <span
+                    className="text-[12px] flex-1 truncate"
+                    style={{
+                      color: frontmatterError ? 'var(--danger-fg)' : 'var(--fg-subtle)',
+                    }}
+                  >
+                    {frontmatterError
+                      ? `invalid YAML — ${frontmatterError}`
+                      : summariseFrontmatter(frontmatter)}
+                  </span>
+                  <span
+                    className="text-[11.5px] shrink-0"
+                    style={{
+                      color: frontmatterError ? 'var(--danger-fg)' : 'var(--fg-subtle)',
+                    }}
+                  >
+                    {frontmatterOpen ? 'Hide' : 'Show'}
+                  </span>
+                </button>
+                {frontmatterOpen && (
+                  <pre
+                    className="mt-2 rounded-md px-3 py-2 text-[12px] whitespace-pre-wrap break-words"
+                    style={{
+                      background: 'var(--viewer)',
+                      border: '1px solid var(--border)',
+                      color: 'var(--fg-subtle)',
+                    }}
+                  >
+                    {frontmatter}
+                  </pre>
+                )}
+              </div>
+            )}
             <article className="md">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
@@ -878,7 +1033,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
                   },
                 }}
               >
-                {displayText}
+                {renderedText}
               </ReactMarkdown>
             </article>
           </div>

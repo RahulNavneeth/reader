@@ -5,6 +5,16 @@ import { ApiError, api } from '../lib/api'
 import { useNavigate } from 'react-router-dom'
 import { useVault } from '../lib/vault-context'
 
+type TemplateVarDecl = {
+  name: string
+  label?: string
+  help?: string
+  type?: 'text' | 'textarea' | 'select' | 'checkbox' | 'number' | 'date'
+  default?: string
+  options?: string[]
+  required?: boolean
+}
+
 type Template = {
   path: string
   name: string
@@ -12,6 +22,8 @@ type Template = {
   bytes: number
   updatedAt: number
   preview: string
+  vars: TemplateVarDecl[]
+  schedule?: string
 }
 
 /** Built-in placeholders the server auto-fills. Must stay in
@@ -512,10 +524,15 @@ export function TemplatesButton({
       setTitle(picked.title)
       setPathTracksName(true)
     }
-    // Extract `{{custom}}` placeholders from BOTH the body preview
-    // and the template's filename, so a slot referenced only in the
-    // filename (like {{author}}) still gets an input on the
-    // confirm screen.
+    // Build the vars object. The DECLARED schema (frontmatter
+    // `vars:`) takes priority — those vars get typed inputs with
+    // labels, defaults, and required gating. We still scan the
+    // body + filename for `{{slot}}` patterns and add any that
+    // weren't declared, so a template author who hasn't bothered
+    // to write a schema yet still gets text-input fallbacks.
+    const declared = new Map<string, TemplateVarDecl>()
+    for (const decl of picked.vars) declared.set(decl.name, decl)
+
     const found = new Set<string>()
     const re = /\{\{\s*([a-zA-Z0-9_-]+)\s*\}\}/g
     for (const src of [picked.preview, picked.name]) {
@@ -525,8 +542,20 @@ export function TemplatesButton({
         if (!BUILTINS.has(m[1])) found.add(m[1])
       }
     }
+
     const nextVars: Record<string, string> = {}
-    for (const k of found) nextVars[k] = ''
+    // Declared vars first, so the dialog renders them in author-
+    // specified order. Defaults pre-fill so the user can submit
+    // immediately when the template is happy with its defaults.
+    for (const decl of picked.vars) {
+      nextVars[decl.name] = decl.default ?? ''
+    }
+    // Add any auto-detected slots that weren't declared (lazy
+    // template — schema not yet written). Empty value so the user
+    // sees an empty field they need to fill.
+    for (const k of found) {
+      if (!declared.has(k)) nextVars[k] = ''
+    }
     setVars(nextVars)
     setTimeout(() => inputRef.current?.focus(), 30)
   }, [picked, currentDir])
@@ -536,6 +565,17 @@ export function TemplatesButton({
     const t = target.trim()
     if (!t) {
       setSubmitErr('Target path is required.')
+      return
+    }
+    // Client-side required-var gate so the user sees a clean error
+    // here instead of a 400 from the server. The server still
+    // re-checks — this is a UX shortcut, not a security boundary.
+    const missing = picked.vars
+      .filter((d) => d.required)
+      .filter((d) => (vars[d.name] ?? '').trim() === '')
+      .map((d) => d.label ?? humanizeSlotName(d.name))
+    if (missing.length > 0) {
+      setSubmitErr(`Fill in: ${missing.join(', ')}`)
       return
     }
     setSubmitting(true)
@@ -793,19 +833,127 @@ export function TemplatesButton({
                     <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
                       Fields
                     </div>
-                    <div className="space-y-2">
+                    <div className="space-y-3">
                       {Object.keys(vars).map((k) => {
-                        const label = humanizeSlotName(k)
+                        // Match declared schema (if any) by name —
+                        // gives this field its widget type, label,
+                        // options, required flag. Auto-detected
+                        // slots fall through to the plain text path.
+                        const decl = picked.vars.find((d) => d.name === k)
+                        const label = decl?.label ?? humanizeSlotName(k)
+                        const required = decl?.required ?? false
+                        const help = decl?.help
+                        const value = vars[k]
+                        const setValue = (v: string) =>
+                          setVars((cur) => ({ ...cur, [k]: v }))
+                        const labelEl = (
+                          <div className="flex items-center gap-1 text-[11.5px] mb-1">
+                            <span style={{ color: 'var(--fg-subtle)' }}>{label}</span>
+                            {required && (
+                              <span
+                                title="required"
+                                style={{ color: '#BF2600' }}
+                                aria-label="required"
+                              >
+                                *
+                              </span>
+                            )}
+                          </div>
+                        )
+                        const helpEl = help ? (
+                          <div
+                            className="text-[10.5px] mt-1"
+                            style={{ color: 'var(--fg-subtle)' }}
+                          >
+                            {help}
+                          </div>
+                        ) : null
+                        if (decl?.type === 'select' && decl.options?.length) {
+                          return (
+                            <div key={k}>
+                              {labelEl}
+                              <select
+                                className="input h-8 text-[13px]"
+                                value={value}
+                                onChange={(e) => setValue(e.target.value)}
+                              >
+                                {!required && <option value="">—</option>}
+                                {decl.options.map((opt) => (
+                                  <option key={opt} value={opt}>
+                                    {opt}
+                                  </option>
+                                ))}
+                              </select>
+                              {helpEl}
+                            </div>
+                          )
+                        }
+                        if (decl?.type === 'checkbox') {
+                          // Encode as "true"/"" so the engine's
+                          // truthy check stays consistent with what
+                          // an agent caller would pass.
+                          const checked = value.trim().toLowerCase() === 'true'
+                          return (
+                            <label
+                              key={k}
+                              className="flex items-center gap-2 text-[13px]"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) =>
+                                  setValue(e.target.checked ? 'true' : '')
+                                }
+                              />
+                              <span style={{ color: 'var(--fg)' }}>{label}</span>
+                              {required && (
+                                <span style={{ color: '#BF2600' }} aria-label="required">
+                                  *
+                                </span>
+                              )}
+                              {help && (
+                                <span
+                                  className="text-[10.5px] ml-auto"
+                                  style={{ color: 'var(--fg-subtle)' }}
+                                >
+                                  {help}
+                                </span>
+                              )}
+                            </label>
+                          )
+                        }
+                        if (decl?.type === 'textarea') {
+                          return (
+                            <div key={k}>
+                              {labelEl}
+                              <textarea
+                                className="input text-[13px] min-h-[72px]"
+                                value={value}
+                                onChange={(e) => setValue(e.target.value)}
+                                placeholder={label}
+                              />
+                              {helpEl}
+                            </div>
+                          )
+                        }
+                        const htmlType: 'text' | 'number' | 'date' =
+                          decl?.type === 'number'
+                            ? 'number'
+                            : decl?.type === 'date'
+                              ? 'date'
+                              : 'text'
                         return (
-                          <input
-                            key={k}
-                            className="input h-8 text-[13px]"
-                            value={vars[k]}
-                            onChange={(e) =>
-                              setVars((cur) => ({ ...cur, [k]: e.target.value }))
-                            }
-                            placeholder={label}
-                          />
+                          <div key={k}>
+                            {labelEl}
+                            <input
+                              type={htmlType}
+                              className="input h-8 text-[13px]"
+                              value={value}
+                              onChange={(e) => setValue(e.target.value)}
+                              placeholder={label}
+                            />
+                            {helpEl}
+                          </div>
                         )
                       })}
                     </div>
@@ -813,7 +961,12 @@ export function TemplatesButton({
                 )}
                 <div
                   className="flex items-center gap-2 px-4 py-3"
-                  style={{ borderTop: '1px solid var(--border)', background: 'var(--panel-2)' }}
+                  // The preceding section (SAVE AS or FIELDS) always
+                  // ends with its own `border-b`, so we don't add a
+                  // matching `borderTop` here — would stack into a
+                  // visible double line. The panel-2 background is
+                  // enough on its own to distinguish the action row.
+                  style={{ background: 'var(--panel-2)' }}
                 >
                   <div
                     className="flex-1 text-[11.5px]"

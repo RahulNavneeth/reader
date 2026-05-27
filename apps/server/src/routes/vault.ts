@@ -2757,6 +2757,92 @@ export async function vaultRoutes(app: FastifyInstance) {
     return { meta: stub }
   })
 
+  // Validate a YAML frontmatter string directly. Used by the chip
+  // in the doc viewer to validate the CURRENT in-memory edit
+  // buffer — the GET-by-path variant below reads disk and would
+  // lag behind a CRDT edit until the materialiser flushes (~2s
+  // debounce), which means a typo "feels saved but no error" for
+  // a few seconds. Sending the YAML in the body short-circuits
+  // that race: we validate exactly what the user is looking at.
+  //
+  // Auth required (session or token) so anonymous callers can't
+  // ping the parser, but no per-file ACL — the caller already
+  // has the YAML in hand.
+  app.post<{ Body: { yaml?: string } }>(
+    '/api/file/frontmatter/validate',
+    async (req, reply) => {
+      if (!req.currentUser) {
+        return reply.code(401).send({ error: 'auth required' })
+      }
+      const yaml = typeof req.body?.yaml === 'string' ? req.body.yaml : ''
+      if (!yaml.trim()) return { ok: true as const }
+      // Wrap the bare YAML back into a frontmatter envelope so the
+      // strict parser's expectations (split on opener/closer, then
+      // YAML.parse the inner block) are satisfied. The strict parser
+      // returns cleanly for "no frontmatter" but throws for
+      // malformed YAML — exactly what we want for the chip.
+      const wrapped = `---\n${yaml}\n---\n`
+      const { parseTemplateSourceStrict } = await import(
+        '../services/templateMetadata.js'
+      )
+      try {
+        parseTemplateSourceStrict(wrapped)
+        return { ok: true as const }
+      } catch (e) {
+        return { ok: false as const, error: (e as Error).message }
+      }
+    },
+  )
+
+  // Validate the YAML frontmatter of a markdown file by path. Same
+  // logic, but reads disk — used by the scheduler-state surface
+  // where the caller doesn't have the YAML in hand (it's enumerating
+  // many templates at once).
+  app.get('/api/file/frontmatter', async (req, reply) => {
+    const { path: rel, p: publicPassword, owner: ownerHint } =
+      req.query as { path?: string; p?: string; owner?: string }
+    if (!rel) return reply.code(400).send({ error: 'missing path' })
+    const requester = req.currentUser?.username
+    const ctx = await resolveReadContext({ rel, ownerHint, requester })
+    if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    // Best-effort: when the file isn't indexed, fall through to a
+    // direct disk read using the owner hint. Mirrors /api/file/meta's
+    // tolerance for loose / pre-ingest files.
+    void publicPassword
+    let raw: string
+    try {
+      const abs = ctx.meta
+        ? resolveVault(ctx.meta.storageKey, ctx.meta.owner)
+        : resolveVault(rel, ownerHint ?? requester ?? '')
+      raw = await readFile(abs, 'utf8')
+    } catch {
+      return reply.code(404).send({ error: 'file not readable' })
+    }
+    const { parseTemplateSourceStrict } = await import(
+      '../services/templateMetadata.js'
+    )
+    // Extract the yaml block first so we can return it even on a
+    // successful parse (the chip wants to render the raw YAML in
+    // its expanded view; sending it back from the server avoids a
+    // second client-side regex split).
+    const opener = raw.match(/^---\s*\r?\n/)
+    let yaml: string | null = null
+    if (opener) {
+      const after = raw.slice(opener[0].length)
+      const closer = after.match(/\r?\n---\s*(\r?\n|$)/)
+      if (closer) yaml = after.slice(0, closer.index!)
+    }
+    if (yaml == null) return { ok: true, yaml: null }
+    try {
+      parseTemplateSourceStrict(raw)
+      return { ok: true, yaml }
+    } catch (e) {
+      return { ok: false, yaml, error: (e as Error).message }
+    }
+  })
+
   // Flip a file's public flag. Only owner / admin / listed editor may change
   // it. Creates an index record on the fly for vault files that haven't been
   // ingested yet (markdown, txt, etc.) so visibility works for every file.

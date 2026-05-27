@@ -51,6 +51,11 @@ import { hasScope, scopeForTool } from '../services/oauth.js'
 import { getUser } from '../stores/users.js'
 import { applyTemplate, applyTemplateAsync } from '../services/templateEngine.js'
 import {
+  applyVarDefaults,
+  missingRequiredVars,
+  parseTemplateSource,
+} from '../services/templateMetadata.js'
+import {
   makeVaultIncludeResolver,
   makeUrlFetchResolver,
 } from '../services/templateResolvers.js'
@@ -2207,6 +2212,20 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
       bytes: number
       updatedAt: number
       preview: string
+      /** Declared vars schema from frontmatter, if any. Empty array
+       *  when the template has no schema — clients (web dialog,
+       *  agents) fall back to scanning the body for {{name}} slots. */
+      vars: Array<{
+        name: string
+        label?: string
+        help?: string
+        type?: 'text' | 'textarea' | 'select' | 'checkbox' | 'number' | 'date'
+        default?: string
+        options?: string[]
+        required?: boolean
+      }>
+      /** Cron expression from frontmatter if the template is scheduled. */
+      schedule?: string
     }> = []
     for (const e of entries) {
       if (!e.isFile()) continue
@@ -2215,13 +2234,18 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
       const st = await stat(abs).catch(() => null)
       if (!st) continue
       const head = await readFile(abs, { encoding: 'utf8' }).catch(() => '')
+      // Strip frontmatter from preview so the user / agent sees the
+      // body the engine will actually render, not the YAML metadata.
+      const { metadata: listMeta, body: listBody } = parseTemplateSource(head)
       out.push({
         path: `_templates/${e.name}`,
         name: e.name,
         title: e.name.replace(/\.(md|markdown|mdx)$/i, ''),
         bytes: st.size,
         updatedAt: st.mtimeMs,
-        preview: head.slice(0, 4096),
+        preview: listBody.slice(0, 4096),
+        vars: listMeta.vars,
+        schedule: listMeta.schedule,
       })
     }
     out.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
@@ -2283,6 +2307,10 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     })
     const existing = await stat(targetAbs).catch(() => null)
     if (existing) throw new Error('destination already exists')
+    const { metadata: tplMeta, body: tplBody } = parseTemplateSource(
+      tplBuf.toString('utf8'),
+    )
+    const withDefaults = applyVarDefaults(tplMeta, callerVars)
     const fullVars = {
       ...computeBuiltins({
         now: new Date(),
@@ -2290,11 +2318,15 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         user: actingUser,
         targetRel,
       }),
-      ...callerVars,
+      ...withDefaults,
+    }
+    const missing = missingRequiredVars(tplMeta, fullVars)
+    if (missing.length > 0) {
+      throw new Error(`template: missing required var(s): ${missing.join(', ')}`)
     }
     let rendered: string
     try {
-      rendered = await applyTemplateAsync(tplBuf.toString('utf8'), fullVars, {
+      rendered = await applyTemplateAsync(tplBody, fullVars, {
         loadInclude: makeVaultIncludeResolver(actingUser),
         loadFetch: makeUrlFetchResolver(),
       })
@@ -2385,10 +2417,20 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
       user: actingUser,
       targetRel: meta.storageKey,
     })
-    const vars = { ...builtins, ...src.vars }
+    const { metadata: refreshMeta, body: tplBody } = parseTemplateSource(
+      tplBuf.toString('utf8'),
+    )
+    const withDefaults = applyVarDefaults(refreshMeta, src.vars)
+    const vars = { ...builtins, ...withDefaults }
+    const refreshMissing = missingRequiredVars(refreshMeta, vars)
+    if (refreshMissing.length > 0) {
+      throw new Error(
+        `template: missing required var(s): ${refreshMissing.join(', ')}`,
+      )
+    }
     let rendered: string
     try {
-      rendered = await applyTemplateAsync(tplBuf.toString('utf8'), vars, {
+      rendered = await applyTemplateAsync(tplBody, vars, {
         loadInclude: makeVaultIncludeResolver(meta.owner),
         loadFetch: makeUrlFetchResolver(),
       })

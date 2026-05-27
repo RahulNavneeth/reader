@@ -519,6 +519,15 @@ export async function buildApp(opts: BuildAppOptions = {}) {
     await startBackupScheduler(app.log).catch((err) =>
       app.log.warn({ err }, 'backup scheduler start failed'),
     )
+
+    // Template scheduler — walks each user's _templates/, parses
+    // frontmatter, and auto-instantiates any template with a
+    // `schedule:` cron expression whose next fire has landed. No
+    // settings — source of truth is the template's own frontmatter.
+    const { startTemplateScheduler } = await import(
+      './services/templateScheduler.js'
+    )
+    startTemplateScheduler(app.log)
   }
 
   return app
