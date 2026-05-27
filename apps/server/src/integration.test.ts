@@ -2240,10 +2240,21 @@ describe('integration: webhook delivery', () => {
       expect(r.headers['x-reader-event']).toBe('upload')
     }
 
-    // The dead-letter slot should now hold the failed event.
+    // The dead-letter slot should now hold the failed event. The
+    // receiver-count poll above only confirms the 4th hit landed —
+    // the webhook caller still has to await its own 503, decide to
+    // dead-letter, and saveMeta. Poll the settings row for the
+    // entry to appear rather than read once and risk losing the
+    // race on slower CI I/O.
     const { loadSettings } = await import('./stores/settings.js')
-    const fresh = await loadSettings()
-    const stored = (fresh.webhooks ?? []).find((h) => h.id === hookId)
+    const dlDeadline = Date.now() + 5_000
+    let stored: (typeof received)[number] extends never ? never : any
+    while (Date.now() < dlDeadline) {
+      const fresh = await loadSettings()
+      stored = (fresh.webhooks ?? []).find((h) => h.id === hookId)
+      if (stored?.deadLetter?.length >= 1) break
+      await new Promise((r) => setTimeout(r, 50))
+    }
     expect(stored?.deadLetter?.length).toBeGreaterThanOrEqual(1)
 
     await app.inject({
