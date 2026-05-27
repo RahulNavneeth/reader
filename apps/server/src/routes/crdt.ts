@@ -34,7 +34,8 @@ import * as syncProtocol from 'y-protocols/sync'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
 import { leaseDoc } from '../services/crdtRegistry.js'
-import { loadMeta, userCanEdit } from '../stores/documents.js'
+import { loadMeta, userCanEdit, userCanRead } from '../stores/documents.js'
+import { findShareForPath } from '../stores/userShares.js'
 
 const MESSAGE_SYNC = 0
 // const MESSAGE_AWARENESS = 1  // Phase 3 work.
@@ -76,12 +77,35 @@ export async function crdtRoutes(app: FastifyInstance) {
         socket.close(1008, 'document not found')
         return
       }
-      // Phase 2 scope: owner-only. Sharing / public CRDT come
-      // later — those need careful thought about read-vs-write
-      // permission at the message-type level.
-      if (!userCanEdit(meta, user.username, user.role)) {
-        socket.close(1008, 'forbidden')
-        return
+      // Permission resolution for the WS connection:
+      //   - owner / admin / ACL editor → 'rw' (full bidirectional)
+      //   - ACL reader, share recipient (read-only), or public-
+      //     read → 'r' (receive updates, can't push them)
+      //   - none of the above → 1008 close.
+      //
+      // Read-only is enforced at the message layer below: we
+      // accept syncStep1 from `r` peers (they want state) and
+      // silently drop syncStep2/update frames they try to send.
+      // This means a reader who opens the editor sees live
+      // updates from the writers without their own typing
+      // leaking back into the doc.
+      let role: 'rw' | 'r' = 'rw'
+      if (userCanEdit(meta, user.username, user.role)) {
+        role = 'rw'
+      } else if (userCanRead(meta, user.username, user.role)) {
+        role = 'r'
+      } else {
+        // Cross-owner share? Folder-cascade match counts.
+        const share = await findShareForPath(
+          user.username,
+          meta.owner,
+          meta.storageKey,
+        ).catch(() => null)
+        if (!share) {
+          socket.close(1008, 'forbidden')
+          return
+        }
+        role = share.canEdit ? 'rw' : 'r'
       }
 
       const { doc, release } = leaseDoc(docId, {
@@ -133,13 +157,34 @@ export async function crdtRoutes(app: FastifyInstance) {
         // `raw` is whatever the client sent; framing matches the
         // outbound encoder we used above.
         try {
-          const decoder = decoding.createDecoder(new Uint8Array(raw))
+          const bytes = new Uint8Array(raw)
+          const decoder = decoding.createDecoder(bytes)
           const messageType = decoding.readVarUint(decoder)
           if (messageType !== MESSAGE_SYNC) {
             // Awareness messages are Phase 3; ignoring them keeps
             // our pre-3 server tolerant of a client that already
             // sends presence ticks.
             return
+          }
+          // Read-only enforcement: peek the sync subtype before
+          // handing the decoder to `readSyncMessage`, which would
+          // apply update bytes to the Y.Doc as a side effect.
+          // We accept syncStep1 (the read-only peer requesting
+          // state) but silently drop syncStep2 / update frames
+          // they try to push. The peek uses a fresh decoder
+          // because reading the varuint advances state.
+          if (role === 'r') {
+            const peek = decoding.createDecoder(bytes)
+            decoding.readVarUint(peek) // skip MESSAGE_SYNC tag
+            const subtype = decoding.readVarUint(peek)
+            if (
+              subtype === syncProtocol.messageYjsSyncStep2 ||
+              subtype === syncProtocol.messageYjsUpdate
+            ) {
+              // No state mutation, no broadcast — read-only peer's
+              // attempted edits just vanish at the relay edge.
+              return
+            }
           }
           const replyEncoder = encoding.createEncoder()
           encoding.writeVarUint(replyEncoder, MESSAGE_SYNC)

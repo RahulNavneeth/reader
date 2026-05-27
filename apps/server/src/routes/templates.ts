@@ -6,7 +6,7 @@ import { audit } from '../stores/audit.js'
 import { isFrozenForArchive, loadMeta, saveMeta, sha256Of, userCanEdit } from '../stores/documents.js'
 import { snapshotVersion } from '../stores/versions.js'
 import { publish as publishEvent } from '../services/events.js'
-import { broadcastEdit } from '../services/crdtRegistry.js'
+import { broadcastEdit, flushDocSync } from '../services/crdtRegistry.js'
 import { invalidateSearchCache } from '../services/search.js'
 import { ingestDocument } from '../services/ingest.js'
 import { dispatch as dispatchWebhook, markExpectedWrite } from '../services/webhooks.js'
@@ -288,32 +288,28 @@ export async function templatesRoutes(app: FastifyInstance) {
       })
     }
 
-    await mkdir(path.dirname(targetAbs), { recursive: true })
-    const buf = Buffer.from(content, 'utf8')
-    // Pre-mark so the watcher's `add` event doesn't fire a duplicate
-    // upload webhook — we dispatch our own `template` event below and
-    // ingest synchronously here.
-    markExpectedWrite(targetAbs, sha256Of(buf))
-    await writeFile(targetAbs, content)
+    // Materialiser-canonical-writer path. Save a stub meta first
+    // so `materialise()` has a row to update + the CRDT lease
+    // knows the locator, then broadcastEdit the rendered content
+    // and force-flush the registry so the file lands + meta gets
+    // its real sha + ingest runs. Replaces the writeFile + saveMeta
+    // + ingestDocument trio.
+    const storageKey = targetRel.replace(/^\/+|\/+$/g, '')
     const id = nanoid()
-    const meta: DocumentMeta = {
+    const stub: DocumentMeta = {
       id,
       owner: user.username,
-      storageKey: targetRel.replace(/^\/+|\/+$/g, ''),
+      storageKey,
       title: title || path.basename(targetRel, path.extname(targetRel)),
       originalFilename: path.basename(targetRel),
       mime: 'text/markdown',
-      bytes: buf.length,
-      sha256: sha256Of(buf),
+      bytes: 0,
+      sha256: '',
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      // ACL defaults — owner-only, matches the upload path.
       acl: { readers: [], editors: [] },
       tags: [],
       ingest: { status: 'pending', embedded: false },
-      // Provenance so the doc can be re-rendered later. Stash the
-      // user-supplied vars only — built-ins (date, uuid, etc.) are
-      // re-computed at refresh time.
       templateSource: {
         template: templateRel,
         vars: body.vars ?? {},
@@ -321,31 +317,28 @@ export async function templatesRoutes(app: FastifyInstance) {
       },
     } as unknown as DocumentMeta
     try {
-      await saveMeta(meta)
-      const finalMeta = await ingestDocument(meta, buf)
-      // Newly-instantiated template doc joins the searchable corpus;
-      // flush so the next search reflects it.
-      const { invalidateSearchCache } = await import('../services/search.js')
-      invalidateSearchCache()
+      await saveMeta(stub)
+      broadcastEdit(
+        id,
+        { owner: user.username, storageKey },
+        content,
+        'template-instantiate',
+      )
+      await flushDocSync(id)
+      const finalMeta = (await loadMeta(id)) ?? stub
       await audit({
         actor: user.username,
         action: 'template.instantiate',
-        target: meta.storageKey,
+        target: storageKey,
         meta: { template: templateRel },
       })
       dispatchWebhook({
         type: 'template',
-        path: meta.storageKey,
+        path: storageKey,
         actor: user.username,
         template: templateRel,
-        title: meta.title,
+        title: finalMeta.title,
       }).catch(() => null)
-      broadcastEdit(
-        meta.id,
-        { owner: meta.owner, storageKey: meta.storageKey },
-        content,
-        'template-instantiate',
-      )
       return { ok: true, document: finalMeta }
     } catch (e) {
       req.log.error({ err: e }, 'template.instantiate failed')

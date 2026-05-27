@@ -58,6 +58,16 @@ type Entry = {
    *  persists the CRDT state, it just skips the disk write
    *  until we know the path. */
   locator: DocLocator | null
+  /** In-flight materialise() chained promise. flush() (fire-and-
+   *  forget, e.g. from detach) and flushDocSync (awaited, e.g.
+   *  from upload_text / instantiate / chat apply-edit) both
+   *  serialise through this so a second materialise can't start
+   *  before the first finishes its ingest pipeline. Without this,
+   *  ingestDocument's later saveMeta calls could land AFTER a
+   *  subsequent route mutation (archive, set_visibility) and
+   *  overwrite the just-set fields with the materialise call's
+   *  stale meta snapshot. */
+  materialisePromise: Promise<void> | null
 }
 
 const PERSIST_DEBOUNCE_MS = 2_000
@@ -97,8 +107,18 @@ function flush(docId: string, e: Entry): void {
     // forget — a failure (eg permission, disk full) leaves the
     // CRDT state authoritative; we just don't update the
     // mirror. Next flush retries.
+    //
+    // Chain off `e.materialisePromise` so a back-to-back flush
+    // (detach + flushDocSync, two debounce ticks landing close)
+    // doesn't run two materialise calls concurrently — ingest's
+    // saveMeta calls capture meta at materialise start, and
+    // overlapping calls can clobber unrelated fields the second
+    // call wasn't aware of.
     if (e.locator) {
-      void materialise(docId, e.doc, e.locator)
+      const locator = e.locator
+      const prev = e.materialisePromise ?? Promise.resolve()
+      e.materialisePromise = prev.then(() => materialise(docId, e.doc, locator))
+      e.materialisePromise.catch(() => null)
     }
   } catch {
     // Swallow — next debounce / eviction retries. Logging would
@@ -221,6 +241,7 @@ function attach(docId: string, locator?: DocLocator): Entry {
       lastAttachAt: Date.now(),
       saveTimer: null,
       locator: locator ?? null,
+      materialisePromise: null,
     }
     // Async seed-from-disk for first-time CRDT lease against a
     // pre-existing markdown file. Fires the registry's update
@@ -336,7 +357,14 @@ export async function flushDocSync(docId: string): Promise<void> {
     }
   }
   if (e.locator) {
-    await materialise(docId, e.doc, e.locator)
+    // Chain through e.materialisePromise so any in-flight
+    // fire-and-forget materialise from a recent flush() (e.g.
+    // broadcastEdit's detach-flush) is awaited too. See the
+    // matching comment in flush().
+    const locator = e.locator
+    const prev = e.materialisePromise ?? Promise.resolve()
+    e.materialisePromise = prev.then(() => materialise(docId, e.doc, locator))
+    await e.materialisePromise
   }
 }
 

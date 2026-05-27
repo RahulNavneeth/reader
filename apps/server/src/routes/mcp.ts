@@ -939,9 +939,6 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
       ? args.tags.filter((t: any) => typeof t === 'string').map((t: string) => t.trim()).filter(Boolean)
       : []
     await ensureUserVault(actingUser)
-    const abs = resolveUserVault(actingUser, rel)
-    await mkdir(path.dirname(abs), { recursive: true })
-    const buffer = Buffer.from(content, 'utf8')
     // Snapshot the pre-edit state of an existing doc before
     // overwriting. The watcher would otherwise race saveMeta and
     // snapshot the new state instead. snapshotVersion dedupes by
@@ -971,67 +968,59 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
           `Use upload_file for binary content like .${filename.split('.').pop() ?? 'pdf'}.`,
       )
     }
-    // Tell the watcher this sha is an in-app write so its chokidar
-    // fire doesn't double-dispatch the edit/upload webhook below.
-    markExpectedWrite(abs, sha256Of(buffer))
-    const isOverwrite = !!(await findDocByPath(actingUser, rel))
-    await writeFile(abs, buffer)
+    // Materialiser-canonical-writer path. We save a stub (for
+    // new docs) or update meta in place (for overwrites), then
+    // broadcastEdit + flushDocSync — the registry's materialise
+    // handles the file write + final saveMeta + ingest.
     const now = Date.now()
     const existing = await findDocByPath(actingUser, rel)
-    let meta: DocumentMeta
-    if (existing) {
-      meta = {
-        ...existing,
-        bytes: buffer.length,
-        sha256: sha256Of(buffer),
-        tags: tags.length ? tags : existing.tags,
-        updatedAt: now,
-        ingest: { status: 'pending', embedded: false },
-      }
-      await saveMeta(meta)
-    } else {
-      meta = {
-        id: nanoid(),
-        title: filename.replace(/\.[^.]+$/, ''),
-        originalFilename: filename,
-        mime,
-        bytes: buffer.length,
-        sha256: sha256Of(buffer),
-        storageKey: rel,
-        owner: actingUser,
-        acl: { readers: [], editors: [] },
-        publicExpiresAt: null,
-        publicPasswordHash: null,
-        tags,
-        createdAt: now,
-        updatedAt: now,
-        ingest: { status: 'pending', embedded: false },
-      }
-      await saveMeta(meta)
-    }
-    // Re-ingest (text extract, chunk, embed) in the foreground so the
-    // RPC reply reflects the final ingest status the agent can act on.
-    meta = await ingestDocument(meta, buffer)
-    invalidateSearchCache()
+    const isOverwrite = !!existing
+    const docId = existing?.id ?? nanoid()
+    const stub: DocumentMeta = existing
+      ? {
+          ...existing,
+          bytes: 0,
+          sha256: '',
+          tags: tags.length ? tags : existing.tags,
+          updatedAt: now,
+          ingest: { status: 'pending', embedded: false },
+        }
+      : ({
+          id: docId,
+          title: filename.replace(/\.[^.]+$/, ''),
+          originalFilename: filename,
+          mime,
+          bytes: 0,
+          sha256: '',
+          storageKey: rel,
+          owner: actingUser,
+          acl: { readers: [], editors: [] },
+          publicExpiresAt: null,
+          publicPasswordHash: null,
+          tags,
+          createdAt: now,
+          updatedAt: now,
+          ingest: { status: 'pending', embedded: false },
+        } as unknown as DocumentMeta)
+    await saveMeta(stub)
+    broadcastEdit(
+      docId,
+      { owner: actingUser, storageKey: rel },
+      content,
+      'mcp:upload_text',
+    )
+    await flushDocSync(docId)
+    const meta = (await loadMeta(docId)) ?? stub
     dispatchWebhook(
       isOverwrite
-        ? { type: 'edit', path: rel, actor: actingUser, bytes: buffer.length, source: 'mcp' }
-        : { type: 'upload', path: rel, actor: actingUser, bytes: buffer.length },
+        ? { type: 'edit', path: rel, actor: actingUser, bytes: meta.bytes, source: 'mcp' }
+        : { type: 'upload', path: rel, actor: actingUser, bytes: meta.bytes },
     ).catch(() => null)
-    publishEvent({ type: 'edit', path: rel, docId: meta.id })
-    if (/\.(md|markdown|mdx|txt|csv|json)$/i.test(rel)) {
-      broadcastEdit(
-        meta.id,
-        { owner: meta.owner, storageKey: rel },
-        content,
-        'mcp:upload_text',
-      )
-    }
     await audit({
       actor: actingUser,
       action: 'mcp.upload_text',
       target: rel,
-      meta: { docId: meta.id, bytes: buffer.length, overwrite: isOverwrite },
+      meta: { docId: meta.id, bytes: meta.bytes, overwrite: isOverwrite },
     })
     return {
       content: [{ type: 'text', text: `Wrote ${rel} (${content.length} chars).` }],
@@ -2312,20 +2301,22 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
     } catch (e) {
       throw new Error(`template: ${(e as Error).message}`)
     }
-    await mkdir(path.dirname(targetAbs), { recursive: true })
-    const buf = Buffer.from(rendered, 'utf8')
-    markExpectedWrite(targetAbs, sha256Of(buf))
-    await writeFile(targetAbs, buf)
+    // Materialiser-canonical-writer path. Stub meta first, then
+    // broadcast the rendered body through the CRDT, then force-
+    // flush so the registry writes the file + finalises the meta
+    // + ingests. No writeFile / saveMeta / ingestDocument trio
+    // in the route anymore.
+    const storageKey = targetRel.replace(/^\/+|\/+$/g, '')
     const id = nanoid()
-    const meta: DocumentMeta = {
+    const stub: DocumentMeta = {
       id,
       owner: actingUser,
-      storageKey: targetRel.replace(/^\/+|\/+$/g, ''),
+      storageKey,
       title: title || path.basename(targetRel, path.extname(targetRel)),
       originalFilename: path.basename(targetRel),
       mime: 'text/markdown',
-      bytes: buf.length,
-      sha256: sha256Of(buf),
+      bytes: 0,
+      sha256: '',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       acl: { readers: [], editors: [] },
@@ -2337,34 +2328,33 @@ async function handleCall(token: McpPrincipal, name: string, args: any) {
         title: title || undefined,
       },
     } as unknown as DocumentMeta
-    await saveMeta(meta)
-    const finalMeta = await ingestDocument(meta, buf)
-    invalidateSearchCache()
+    await saveMeta(stub)
+    broadcastEdit(
+      id,
+      { owner: actingUser, storageKey },
+      rendered,
+      'mcp:instantiate_template',
+    )
+    await flushDocSync(id)
+    const finalMeta = (await loadMeta(id)) ?? stub
     await audit({
       actor: actingUser,
       action: 'mcp.template.instantiate',
-      target: meta.storageKey,
+      target: storageKey,
       meta: { template: templateRel },
     })
     dispatchWebhook({
       type: 'template',
-      path: meta.storageKey,
+      path: storageKey,
       actor: actingUser,
       template: templateRel,
-      title: meta.title,
+      title: finalMeta.title,
     }).catch(() => null)
-    publishEvent({ type: 'edit', path: meta.storageKey, docId: meta.id })
-    broadcastEdit(
-      meta.id,
-      { owner: meta.owner, storageKey: meta.storageKey },
-      rendered,
-      'mcp:instantiate_template',
-    )
     return {
       content: [
         {
           type: 'text',
-          text: `Created ${meta.storageKey} from ${templateRel} (${buf.length} bytes).`,
+          text: `Created ${storageKey} from ${templateRel} (${finalMeta.bytes} bytes).`,
         },
       ],
       structuredContent: { document: finalMeta },
