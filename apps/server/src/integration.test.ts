@@ -5110,6 +5110,14 @@ describe('integration: mcp richer tools', () => {
   let cookie = ''
   let token = ''
 
+  // Same rationale as the "expanded toolkit" block — this one's
+  // also dozens of back-to-back MCP calls. Reset the per-token
+  // bucket so a 429 doesn't surprise the assertions.
+  beforeEach(async () => {
+    const { _resetMcpRateLimitForTest } = await import('./routes/mcp.js')
+    _resetMcpRateLimitForTest()
+  })
+
   beforeAll(async () => {
     let login = await app.inject({
       method: 'POST',
@@ -5444,6 +5452,19 @@ describe('integration: backup scheduling', () => {
 describe('integration: mcp expanded toolkit', () => {
   let cookie = ''
   let token = ''
+
+  // This block fires hundreds of MCP calls across its tests. The
+  // per-token rate-limit bucket (capacity 60, refill 5/sec) is fine
+  // for honest agents but cooks under back-to-back vitest serial
+  // execution — CI especially, where wall-clock between calls is
+  // tighter than dev. Reset before each test so a 429 doesn't get
+  // returned mid-block (the test framework would then crash on
+  // `r.result.isError` because 429s come back as JSON-RPC err
+  // envelopes with no `result` field).
+  beforeEach(async () => {
+    const { _resetMcpRateLimitForTest } = await import('./routes/mcp.js')
+    _resetMcpRateLimitForTest()
+  })
 
   beforeAll(async () => {
     let login = await app.inject({
