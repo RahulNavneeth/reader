@@ -213,7 +213,17 @@ export default function App() {
       const file = arr[i]
       setUploadProgress({ done: i, total: arr.length, current: file.name, failed: [...failed] })
       try {
-        await api.upload(file, { dir })
+        // Folder uploads come with `webkitRelativePath` populated
+        // (`MyFolder/sub/file.md`). Strip the basename and append
+        // the rest to the user-picked destination so the tree
+        // structure is recreated server-side. Plain file uploads
+        // have an empty webkitRelativePath and fall through with
+        // just `dir`.
+        const rel = (file as File & { webkitRelativePath?: string })
+          .webkitRelativePath ?? ''
+        const sub = rel ? rel.replace(/\/[^/]*$/, '') : ''
+        const targetDir = sub ? (dir ? `${dir}/${sub}` : sub) : dir
+        await api.upload(file, { dir: targetDir })
       } catch (e) {
         const reason = e instanceof ApiError ? e.message : String(e)
         failed.push({ name: file.name, reason })
@@ -247,6 +257,22 @@ export default function App() {
     fileInputRef.current?.click()
   }, [])
 
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  // React doesn't reliably pass through non-standard attributes
+  // like `webkitdirectory` (they get stripped or stringified
+  // depending on version). Setting them imperatively on mount
+  // guarantees the input behaves as a folder picker.
+  useEffect(() => {
+    const el = folderInputRef.current
+    if (!el) return
+    el.setAttribute('webkitdirectory', '')
+    el.setAttribute('directory', '')
+    el.setAttribute('mozdirectory', '')
+  }, [])
+  const triggerFolderUpload = useCallback(() => {
+    folderInputRef.current?.click()
+  }, [])
+
   // Controlled open-state for the inline NewFolderButton popover.
   // The ⌘K palette (and anyone else with the vault context) calls
   // `triggerNewFolder` to flip this on, which pops the popover under
@@ -268,7 +294,7 @@ export default function App() {
     // Bare-path public URLs: `/` for a public vault root, `/<path>` for
     // any public file or folder. Reserved root segments are app routes
     // that can't be vault items.
-    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline', 'collections', 'c', 'pc', 'oauth'])
+    const RESERVED = new Set(['settings', 'account', 'library', 'trash', 'map', 'timeline', 'collections', 'c', 'pc', 'oauth', 'u'])
     const rawPath = decodeURIComponent(location.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
     const firstSeg = rawPath.split('/')[0] ?? ''
     const isReserved = RESERVED.has(firstSeg) || firstSeg === 'tags'
@@ -314,6 +340,7 @@ export default function App() {
     <VaultContext.Provider
       value={{
         triggerUpload,
+        triggerFolderUpload,
         uploadFiles,
         triggerNewFolder,
         refresh,
@@ -476,6 +503,21 @@ export default function App() {
                 e.target.value = ''
               }}
             />
+            {/* Folder picker. `webkitdirectory` / `directory` /
+                `mozdirectory` are attached imperatively in a useEffect
+                because React doesn't reliably pass non-standard
+                attributes through JSX. The resulting File list
+                carries `webkitRelativePath` so doUpload can rebuild
+                the directory tree under the destination. */}
+            <input
+              ref={folderInputRef}
+              type="file"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                if (e.target.files) uploadFiles(e.target.files)
+                e.target.value = ''
+              }}
+            />
 
             <SyncStatusBadge status={syncStatus} />
 
@@ -513,6 +555,12 @@ export default function App() {
           <Route path="/library/:mountId/*" element={<MountBrowser />} />
           <Route path="/library/:mountId" element={<MountBrowser />} />
           {auth.user.role === 'admin' && <Route path="/settings" element={<AdminPanel />} />}
+          {/* Shared item, namespaced under owner so the URL itself
+              disambiguates "your own /investments/foo.md" from
+              "rahulmnavneeth's /investments/foo.md". Both route
+              into the same VaultView; the component pulls the
+              owner out of params. */}
+          <Route path="/u/:owner/*" element={<VaultView />} />
           <Route path="*" element={<VaultView />} />
         </Routes>
 
@@ -537,7 +585,6 @@ export default function App() {
               style={{
                 background: 'var(--panel)',
                 border: '1px solid var(--border)',
-                boxShadow: '0 10px 30px -10px rgba(9,30,66,0.35)',
               }}
               role="status"
               aria-live="polite"

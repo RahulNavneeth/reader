@@ -20,11 +20,14 @@
     --danger-bg: #FFEBE6;
     --danger-fg: #BF2600;
     --scrim: rgba(0, 0, 0, 0.35);
-    /* Surface roles. In light mode the viewer is the brighter
-     * surface (white) and rails are the tinted secondary surface
-     * (panel). Dark mode keeps the reverse — the rails are the
-     * darker base and the viewer is the slightly-bluer panel. */
-    --viewer: var(--bg);
+    /* Surface roles. Both modes now derive --viewer from the
+     * `surface-2` tier so card-like surfaces across the app
+     * (SettingsList rows, doc viewer body, modal slabs) share
+     * one elevation — the previous "bright white viewer" in
+     * light mode read as a stark slab against the tinted page
+     * chrome. Inputs and chips still pull from `--bg` directly
+     * for their own white affordance. */
+    --viewer: var(--panel-2);
     --rail: var(--panel);
     /* Three-tier hierarchy used across every settings/page surface.
      * surface-1 = brightest (top app shell header)
@@ -38,7 +41,7 @@
     --surface-2: var(--panel-2);
     --surface-3: var(--panel);
     --composer-input: var(--bg);
-    --input-bg: var(--bg);
+    --input-bg: var(--surface-2);
     --input-border: var(--border);
     /* Table chrome derived from --surface-2 so the header always
      * pops one tier above the page body — the body is on
@@ -46,8 +49,20 @@
      * from --viewer would collapse the header into the body in
      * light mode where --viewer === body. The 8%/4% mixes give a
      * visible-but-quiet step against the row stripes. */
-    --table-header-bg: color-mix(in srgb, var(--fg) 8%, var(--surface-2));
-    --table-stripe-bg: color-mix(in srgb, var(--fg) 4%, var(--surface-2));
+    --table-header-bg: color-mix(in srgb, var(--fg) 12%, var(--panel-2));
+    --table-stripe-bg: color-mix(in srgb, var(--fg) 5%, var(--panel-2));
+    /* Body cells sit on a distinct surface so the table reads as
+     * its own card against the document body, rather than as a
+     * naked grid of borders. Panel-2 is one step above the page
+     * surface in both themes, which is exactly the elevation
+     * we want here. */
+    --table-cell-bg: var(--panel-2);
+    /* Borders derived from `--fg` mixed INTO the cell bg, so the
+     * contrast holds in both themes without us hand-tuning per
+     * mode. The default `--border` at 8% of fg blended with the
+     * page bg disappears against the cell bg in dark mode
+     * (cell and border both wash into the same navy). */
+    --table-border: color-mix(in srgb, var(--fg) 22%, var(--table-cell-bg));
   }
   .dark {
     --bg: #0B1424;
@@ -61,7 +76,13 @@
     --accent: #4C9AFF;
     --accent-bg: #0747A6;
     --hover: #16243F;
-    --selected: #0747A6;
+    /* Subtler than the previous saturated `#0747A6`, which read
+     * as a bright blue solid on the dark navy chrome. Mid-blend
+     * of the accent with the page bg keeps the affordance
+     * recognisable while sitting comfortably in the dark theme —
+     * mirrors what `#DEEBFF` does in light mode (a subtle accent
+     * wash, not a stark fill). */
+    --selected: color-mix(in srgb, var(--accent) 22%, var(--bg));
     --code-bg: #0A1224;
     --danger-bg: #2A1014;
     --danger-fg: #FF8F73;
@@ -74,9 +95,9 @@
     --surface-2: var(--panel);
     --surface-3: var(--bg);
     --composer-input: var(--panel-2);
-    /* One step lighter than --panel-2 so an input visibly pops
-     * against the header / rail surfaces in dark mode. */
-    --input-bg: #1A2B52;
+    /* Inputs ride one surface above the page body so they pop
+     * against headers / rails in both themes. */
+    --input-bg: var(--surface-2);
     /* Slightly lighter than --input-bg so the frame reads as
      * an intentional outline, not a contrasting ring. Avoids
      * the "bright border" effect we'd get if we reused --border
@@ -87,7 +108,14 @@
     height: 100%;
   }
   body {
-    background: var(--bg);
+    /* Base bg sits on the page-body tier (`--surface-3`) — the
+     * same surface the PathViewer's content scroller paints,
+     * and what most page roots (Archive, Trash, Collections,
+     * Settings) use too. Reload no longer flashes pure-white
+     * before React hydrates; the body is already the right
+     * grey in light mode and the right dark navy in dark mode.
+     * Cards / sub-headers paint surface-2 on top normally. */
+    background: var(--surface-3);
     color: var(--fg);
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
@@ -168,7 +196,15 @@
 }
 
 @layer components {
-  .surface { background: var(--bg); }
+  /* The App's outermost frame. Was `var(--bg)` (= pure white in
+   * light mode) which created a brief white flash on reload
+   * between the body's surface-3 paint and the per-page
+   * background (PathViewer's surface-3 content area, VaultView's
+   * own bg, etc.). Sitting on surface-3 means whatever page
+   * mounts afterwards either matches (no flash) or paints its
+   * own different surface on top — same direction, never a
+   * stark white intermediate. */
+  .surface { background: var(--surface-3); }
   .panel   { background: var(--panel); }
   .panel-2 { background: var(--panel-2); }
   .border-app { border-color: var(--border); }
@@ -215,6 +251,61 @@
     transition: background-color 150ms;
   }
   .btn-ghost:hover { background: var(--hover); color: var(--fg); }
+
+  /* Comment-row action buttons (trash / link / resolve). Use
+     --hover for a theme-consistent neutral wash (the previous
+     --selected variant was a loud sky-blue in light mode that
+     looked like a "selected" state rather than hover). Icon
+     brightens to --fg on hover so the click affordance reads
+     clearly without a strong fill. */
+  .comment-action-btn:hover:not(:disabled) {
+    background: var(--hover);
+    color: var(--fg) !important;
+  }
+  .comment-action-btn:disabled { opacity: 0.35; }
+
+  /* Toolbar/icon-button tooltips. Apply `.btn-ghost` (which most
+     toolbar buttons already use) gets a fast styled tooltip on
+     hover, read from the same `title` attribute the buttons
+     already carry. The native browser tooltip still fires after
+     ~700ms but ours appears at ~350ms with a theme-styled chip,
+     so it's the one the user actually sees.
+     Buttons can opt out with `data-no-tooltip`. */
+  @keyframes tooltip-fade-in {
+    from { opacity: 0; transform: translate(-50%, -4px); }
+    to   { opacity: 1; transform: translate(-50%, 0); }
+  }
+  .btn-ghost[data-tooltip]:not([data-no-tooltip]) { position: relative; }
+  /* External-mount (library) grid tiles. Light-mode-only swap so
+     the outer card reads as a slight elevation off the page and
+     the inner icon-frame reads as a recessed panel — the previous
+     all-white-on-white tile in light mode showed almost no
+     contrast against the body. Dark mode keeps its current
+     values via the default rules. */
+  .mount-tile-outer { background: var(--panel); }
+  .mount-tile-inner { background: var(--bg); }
+  :root:not(.dark) .mount-tile-outer { background: var(--surface-2); }
+  :root:not(.dark) .mount-tile-inner { background: var(--panel); }
+
+  .btn-ghost[data-tooltip]:not([data-no-tooltip]):hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 50%;
+    transform: translate(-50%, 0);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+    z-index: 1000;
+    pointer-events: none;
+    animation: tooltip-fade-in 0.15s ease-out 0.35s both;
+    max-width: 240px;
+  }
 
   /* Danger-flavoured ghost button — destructive actions (Revoke,
      Delete, Purge). Reads as red on rest and a darker red wash on
@@ -355,6 +446,50 @@
   background: var(--code-bg);
   color: var(--fg);
 }
+/* Template-engine syntax — restrained, typography-led. No
+ * chip / border / heavy fill: the braces sit in muted
+ * `--fg-subtle`, the expression body picks up a refined
+ * accent colour, and the whole token reads in-line at body
+ * weight so it doesn't shout. The body's accent stays soft
+ * (40% mix with the surrounding text) so the colour reads
+ * as semantic categorisation, not decoration. */
+.md .md-tmpl-token {
+  white-space: nowrap;
+  font-feature-settings: 'ss01';
+  letter-spacing: 0.005em;
+}
+.md .md-tmpl-brace {
+  color: var(--fg-subtle);
+  font-weight: 400;
+  opacity: 0.7;
+  padding: 0 1px;
+}
+.md .md-tmpl-body {
+  font-weight: 600;
+}
+.md .md-tmpl-control .md-tmpl-body {
+  color: color-mix(in srgb, #7C3AED 80%, var(--fg) 20%);
+}
+.md .md-tmpl-var .md-tmpl-body {
+  color: color-mix(in srgb, var(--accent) 75%, var(--fg) 25%);
+}
+/* Wraps the content between a matched `{{#if …}}` and its
+ * `{{/if}}`. Adds left padding + a soft accent rule so the
+ * template's branch structure reads visually like a code
+ * block's body. Nested blocks compound the indent + rule
+ * naturally because the wrapper is just another root child
+ * inside its parent block. */
+.md .md-tmpl-block {
+  padding-left: 16px;
+  margin: 0 0 6px;
+  border-left: 2px solid color-mix(in srgb, #7C3AED 30%, transparent);
+}
+.md .md-tmpl-block > :first-child {
+  margin-top: 4px;
+}
+.md .md-tmpl-block > :last-child {
+  margin-bottom: 0;
+}
 .md pre {
   background: var(--code-bg);
   border: 1px solid var(--border-soft);
@@ -378,18 +513,20 @@
   overflow-x: auto;
 }
 .md th, .md td {
-  border: 1px solid var(--border);
+  border: 1px solid var(--table-border);
   padding: 7px 12px;
   text-align: left;
+  /* Card-style table bg so the grid pops against the document
+   * body in both themes. Dark mode otherwise rendered as bare
+   * cells on the page bg, with only the borders to delineate. */
+  background: var(--table-cell-bg);
 }
 .md th {
   background: var(--table-header-bg);
   font-weight: 600;
-  /* Higher-contrast border than the body cells so the header row
-   * stays visually anchored even when its bg sits close in value
-   * to the viewer surface (the default --border at 8% of --fg can
-   * disappear into the header's own tint). */
-  border-color: color-mix(in srgb, var(--fg) 18%, var(--viewer));
+  /* Header bottom rule a hair stronger than the body grid so the
+   * header row stays visually anchored. */
+  border-color: color-mix(in srgb, var(--fg) 30%, var(--table-cell-bg));
 }
 .md tr:nth-child(even) td { background: var(--table-stripe-bg); }
 .md hr { border: 0; border-top: 1px solid var(--border-soft); margin: 24px 0; }
@@ -465,14 +602,15 @@
   overflow-x: auto;
 }
 .chat-md th, .chat-md td {
-  border: 1px solid var(--border-soft);
+  border: 1px solid var(--table-border);
   padding: 4px 8px;
   text-align: left;
+  background: var(--table-cell-bg);
 }
 .chat-md th {
   background: var(--table-header-bg);
   font-weight: 600;
-  border-color: color-mix(in srgb, var(--fg) 18%, var(--viewer));
+  border-color: color-mix(in srgb, var(--fg) 30%, var(--table-cell-bg));
 }
 .chat-md tr:nth-child(even) td { background: var(--table-stripe-bg); }
 .chat-md hr { border: 0; border-top: 1px solid var(--border-soft); margin: 10px 0; }

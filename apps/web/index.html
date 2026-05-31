@@ -5,6 +5,35 @@
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Reader</title>
+    <!--
+      First-paint theme — inline script runs synchronously before
+      any rendering. Reads the stored theme key the React hook
+      uses (`mdr.theme`) or falls back to the OS pref, and
+      stamps an inline `style` directly on the html element so
+      the very first paint is already on the surface-3 colour.
+      Inline `style` beats any external stylesheet load order
+      (Inter / Tailwind / CSS module) so there's no white band
+      while those resources fetch.
+    -->
+    <script>
+      (function () {
+        var html = document.documentElement;
+        var dark = false;
+        try {
+          var saved = localStorage.getItem('mdr.theme');
+          var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          dark = saved === 'dark' || (saved !== 'light' && prefersDark);
+        } catch (_) { /* private mode / localStorage blocked — fall through */ }
+        if (dark) html.classList.add('dark');
+        // Inline style on both <html> and <body> wins against
+        // any stylesheet load timing. `<body>` is set in DOMContentLoaded
+        // because it doesn't exist yet at script-execution time.
+        html.style.background = dark ? '#0B1424' : '#F4F5F7';
+        document.addEventListener('DOMContentLoaded', function () {
+          document.body.style.background = dark ? '#0B1424' : '#F4F5F7';
+        });
+      })();
+    </script>
     <link rel="preconnect" href="https://rsms.me/" />
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
   </head>

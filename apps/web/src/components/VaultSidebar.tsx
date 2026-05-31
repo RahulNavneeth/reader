@@ -4,8 +4,10 @@ import clsx from 'clsx'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { VaultTree } from './VaultTree'
+import { SidebarSelectionProvider } from '../lib/sidebarSelection'
 import { useVault } from '../lib/vault-context'
 import { useConfirm, usePrompt } from '../lib/confirm'
+import { vaultUrl } from '../lib/vaultUrl'
 
 // JSON-equality. Fine for our small payloads (tree/tags/views are O(100)
 // entries each); avoids pulling lodash for one comparator.
@@ -40,6 +42,14 @@ type FolderHit = { path: string; name: string; owner: string; score: number }
  * always highlighted regardless of which page is rendered to the right of it.
  */
 export function VaultSidebar() {
+  return (
+    <SidebarSelectionProvider>
+      <VaultSidebarInner />
+    </SidebarSelectionProvider>
+  )
+}
+
+function VaultSidebarInner() {
   const params = useParams()
   const navigate = useNavigate()
   const location = useLocation()
@@ -67,6 +77,10 @@ export function VaultSidebar() {
   }, [collapsed])
 
   const [tree, setTree] = useState<VaultNode[] | null>(null)
+  /** True while a drag is over the root-drop wrapper. Drives the
+   *  dashed-outline visual cue so the user can see the root IS a
+   *  valid drop target (previously a silent area). */
+  const [rootDropActive, setRootDropActive] = useState(false)
   const [tags, setTags] = useState<Array<{ tag: string; count: number }> | null>(null)
   // Collapsed by default — when the vault grows large the file tree is the
   // primary nav; tags are a secondary index the user expands when needed.
@@ -214,7 +228,7 @@ export function VaultSidebar() {
           show/hide) is unaffected. */}
       {collapsed && (
         <aside
-          style={{ background: 'var(--surface-3)' }}
+          style={{ background: 'var(--surface-2)' }}
           className="hidden md:flex w-8 shrink-0 border-r border-app flex-col items-stretch"
         >
           <button
@@ -229,7 +243,7 @@ export function VaultSidebar() {
         </aside>
       )}
       <aside
-        style={{ background: 'var(--surface-3)' }}
+        style={{ background: 'var(--surface-2)' }}
         className={clsx(
           'border-r border-app overflow-y-auto flex flex-col',
           // Mobile: fixed-position drawer that slides in from the left.
@@ -391,12 +405,10 @@ export function VaultSidebar() {
             {pinsOpen && (
               <div className="mt-0.5 space-y-0.5">
                 {pins.map((p) => {
-                  const segs = p.storageKey.split('/').map(encodeURIComponent).join('/')
-                  const suffix =
-                    p.owner !== currentUsername
-                      ? `?owner=${encodeURIComponent(p.owner)}`
-                      : ''
-                  const target = `/${segs}${suffix}`
+                  const target = vaultUrl(p.storageKey, {
+                    owner: p.owner,
+                    requester: currentUsername,
+                  })
                   const isActive = openPath === p.storageKey
                   const name = p.label || p.storageKey.split('/').pop() || p.storageKey
                   return (
@@ -539,8 +551,8 @@ export function VaultSidebar() {
                   <input
                     className="w-full mt-1 mb-1 px-2 h-6 rounded text-[11.5px] outline-none"
                     style={{
-                      background: 'var(--bg)',
-                      border: '1px solid var(--border)',
+                      background: 'var(--input-bg)',
+                      border: '1px solid var(--input-border)',
                       color: 'var(--fg)',
                     }}
                     placeholder={`Filter ${tags.length} tags…`}
@@ -651,21 +663,11 @@ export function VaultSidebar() {
             )
 
             const openFolderHit = (f: FolderHit) => {
-              const segs = f.path.split('/').filter(Boolean).map(encodeURIComponent).join('/')
-              const suffix =
-                f.owner && f.owner !== currentUsername
-                  ? `?owner=${encodeURIComponent(f.owner)}`
-                  : ''
-              navigate(`${segs ? `/${segs}` : '/'}${suffix}`)
+              navigate(vaultUrl(f.path, { owner: f.owner, requester: currentUsername }))
               setFilter('')
             }
             const openFileHit = (h: FlatHit) => {
-              const segs = h.path.split('/').map(encodeURIComponent).join('/')
-              const suffix =
-                h.owner && h.owner !== currentUsername
-                  ? `?owner=${encodeURIComponent(h.owner)}`
-                  : ''
-              navigate(`/${segs}${suffix}`)
+              navigate(vaultUrl(h.path, { owner: h.owner, requester: currentUsername }))
             }
 
             return (
@@ -775,22 +777,74 @@ export function VaultSidebar() {
                Without the top padding, the first folder row claims
                the entire top area and dropping above it is
                impossible. */
-            className="pt-2 pb-12 min-h-[60px]"
+            className="pt-2 pb-12 min-h-[60px] transition-colors"
+            style={
+              rootDropActive
+                ? {
+                    background:
+                      'color-mix(in srgb, var(--accent) 10%, transparent)',
+                    outline: '1px dashed color-mix(in srgb, var(--accent) 55%, transparent)',
+                    outlineOffset: -2,
+                    borderRadius: 6,
+                  }
+                : undefined
+            }
             onDragOver={(e) => {
-              if (!e.dataTransfer.types.includes('application/x-reader-path')) return
+              const types = e.dataTransfer.types
+              if (
+                !types.includes('application/x-reader-path') &&
+                !types.includes('application/x-reader-paths')
+              ) {
+                return
+              }
               e.preventDefault()
               e.dataTransfer.dropEffect = 'move'
+              if (!rootDropActive) setRootDropActive(true)
+            }}
+            onDragLeave={(e) => {
+              // Only clear when the cursor leaves the wrapper itself,
+              // not when it crosses a child row.
+              if (e.currentTarget === e.target) setRootDropActive(false)
             }}
             onDrop={async (e) => {
-              const src = e.dataTransfer.getData('application/x-reader-path')
-              if (!src) return
+              setRootDropActive(false)
+              // Accept both single (legacy) and bulk-array (shift-
+              // multi-select) payloads.
+              let srcs: string[] = []
+              const bulkRaw = e.dataTransfer.getData(
+                'application/x-reader-paths',
+              )
+              if (bulkRaw) {
+                try {
+                  const parsed = JSON.parse(bulkRaw)
+                  if (Array.isArray(parsed)) {
+                    srcs = parsed.filter((p): p is string => typeof p === 'string')
+                  }
+                } catch {
+                  /* fall through to single */
+                }
+              }
+              if (srcs.length === 0) {
+                const single = e.dataTransfer.getData(
+                  'application/x-reader-path',
+                )
+                if (single) srcs = [single]
+              }
+              if (srcs.length === 0) return
               e.preventDefault()
-              const filename = src.split('/').pop()
-              if (!filename) return
-              // Already at root — nothing to move.
-              if (!src.includes('/')) return
+              const moves: { src: string; target: string }[] = []
+              for (const src of srcs) {
+                const filename = src.split('/').pop()
+                if (!filename) continue
+                // Already at root — nothing to move for this path.
+                if (!src.includes('/')) continue
+                moves.push({ src, target: filename })
+              }
+              if (moves.length === 0) return
               try {
-                await api.move(src, filename)
+                for (const { src, target } of moves) {
+                  await api.move(src, target)
+                }
                 refreshVault()
               } catch (err) {
                 if (!(err instanceof ApiError && err.status === 401)) {

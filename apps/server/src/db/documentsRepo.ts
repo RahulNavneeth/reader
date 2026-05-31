@@ -50,6 +50,9 @@ type DocRow = {
   hls_ready: number
   archived: number
   archived_at: number | null
+  locked: number
+  locked_at: number | null
+  locked_by: string | null
   template_source: string | null
 }
 
@@ -108,6 +111,9 @@ function rowToMeta(
     hlsReady: row.hls_ready === 1,
     archived: row.archived === 1,
     archivedAt: row.archived_at,
+    locked: row.locked === 1,
+    lockedAt: row.locked_at,
+    lockedBy: row.locked_by,
     templateSource: row.template_source ? JSON.parse(row.template_source) : null,
   }
 }
@@ -121,7 +127,7 @@ const UPSERT_SQL = `
     ingest_embedded, ingest_extracted_at, ingest_embedded_at,
     entities_json, gps_lat, gps_lng, gps_tried,
     p_hash, live_photo_pair, hls_ready,
-    archived, archived_at, template_source
+    archived, archived_at, locked, locked_at, locked_by, template_source
   ) VALUES (
     @id, @owner, @storage_key, @title, @original_filename, @mime, @bytes, @sha256,
     @created_at, @updated_at,
@@ -130,7 +136,7 @@ const UPSERT_SQL = `
     @ingest_embedded, @ingest_extracted_at, @ingest_embedded_at,
     @entities_json, @gps_lat, @gps_lng, @gps_tried,
     @p_hash, @live_photo_pair, @hls_ready,
-    @archived, @archived_at, @template_source
+    @archived, @archived_at, @locked, @locked_at, @locked_by, @template_source
   )
   ON CONFLICT(id) DO UPDATE SET
     owner = excluded.owner,
@@ -162,6 +168,9 @@ const UPSERT_SQL = `
     hls_ready = excluded.hls_ready,
     archived = excluded.archived,
     archived_at = excluded.archived_at,
+    locked = excluded.locked,
+    locked_at = excluded.locked_at,
+    locked_by = excluded.locked_by,
     template_source = excluded.template_source
 `
 
@@ -203,6 +212,9 @@ function metaToParams(m: DocumentMeta): Record<string, unknown> {
     hls_ready: m.hlsReady ? 1 : 0,
     archived: m.archived ? 1 : 0,
     archived_at: m.archivedAt ?? null,
+    locked: m.locked ? 1 : 0,
+    locked_at: m.lockedAt ?? null,
+    locked_by: m.lockedBy ?? null,
     template_source: m.templateSource ? JSON.stringify(m.templateSource) : null,
   }
 }

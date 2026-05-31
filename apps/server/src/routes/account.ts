@@ -592,6 +592,52 @@ export async function accountRoutes(app: FastifyInstance) {
     return await listScheduledTemplates(req.currentUser.username)
   })
 
+  /** Upcoming scheduled-template fires for the caller, bucketed by
+   *  local day in the template's TZ. Feeds the timeline calendar so
+   *  it can color-code days with scheduled instantiations alongside
+   *  the past-activity heatmap. */
+  app.get<{ Querystring: { from?: string; to?: string } }>(
+    '/api/account/scheduled-templates/upcoming',
+    async (req, reply) => {
+      if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+      const q = req.query ?? {}
+      const parseYmd = (s?: string): Date | null => {
+        if (!s) return null
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s)
+        if (!m) return null
+        const d = new Date(
+          Number(m[1]),
+          Number(m[2]) - 1,
+          Number(m[3]),
+          0,
+          0,
+          0,
+          0,
+        )
+        return Number.isFinite(d.getTime()) ? d : null
+      }
+      const from = parseYmd(q.from) ?? new Date()
+      const to =
+        parseYmd(q.to) ??
+        new Date(from.getTime() + 365 * 24 * 60 * 60 * 1000)
+      // Clamp window to one year so a runaway request can't make
+      // every template iterate millions of fires.
+      const maxMs = 366 * 24 * 60 * 60 * 1000
+      const cappedTo = new Date(
+        Math.min(to.getTime(), from.getTime() + maxMs),
+      )
+      const { upcomingScheduledFires } = await import(
+        '../services/templateScheduler.js'
+      )
+      const r = await upcomingScheduledFires(
+        req.currentUser.username,
+        from,
+        cappedTo,
+      )
+      return r
+    },
+  )
+
   app.post<{ Body: { template?: string; cron?: string } }>(
     '/api/account/scheduled-templates/run-now',
     async (req, reply) => {

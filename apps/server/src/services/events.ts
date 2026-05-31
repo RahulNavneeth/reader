@@ -28,6 +28,19 @@ export type ReaderEvent =
   | { type: 'edit'; path: string; docId?: string }
   /** Archive flag flipped on a file or folder. */
   | { type: 'archive'; path: string; archived: boolean }
+  /** Lock flag flipped on a file or folder. Empty `path` means
+   *  bulk update — listeners should re-fetch their slice. */
+  | { type: 'lock'; path: string; locked: boolean }
+  /** Inline comment created / deleted / resolve-toggled. Path is
+   *  the doc's vault-relative storageKey so the listener side can
+   *  filter the same way it does for `edit`. */
+  | {
+      type: 'comment'
+      path: string
+      docId: string
+      action: 'created' | 'deleted' | 'resolved' | 'reopened'
+      author: string
+    }
 
 type Listener = (e: ReaderEvent) => void
 

@@ -251,7 +251,7 @@ export function MapPage() {
           <div className="absolute inset-0 flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--surface-2)', border: '1px dashed var(--border)' }}
             >
               <MapPin size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No geotagged photos yet</div>
@@ -713,9 +713,6 @@ function ThumbMarker({
           border: selected
             ? `2px solid var(--accent)`
             : `1px solid var(--border)`,
-          boxShadow: selected
-            ? '0 0 0 3px rgba(76, 110, 245, 0.18), 0 2px 10px rgba(9,30,66,0.25)'
-            : '0 2px 8px rgba(9,30,66,0.22)',
           boxSizing: 'border-box',
         }}
       >
@@ -756,7 +753,6 @@ function ThumbMarker({
             fontVariantNumeric: 'tabular-nums',
             textAlign: 'center',
             border: '1.5px solid var(--panel)',
-            boxShadow: '0 1px 3px rgba(9,30,66,0.20)',
             pointerEvents: 'none',
             display: 'inline-flex',
             alignItems: 'center',

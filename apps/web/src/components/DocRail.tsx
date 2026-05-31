@@ -1,13 +1,20 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  List,
+  Check,
   Clock,
+  Link as LinkIcon,
+  List,
   Loader2,
+  MessageSquare,
   PanelRightClose,
   PanelRightOpen,
+  Quote,
+  Trash2,
+  Users,
 } from 'lucide-react'
-import { ApiError, api } from '../lib/api'
+import { ApiError, api, type CommentDTO } from '../lib/api'
 import { computeLineDiffCounts } from '../lib/lineDiff'
+import { peerInitial, usePeers } from './AwarenessPill'
 
 type Version = {
   ts: number
@@ -44,6 +51,39 @@ type Props = {
    *  used after a restore so the just-created pre-restore snapshot
    *  shows up in the rail without a page reload. */
   versionsReloadKey?: number
+  /** Optional Y.Doc awareness — when present, the rail surfaces a
+   *  "Peers" section below the Clock icon (icon-strip mode) and an
+   *  inline panel in the expanded aside (sidebar mode). */
+  awareness?: import('y-protocols/awareness').Awareness | null
+  peersOpen?: boolean
+  setPeersOpen?: (v: boolean) => void
+  /** Owner hint for cross-user reads. When the rail is rendered for
+   *  a shared editor opening someone else's doc, the version list
+   *  endpoints need the owner to scope the lookup (same storageKey
+   *  can exist under multiple owners). Omitted = own doc. */
+  ownerOpt?: string | null
+  /** Comment thread for the open doc — owned by PathViewer so the
+   *  floating "+ Comment" button can push new rows into the same
+   *  store the rail reads from, no double round-trip. */
+  comments?: CommentDTO[]
+  commentsOpen?: boolean
+  setCommentsOpen?: (v: boolean) => void
+  /** Click a comment row → parent scrolls/highlights the anchor. */
+  onScrollToComment?: (c: CommentDTO) => void
+  /** Delete (author-or-admin) — parent handles auth + refresh. */
+  onDeleteComment?: (c: CommentDTO) => void | Promise<void>
+  /** Toggle resolved flag. Anyone with read access can flip this. */
+  onResolveComment?: (c: CommentDTO, resolved: boolean) => void | Promise<void>
+  /** Copy a deep-link to this comment to the clipboard. */
+  onCopyCommentLink?: (c: CommentDTO) => void | Promise<void>
+  /** Signed-in user — used to show the trash affordance only on the
+   *  caller's own rows (admins can still delete; the server enforces
+   *  the actual permission). */
+  currentUsername?: string | null
+  /** Comment whose row should be flashed + scrolled into view in the
+   *  rail. Set by the parent when the user clicks an in-doc
+   *  highlight; cleared on a timer so the flash auto-fades. */
+  focusedCommentId?: string | null
 }
 
 /**
@@ -74,7 +114,37 @@ export function DocRail({
   activeDiffTs,
   onPickVersion,
   versionsReloadKey,
+  awareness,
+  peersOpen = false,
+  setPeersOpen,
+  ownerOpt,
+  comments,
+  commentsOpen = false,
+  setCommentsOpen,
+  onScrollToComment,
+  onDeleteComment,
+  onResolveComment,
+  onCopyCommentLink,
+  currentUsername,
+  focusedCommentId,
 }: Props) {
+  const focusedRowRef = useRef<HTMLLIElement | null>(null)
+  useEffect(() => {
+    if (!focusedCommentId) return
+    // Defer to next frame so the list has rendered the row.
+    const id = focusedCommentId
+    const raf = requestAnimationFrame(() => {
+      const el = focusedRowRef.current
+      if (el && el.dataset.commentId === id) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [focusedCommentId])
+  // Track which comment's link was just copied so we can flip
+  // the link icon to a check briefly — gives the user explicit
+  // visual confirmation that the click did something.
+  const [copiedCommentId, setCopiedCommentId] = useState<string | null>(null)
   const [versions, setVersions] = useState<Version[] | null>(null)
   const [versionsError, setVersionsError] = useState<string | null>(null)
   /** Per-version line-delta vs the chronologically older snapshot.
@@ -85,13 +155,27 @@ export function DocRail({
     new Map(),
   )
 
+  // Stale-while-revalidate refetch. We only blank the list when
+  // the user navigates to a different doc (or owner) — purely a
+  // reload-key bump (after the user makes an edit) keeps the
+  // existing list visible while the new one is fetched in the
+  // background. Without this, every save flashed the list to its
+  // loading skeleton and felt glitchy.
+  const lastFetchKeyRef = useRef<string>('')
   useEffect(() => {
     let cancelled = false
-    setVersions(null)
-    setVersionsError(null)
-    setDeltaByTs(new Map())
+    const docKey = `${path}::${ownerOpt ?? ''}`
+    const isDocChange = lastFetchKeyRef.current !== docKey
+    lastFetchKeyRef.current = docKey
+    if (isDocChange) {
+      // Different doc — old data isn't relevant. Clear so we don't
+      // flash someone else's history for half a second.
+      setVersions(null)
+      setVersionsError(null)
+      setDeltaByTs(new Map())
+    }
     api
-      .fileVersions(path)
+      .fileVersions(path, { owner: ownerOpt ?? undefined })
       .then((r) => {
         if (!cancelled) setVersions(r.versions)
       })
@@ -101,36 +185,37 @@ export function DocRail({
     return () => {
       cancelled = true
     }
-  }, [path, versionsReloadKey])
+  }, [path, versionsReloadKey, ownerOpt])
 
-  // Memoised bucketed rows — shared by the delta-compute effect
-  // and the render below. Bucketing collapses adjacent-in-time
-  // snapshots into a single row so a flurry of saves in one
-  // editing session shows up as one entry, not eight.
-  const bucketedRows = useMemo(() => {
+  // No grouping. Every snapshot is its own row — what you see in
+  // the rail is exactly what's on disk. Display is newest-first so
+  // index 0 is the latest snapshot.
+  const rows = useMemo<RowVersion[]>(() => {
     if (!versions) return []
-    return bucketByTimeWindow(collapseVersions(versions))
+    return versions.map((v, i) => ({
+      ts: v.ts,
+      sha256: v.sha256,
+      bytes: v.bytes,
+      isLatest: i === 0,
+    }))
   }, [versions])
 
-  // Once bucketed rows are known AND the user has actually opened
-  // the versions section, fetch each bucket's kept-snapshot text
-  // and compute the line-delta vs the CURRENT doc text. This
-  // mirrors what the inline diff view shows when the row is
-  // clicked — "what would change if I went back to this
-  // snapshot" — so the +/- on the row predicts the inline diff
-  // exactly. (Earlier passes diffed against the next bucket,
-  // which produced numbers that didn't match the inline view.)
+  // Per-row delta = per-edit isolation (this snapshot → next
+  // snapshot, or current for the latest). Each row shows ONLY the
+  // changes introduced by its own edit, so the section that was
+  // removed at 15:03 shows up only on 15:03's row — not on every
+  // earlier row that happened to also contain it.
   useEffect(() => {
-    if (bucketedRows.length === 0) return
+    if (rows.length === 0) return
     if (!versionsOpen) return
     if (text === null) return
     let cancelled = false
     const FETCH_LIMIT = 30
-    const slice = bucketedRows.slice(0, FETCH_LIMIT)
+    const slice = rows.slice(0, FETCH_LIMIT)
     Promise.all(
       slice.map((v) =>
         api
-          .fileVersionText(path, v.ts)
+          .fileVersionText(path, v.ts, { owner: ownerOpt ?? undefined })
           .then((r) => [v.ts, r.text ?? ''] as const)
           .catch(() => [v.ts, ''] as const),
       ),
@@ -138,44 +223,63 @@ export function DocRail({
       if (cancelled) return
       const textByTs = new Map<number, string>(pairs)
       const map = new Map<number, { added: number; removed: number }>()
-      for (const v of slice) {
+      for (let i = 0; i < slice.length; i++) {
+        const v = slice[i]
         const snapText = textByTs.get(v.ts) ?? ''
-        if (!snapText && text === '') continue
-        // Same direction as the inline view: (snapshot → current).
-        // `ins` lines count as added (in current, not in snapshot),
-        // `del` as removed (in snapshot, not in current).
-        map.set(v.ts, computeLineDiffCounts(snapText, text))
+        // Right side: the NEXT more recent snapshot's text (since
+        // rows is desc, slice[i-1] is newer). For the latest row
+        // (i === 0), compare to the live doc text.
+        const afterText =
+          i === 0 ? text : textByTs.get(slice[i - 1].ts) ?? ''
+        if (!snapText && !afterText) continue
+        map.set(v.ts, computeLineDiffCounts(snapText, afterText))
       }
       setDeltaByTs(map)
     })
     return () => {
       cancelled = true
     }
-  }, [bucketedRows, versionsOpen, path, text])
+  }, [rows, versionsOpen, path, text, ownerOpt])
 
   const hasVersions = (versions?.length ?? 0) > 0 || !!versionsError
   // Mirror the versions auto-hide: when the doc has no headings to
   // outline, skip the Outline section entirely. Without this an
   // empty doc would still show a rail icon that opens an empty pane.
-  const eitherOpen = (outlineOpen && hasOutlineList) || (versionsOpen && hasVersions)
+  const peers = usePeers(awareness ?? null)
+  const hasPeers = peers.length > 0
+  // Comments icon always shows when the parent passes a comments
+  // array (even an empty one) — the rail is the only place to open
+  // the panel + see history, so hiding the entry point when count=0
+  // would also hide the route to past resolved threads.
+  const hasComments = Array.isArray(comments)
+  const eitherOpen =
+    (outlineOpen && hasOutlineList) ||
+    (versionsOpen && hasVersions) ||
+    (peersOpen && hasPeers) ||
+    (commentsOpen && hasComments)
 
-  // No outline + no versions → the entire rail is dead weight. Hide.
-  if (!hasOutlineList && !hasVersions) return null
+  // Even without outline or versions, the rail still surfaces the
+  // co-editing peers / comments sections — so it's only fully empty
+  // if every track is unavailable.
+  if (!hasOutlineList && !hasVersions && !hasPeers && !hasComments) return null
+  const commentCount = comments?.length ?? 0
+  const openCommentCount = comments?.filter((c) => !c.resolved).length ?? 0
 
   return (
     <>
       {!eitherOpen ? (
         <div
           className="w-8 shrink-0 border-l flex flex-col items-stretch"
-          style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
+          style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
         >
           {hasOutlineList && (
             <RailIconButton
               label="Expand outline"
               icon={<List size={12} />}
               onClick={() => {
-                // Mutually exclusive — opening outline closes versions.
+                // Mutually exclusive across all three sections.
                 setVersionsOpen(false)
+                setPeersOpen?.(false)
                 setOutlineOpen(true)
               }}
             />
@@ -186,15 +290,80 @@ export function DocRail({
               icon={<Clock size={12} />}
               onClick={() => {
                 setOutlineOpen(false)
+                setPeersOpen?.(false)
                 setVersionsOpen(true)
+              }}
+            />
+          )}
+          {hasPeers && (
+            <RailIconButton
+              label={`Peers · ${peers.length}`}
+              icon={
+                <span className="relative inline-flex">
+                  <Users size={12} />
+                  <span
+                    className="absolute -top-1 -right-1.5 inline-flex items-center justify-center text-[8.5px] font-semibold rounded-full leading-none"
+                    style={{
+                      background: 'var(--accent)',
+                      color: 'white',
+                      minWidth: 10,
+                      height: 10,
+                      padding: '0 2px',
+                    }}
+                  >
+                    {peers.length}
+                  </span>
+                </span>
+              }
+              onClick={() => {
+                setOutlineOpen(false)
+                setVersionsOpen(false)
+                setCommentsOpen?.(false)
+                setPeersOpen?.(true)
+              }}
+            />
+          )}
+          {hasComments && (
+            <RailIconButton
+              label={
+                openCommentCount > 0
+                  ? `Comments · ${openCommentCount} open`
+                  : commentCount > 0
+                    ? `Comments · ${commentCount} resolved`
+                    : 'Comments'
+              }
+              icon={
+                <span className="relative inline-flex">
+                  <MessageSquare size={12} />
+                  {openCommentCount > 0 && (
+                    <span
+                      className="absolute -top-1 -right-1.5 inline-flex items-center justify-center text-[8.5px] font-semibold rounded-full leading-none"
+                      style={{
+                        background: 'var(--accent)',
+                        color: 'white',
+                        minWidth: 10,
+                        height: 10,
+                        padding: '0 2px',
+                      }}
+                    >
+                      {openCommentCount}
+                    </span>
+                  )}
+                </span>
+              }
+              onClick={() => {
+                setOutlineOpen(false)
+                setVersionsOpen(false)
+                setPeersOpen?.(false)
+                setCommentsOpen?.(true)
               }}
             />
           )}
         </div>
       ) : (
         <aside
-          className="w-[240px] shrink-0 border-l overflow-y-auto"
-          style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
+          className="w-[300px] shrink-0 border-l overflow-y-auto"
+          style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
         >
           {outlineOpen && hasOutlineList && (
             <>
@@ -246,11 +415,8 @@ export function DocRail({
                   )}
                   {(() => {
                     if (!versions) return null
-                    // Compact display: collapse runs of identical
-                    // sha256 (back-to-back snapshots with no actual
-                    // change) and group rows by their day so the
-                    // user can scan the timeline at a glance.
-                    const rows = bucketedRows
+                    // No collapsing — each snapshot is its own row.
+                    // Grouped only by calendar day for visual scan.
                     return groupedByDay(rows).map((group) => (
                       <div key={group.dayKey} className="mb-2">
                         <div className="px-2 pt-1.5 pb-1 text-[10px] uppercase tracking-wider font-semibold text-subtle">
@@ -273,7 +439,7 @@ export function DocRail({
                             title={
                               text === null
                                 ? 'Loading doc…'
-                                : `Show diff against current — ${new Date(v.ts).toLocaleString()}`
+                                : `Show diff — ${new Date(v.ts).toLocaleString()}`
                             }
                           >
                             <div className="flex items-center gap-1.5 leading-tight">
@@ -288,14 +454,6 @@ export function DocRail({
                                   title="Latest snapshot"
                                 >
                                   *
-                                </span>
-                              )}
-                              {v.duplicateCount > 1 && (
-                                <span
-                                  className="text-[10.5px] text-subtle leading-none"
-                                  title={`${v.duplicateCount} snapshots folded into this entry (consecutive identical content or rapid-fire edits within 5 minutes)`}
-                                >
-                                  ×{v.duplicateCount}
                                 </span>
                               )}
                             </div>
@@ -331,10 +489,225 @@ export function DocRail({
               </div>
             </>
           )}
+          {peersOpen && hasPeers && (
+            <>
+              <SectionHeader
+                icon={<Users size={11} />}
+                label="Peers"
+                count={peers.length}
+                open={true}
+                onToggle={() => setPeersOpen?.(false)}
+              />
+              <ul
+                className="divide-y"
+                style={{ borderColor: 'var(--border)' }}
+              >
+                {peers.map((p) => (
+                  <li
+                    key={p.clientId}
+                    className="flex items-center gap-2 px-3 py-2 text-[12px]"
+                  >
+                    <span
+                      className="inline-flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-semibold text-white shrink-0"
+                      style={{ background: p.color }}
+                    >
+                      {peerInitial(p.name)}
+                    </span>
+                    <span className="text-fg truncate flex-1">{p.name}</span>
+                  </li>
+                ))}
+              </ul>
+              <div
+                className="px-3 py-2 text-[10.5px]"
+                style={{
+                  color: 'var(--fg-subtle)',
+                  borderTop: '1px solid var(--border)',
+                }}
+              >
+                Their cursors are coloured inline in the editor — open
+                Edit mode to see live caret + selection.
+              </div>
+            </>
+          )}
+          {commentsOpen && hasComments && (
+            <>
+              <SectionHeader
+                icon={<MessageSquare size={11} />}
+                label="Comments"
+                count={commentCount || undefined}
+                open={true}
+                onToggle={() => setCommentsOpen?.(false)}
+              />
+              {commentCount === 0 ? (
+                <div
+                  className="px-3 py-3 text-[11.5px]"
+                  style={{ color: 'var(--fg-subtle)' }}
+                >
+                  Select text in the doc and use the floating
+                  <span
+                    className="mx-1 inline-flex items-center"
+                    style={{ color: 'var(--accent)' }}
+                  >
+                    Comment
+                  </span>
+                  button to start a thread.
+                </div>
+              ) : (
+                <ul className="py-1">
+                  {comments!.map((c, idx) => {
+                    const mine = !!currentUsername && c.author === currentUsername
+                    const focused = focusedCommentId === c.id
+                    const isLast = idx === comments!.length - 1
+                    return (
+                      <li
+                        key={c.id}
+                        ref={focused ? focusedRowRef : undefined}
+                        data-comment-id={c.id}
+                        className="group px-3 py-3 text-[12px] transition-colors cursor-pointer hover:bg-[var(--hover)]"
+                        style={{
+                          opacity: c.resolved ? 0.55 : 1,
+                          background: focused
+                            ? 'color-mix(in srgb, var(--accent) 14%, transparent)'
+                            : undefined,
+                          // Hair-thin divider in the theme's own
+                          // border color — not the Tailwind divide-y
+                          // default that was reading as harsh white
+                          // in dark mode.
+                          borderBottom: isLast
+                            ? 'none'
+                            : '1px solid var(--border)',
+                        }}
+                        // Whole-row click jumps to the doc anchor.
+                        // Trash/Resolve buttons stop propagation so
+                        // they don't also fire this.
+                        onClick={() => onScrollToComment?.(c)}
+                        title="Jump to comment anchor"
+                      >
+                        <div>
+                          <div
+                            className="flex items-center gap-1.5 mb-1.5 text-[11.5px]"
+                            style={{ color: 'var(--fg-subtle)' }}
+                          >
+                            <Quote size={10} className="shrink-0" />
+                            <span
+                              className="flex-1 min-w-0 truncate italic"
+                              title={c.quote}
+                            >
+                              {c.quote}
+                            </span>
+                          </div>
+                          <div
+                            className="whitespace-pre-wrap break-words leading-snug"
+                            style={{
+                              color: 'var(--fg)',
+                              textDecoration: c.resolved ? 'line-through' : 'none',
+                            }}
+                          >
+                            {c.text}
+                          </div>
+                        </div>
+                        <div
+                          className="mt-2 flex items-center gap-1.5 text-[10.5px] min-w-0"
+                          style={{ color: 'var(--fg-subtle)' }}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <span className="truncate min-w-0">{c.author}</span>
+                          <span aria-hidden className="shrink-0">·</span>
+                          <span className="shrink-0 whitespace-nowrap">
+                            {formatTimestamp(c.createdAt)}
+                          </span>
+                          <div className="flex-1" />
+                          {/* Action group — trash, copy-link, resolve.
+                              Fixed-width container so columns line up
+                              across every row regardless of perms. */}
+                          <div
+                            className="shrink-0 flex items-center justify-end gap-1"
+                            style={{ width: 78 }}
+                          >
+                            <button
+                              type="button"
+                              className="comment-action-btn h-6 w-6 rounded inline-flex items-center justify-center transition-colors cursor-pointer disabled:cursor-not-allowed"
+                              style={{
+                                color: mine ? 'var(--danger-fg)' : 'var(--fg-subtle)',
+                                opacity: mine ? 1 : 0.35,
+                              }}
+                              onClick={() => mine && void onDeleteComment?.(c)}
+                              disabled={!mine}
+                              title={
+                                mine ? 'Delete comment' : 'Only the author can delete this'
+                              }
+                              aria-label="Delete comment"
+                            >
+                              <Trash2 size={11} />
+                            </button>
+                            <button
+                              type="button"
+                              className="comment-action-btn h-6 w-6 rounded inline-flex items-center justify-center transition-colors cursor-pointer"
+                              style={{
+                                color:
+                                  copiedCommentId === c.id
+                                    ? 'var(--accent)'
+                                    : 'var(--fg-subtle)',
+                              }}
+                              onClick={async () => {
+                                await onCopyCommentLink?.(c)
+                                setCopiedCommentId(c.id)
+                                window.setTimeout(() => {
+                                  setCopiedCommentId((cur) =>
+                                    cur === c.id ? null : cur,
+                                  )
+                                }, 1500)
+                              }}
+                              title={
+                                copiedCommentId === c.id
+                                  ? 'Link copied!'
+                                  : 'Copy link to this comment'
+                              }
+                              aria-label="Copy comment link"
+                            >
+                              {copiedCommentId === c.id ? (
+                                <Check size={11} />
+                              ) : (
+                                <LinkIcon size={11} />
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              className="comment-action-btn h-6 w-6 rounded inline-flex items-center justify-center transition-colors cursor-pointer"
+                              style={{
+                                color: c.resolved ? 'var(--accent)' : 'var(--fg-subtle)',
+                              }}
+                              onClick={() =>
+                                void onResolveComment?.(c, !c.resolved)
+                              }
+                              title={c.resolved ? 'Re-open this comment' : 'Mark resolved'}
+                              aria-label={c.resolved ? 'Re-open' : 'Resolve'}
+                            >
+                              <Check size={12} />
+                            </button>
+                          </div>
+                        </div>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </>
+          )}
         </aside>
       )}
     </>
   )
+}
+
+function formatTimestamp(ts: number): string {
+  const d = new Date(ts)
+  const now = Date.now()
+  const diffMin = Math.floor((now - ts) / 60000)
+  if (diffMin < 1) return 'just now'
+  if (diffMin < 60) return `${diffMin}m ago`
+  if (diffMin < 60 * 24) return `${Math.floor(diffMin / 60)}h ago`
+  return d.toLocaleDateString()
 }
 
 function RailIconButton({
@@ -375,7 +748,7 @@ function SectionHeader({
   return (
     <div
       className="sticky top-0 h-11 px-3 border-b text-[10.5px] uppercase tracking-wider font-semibold text-subtle flex items-center gap-1.5"
-      style={{ background: 'var(--rail)', borderColor: 'var(--border)' }}
+      style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}
     >
       {icon}
       <span className="flex-1">{label}</span>
@@ -403,60 +776,6 @@ type RowVersion = {
   sha256: string
   bytes: number
   isLatest: boolean
-  /** How many adjacent snapshots had this exact sha256 (1 = the
-   *  original, 2 = collapsed one duplicate, etc.). */
-  duplicateCount: number
-}
-
-/** Collapse runs of consecutive identical sha256 into a single row.
- *  Input is newest-first; the kept row is the newest of each run.
- *  Also computes byte deltas vs the chronologically prior version
- *  (the row immediately BELOW it in the newest-first list). */
-function collapseVersions(versions: Version[]): RowVersion[] {
-  const out: RowVersion[] = []
-  for (let i = 0; i < versions.length; i++) {
-    const v = versions[i]
-    const last = out[out.length - 1]
-    if (last && last.sha256 === v.sha256) {
-      last.duplicateCount++
-      continue
-    }
-    out.push({
-      ts: v.ts,
-      sha256: v.sha256,
-      bytes: v.bytes,
-      isLatest: i === 0,
-      duplicateCount: 1,
-    })
-  }
-  return out
-}
-
-/** Time-window bucketing: collapse rows that fall within
- *  BUCKET_WINDOW_MS of each other into a single row. Solves the
- *  "I made 8 tiny edits in 9 minutes and now I have 8 versions"
- *  problem — a flurry of saves during one editing session
- *  shouldn't crowd the list. The kept row is the NEWEST in each
- *  bucket (which is what users care about — "where did we end
- *  up after that edit session?"). duplicateCount accumulates the
- *  raw count so the ×N badge reflects how many snapshots were
- *  folded in.
- *
- *  Input is newest-first. */
-const BUCKET_WINDOW_MS = 60 * 1000 // 1 minute — collapse sub-minute edit bursts
-function bucketByTimeWindow(rows: RowVersion[]): RowVersion[] {
-  const out: RowVersion[] = []
-  for (const r of rows) {
-    const last = out[out.length - 1]
-    // last is NEWER than r (we go newest-first). Bucket together
-    // if r is within WINDOW_MS BEFORE the bucket's newest entry.
-    if (last && last.ts - r.ts <= BUCKET_WINDOW_MS) {
-      last.duplicateCount += r.duplicateCount
-      continue
-    }
-    out.push({ ...r })
-  }
-  return out
 }
 
 type DayGroup = { dayKey: string; dayLabel: string; items: RowVersion[] }

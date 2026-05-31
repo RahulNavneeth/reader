@@ -224,7 +224,7 @@ export function TagsButton({ path, tags, kind = 'file', owner, onSaved }: Props)
           <div
             className="px-2 py-1.5 flex flex-wrap items-center gap-1 cursor-text max-h-[120px] overflow-y-auto"
             style={{
-              background: 'var(--bg)',
+              background: 'var(--input-bg)',
               borderBottom: hasSuggestionArea ? '1px solid var(--border)' : undefined,
             }}
             onClick={() => inputRef.current?.focus()}

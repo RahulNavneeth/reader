@@ -35,8 +35,16 @@ export default {
         mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
       boxShadow: {
-        card: '0 1px 1px rgba(9,30,66,0.08), 0 0 1px rgba(9,30,66,0.16)',
-        raised: '0 4px 8px -2px rgba(9,30,66,0.16), 0 0 1px rgba(9,30,66,0.20)',
+        // Decorative shadows neutralised — Reader uses a flat
+        // style with borders for separation. `shadow-card` and
+        // `shadow-raised` are still referenced by many components
+        // (popovers, modals, scroll-to-top buttons); rather than
+        // chase down every usage, redefine the tokens to `none`
+        // so the existing markup loses the shadow without
+        // touching every file. The 1 px borders already in place
+        // do the elevation work on their own.
+        card: 'none',
+        raised: 'none',
       },
     },
   },

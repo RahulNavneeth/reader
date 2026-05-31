@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, Clock, AlertCircle, Play, FileText, ArrowUp, Check, X } from 'lucide-react'
+import { ArrowLeft, Clock, AlertCircle, Play, FileText, ArrowUp, X } from 'lucide-react'
+import { SelectIndicator } from './SelectIndicator'
 import { ApiError, api } from '../lib/api'
 import { CalendarHeatmap } from './CalendarHeatmap'
 import { BulkTagsButton } from './BulkTagsButton'
@@ -72,8 +73,10 @@ export function TimelinePage() {
   // `loading=false` before either setLoading commits. A ref flips
   // synchronously.
   const inFlight = useRef(false)
-  const loadPage = async (next: string | null) => {
-    if (inFlight.current || done) return
+  const loadPage = async (
+    next: string | null,
+  ): Promise<{ days: DayGroup[]; nextCursor: string | null } | null> => {
+    if (inFlight.current || done) return null
     inFlight.current = true
     setLoading(true)
     setError(null)
@@ -83,12 +86,43 @@ export function TimelinePage() {
       setCursor(r.nextCursor)
       setTotal(r.total)
       if (!r.nextCursor) setDone(true)
+      return { days: r.days, nextCursor: r.nextCursor }
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
+      return null
     } finally {
       setLoading(false)
       inFlight.current = false
     }
+  }
+
+  /** Click a calendar cell whose day section hasn't been loaded
+   *  yet — walk forward through the cursor pages until either the
+   *  closest-day-on-or-before lands in the DOM or we run out. Used
+   *  by the heatmap's onDayClick so pagination doesn't make the
+   *  click feel dead. */
+  const scrollToDay = async (clickedDay: string) => {
+    let nearest = days.find((g) => g.day <= clickedDay)
+    let curCursor = cursor
+    let safetyCap = 20
+    while (!nearest && curCursor && safetyCap-- > 0) {
+      // Wait for any concurrent infinite-scroll load to settle so we
+      // don't double-fire loadPage and skip pages.
+      while (inFlight.current) {
+        await new Promise((r) => setTimeout(r, 40))
+      }
+      const r = await loadPage(curCursor)
+      if (!r) break
+      curCursor = r.nextCursor
+      nearest = r.days.find((g) => g.day <= clickedDay) ?? nearest
+    }
+    if (!nearest) return
+    // rAF so React commits the appended sections before we look
+    // them up in the DOM.
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-day="${nearest!.day}"]`)
+      el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
   }
 
   useEffect(() => {
@@ -204,7 +238,22 @@ export function TimelinePage() {
         )}
       </header>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6">
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto px-6 py-6"
+        onClick={(e) => {
+          // Click-outside-to-clear: drop any active selection when
+          // the user clicks anywhere that isn't a tile or other
+          // interactive control. `closest('button, a, input')`
+          // catches the tile buttons themselves (which already
+          // handled the click via onItemClick), so we only clear
+          // when the click landed on actual empty grid space.
+          if (selection.size === 0) return
+          const t = e.target as HTMLElement
+          if (t.closest('button, a, input, [data-keep-selection]')) return
+          clearSelection()
+        }}
+      >
         {error && (
           <div
             className="mb-4 px-3 py-2 rounded text-[12.5px] inline-flex items-center gap-2 max-w-[1080px] mx-auto"
@@ -218,7 +267,7 @@ export function TimelinePage() {
           <div className="h-full flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--surface-2)', border: '1px dashed var(--border)' }}
             >
               <Clock size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No documents yet</div>
@@ -239,11 +288,17 @@ export function TimelinePage() {
           {days.length > 0 && (
             <CalendarHeatmap
               onDayClick={(day) => {
-                const el = document.querySelector(`[data-day="${day}"]`)
-                if (el) {
-                  el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                }
+                // scrollToDay walks pagination forward if the target
+                // day hasn't been loaded yet, so clicking an old
+                // cell doesn't silently no-op just because the
+                // infinite scroll hasn't reached that page.
+                void scrollToDay(day)
               }}
+              // Future scheduled-template cell click → open the
+              // template doc itself. Beats trying to scroll-to-day
+              // (no section exists yet for future dates) and lets
+              // the user jump straight to "what is this thing".
+              onTemplateClick={(template) => openItem(template)}
             />
           )}
           {days.map((g) => (
@@ -266,25 +321,18 @@ export function TimelinePage() {
                   <button
                     key={it.docId}
                     onClick={(e) => onItemClick(it.path, e)}
-                    className="group relative overflow-hidden rounded-md"
+                    className="group relative overflow-hidden rounded-md transition-colors hover:border-[var(--accent)]"
                     style={{
                       aspectRatio: '1 / 1',
-                      background: 'var(--viewer)',
-                      border: isSel
-                        ? '2px solid var(--accent)'
-                        : '1px solid var(--border)',
-                      outline: isSel ? '2px solid var(--accent)' : undefined,
-                      outlineOffset: isSel ? '-2px' : undefined,
-                      // Subtle shadow lifts the tile off the
-                      // near-white canvas in light mode where
-                      // the bg vs surface-3 luminance delta is
-                      // only ~5% (white on #F4F5F7). The shadow
-                      // is theme-neutral — it reads as elevation
-                      // in both modes without darkening the
-                      // dark-mode look.
-                      boxShadow: isSel
-                        ? '0 0 0 3px rgba(76, 110, 245, 0.18)'
-                        : '0 1px 3px rgba(9, 30, 66, 0.08)',
+                      // Tile sits one tier above the page body
+                      // (`--surface-3`) — uses `--surface-2` so
+                      // the card has a subtle elevation without
+                      // popping as the brighter `--viewer` white
+                      // strip in light mode. Hover promotes the
+                      // border to accent; selected state tints
+                      // with `--selected`.
+                      background: isSel ? 'var(--selected)' : 'var(--surface-2)',
+                      border: `1px solid ${isSel ? 'var(--accent)' : 'var(--border)'}`,
                     }}
                     title={
                       selection.size > 0
@@ -292,47 +340,61 @@ export function TimelinePage() {
                         : it.name
                     }
                   >
-                    {/* Hover-revealed select checkbox — same
-                        affordance the FolderGrid tiles expose.
-                        Clicking it toggles selection without
-                        opening the doc; once anything is
-                        selected the whole grid enters selection
-                        mode (plain clicks become toggles). */}
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.preventDefault()
-                        e.stopPropagation()
-                        toggleSelected(it.path, true)
-                      }}
-                      className={`absolute top-1.5 left-1.5 w-5 h-5 rounded-md inline-flex items-center justify-center z-10 transition-opacity ${
-                        isSel || selection.size > 0
-                          ? 'opacity-100'
-                          : 'opacity-0 group-hover:opacity-100'
-                      }`}
-                      style={{
-                        background: isSel ? 'var(--accent)' : 'var(--surface-1)',
-                        border: `1px solid ${isSel ? 'var(--accent)' : 'var(--border)'}`,
-                      }}
-                      title={isSel ? 'Deselect' : 'Select'}
-                      aria-label={isSel ? 'Deselect' : 'Select'}
-                    >
-                      {isSel && (
-                        <Check size={11} color="white" strokeWidth={3} />
-                      )}
-                    </button>
+                    {/* Selected tile keeps its checkbox permanently
+                        visible so deselecting is a one-click
+                        affordance. Unselected tiles only reveal
+                        the checkbox on hover — even when other
+                        tiles ARE selected — so the grid doesn't
+                        fill with unchecked boxes the user isn't
+                        engaging with. File/folder tiles use the
+                        theme-aware `light` variant; photo / video
+                        thumbnails use `over-image` so the check
+                        reads against the image itself. */}
+                    {isSel && (
+                      <SelectIndicator
+                        checked
+                        variant={
+                          it.kind === 'image' || it.kind === 'video'
+                            ? 'over-image'
+                            : 'light'
+                        }
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          toggleSelected(it.path, true)
+                        }}
+                      />
+                    )}
+                    {!isSel && (
+                      <span
+                        className="absolute top-1.5 left-1.5 opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                      >
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            toggleSelected(it.path, true)
+                          }}
+                          className="w-4 h-4 rounded flex items-center justify-center"
+                          style={{
+                            background: 'var(--bg)',
+                            border: '1px solid var(--border)',
+                          }}
+                          title="Select"
+                          aria-label="Select"
+                        />
+                      </span>
+                    )}
                     {it.kind === 'file' ? (
-                      // Non-media doc — no thumbnail to show; render a
-                      // generic file tile with truncated filename so the
-                      // grid stays visually uniform alongside media tiles.
-                      // Uses --viewer (the same "content panel" var
-                      // FolderGrid + doc viewer use) so the tile pops
-                      // as white-on-gray in light mode and dark-panel-
-                      // on-bg in dark mode. `--surface-2` collapsed
-                      // into the surrounding canvas in light mode.
+                      // Non-media doc — no thumbnail to show; render
+                      // a generic icon-and-filename tile so the grid
+                      // stays visually uniform alongside media tiles.
+                      // Inner div is transparent — the outer button
+                      // already provides the surface-2 fill / hover
+                      // tint / selected tint we want.
                       <div
                         className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-2"
-                        style={{ background: 'var(--viewer)' }}
                       >
                         <FileText size={28} className="text-subtle" strokeWidth={1.4} />
                         <div className="text-[11px] text-fg text-center leading-tight line-clamp-3 break-all">

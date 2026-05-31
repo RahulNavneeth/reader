@@ -208,6 +208,7 @@ export default defineConfig({
             url.startsWith('/icons/') ||
             url.startsWith('/assets/') ||
             url === '/favicon.ico' ||
+            url === '/icon.svg' ||
             url === '/manifest.webmanifest' ||
             url === '/sw.js'
           ) {

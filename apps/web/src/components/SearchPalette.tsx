@@ -231,7 +231,6 @@ export function SearchPalette({ open, query, onClose, inputRef }: Props) {
       style={{
         background: 'var(--panel)',
         border: '1px solid var(--border)',
-        boxShadow: '0 8px 24px -8px rgba(9,30,66,0.18)',
         maxHeight: '70vh',
       }}
     >

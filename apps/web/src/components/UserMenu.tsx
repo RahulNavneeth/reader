@@ -18,9 +18,11 @@ import {
   Check,
   AlertCircle,
   Loader2,
+  Terminal,
 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { ApiError, api, type PublicUser } from '../lib/api'
+import { useVimMode } from '../lib/uiPrefs'
 
 type Props = {
   user: PublicUser
@@ -32,6 +34,7 @@ export function UserMenu({ user, onLogout }: Props) {
   const ref = useRef<HTMLDivElement>(null)
   const navigate = useNavigate()
   const isAdmin = user.role === 'admin'
+  const [vimEnabled, setVim] = useVimMode()
   const [reindexing, setReindexing] = useState(false)
   const [reindexResult, setReindexResult] = useState<{
     ok: boolean
@@ -142,6 +145,29 @@ export function UserMenu({ user, onLogout }: Props) {
           >
             <Trash2 size={13} className="text-muted" />
             Trash
+          </button>
+          <button
+            className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors border-t"
+            style={{ borderColor: 'var(--border)' }}
+            onClick={() => setVim(!vimEnabled)}
+            role="switch"
+            aria-checked={vimEnabled}
+            title={
+              vimEnabled
+                ? 'Vim mode on — markdown editor uses vim keybindings'
+                : 'Vim mode off'
+            }
+          >
+            <Terminal size={13} className="text-muted" />
+            <span className="flex-1">Vim mode</span>
+            <span
+              className="inline-flex items-center text-[10.5px] font-semibold uppercase tracking-wide"
+              style={{
+                color: vimEnabled ? 'var(--accent)' : 'var(--fg-subtle)',
+              }}
+            >
+              {vimEnabled ? 'On' : 'Off'}
+            </span>
           </button>
           <button
             className="w-full text-left px-3 py-2 text-[13px] text-fg hover:bg-hover flex items-center gap-2 transition-colors border-t"

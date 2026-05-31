@@ -17,15 +17,15 @@ import type { ReactNode } from 'react'
  */
 
 export function SettingsListCard({ children }: { children: ReactNode }) {
-  // Bordered card on the surface-3 page body. The viewer surface
-  // gives most of the framing, the 1px border tightens the edge
-  // without reading as a hard saturated line — works in both
-  // themes now that the body sits a tier below the card.
+  // Bordered card on the surface-3 page body. Uses `--surface-2`
+  // for one tier of elevation against the page chrome — was
+  // `--viewer` (= pure white in light mode) which read as a
+  // bright slab instead of an inline section.
   return (
     <div
       className="rounded-md overflow-hidden settings-list-card"
       style={{
-        background: 'var(--viewer)',
+        background: 'var(--surface-2)',
         border: '1px solid var(--border)',
       }}
     >
@@ -44,7 +44,7 @@ export function SettingsListEmpty({
   return (
     <div
       className="rounded-md p-8 text-center"
-      style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
+      style={{ background: 'var(--surface-2)', border: '1px dashed var(--border)' }}
     >
       <div className="text-[14px] text-fg font-medium">{title}</div>
       <div className="text-[12px] text-subtle mt-1.5">{hint}</div>

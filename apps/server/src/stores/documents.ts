@@ -338,6 +338,29 @@ export function isFrozenForArchive(meta: DocumentMeta): boolean {
   return !!meta.archived
 }
 
+/** Owner-controlled write freeze. Locked docs reject every mutation
+ *  (CRDT autosave, MCP edit, upload overwrite, chat apply-edit,
+ *  delete, move, etc.) for EVERYONE (including the owner) until the
+ *  owner explicitly unlocks. Admins bypass — they need an escape
+ *  hatch to recover stuck workflows.
+ *
+ *  This matches the user's mental model: "lock prevents editing
+ *  until the file owner opens (unlocks)". An owner who tries to
+ *  mutate a doc they themselves locked gets the same 423 — they
+ *  unlock explicitly, then mutate, instead of forgetting they'd
+ *  locked it. */
+export function isFrozenForLock(
+  meta: DocumentMeta,
+  _actor: { username: string; role: string } | null,
+): boolean {
+  // Locks apply to EVERYONE — including the owner and admins. The
+  // intent is "this is frozen until someone explicitly unlocks it",
+  // not "lock except for the special people". Admins can still
+  // unlock and then mutate; the unlock action itself is fast.
+  void _actor
+  return !!meta.locked
+}
+
 export function sha256Of(buffer: Buffer): string {
   return crypto.createHash('sha256').update(buffer).digest('hex')
 }

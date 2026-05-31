@@ -197,6 +197,39 @@ async function materialise(
       markCrdtMaterialised(docId, Date.now())
       return
     }
+    // Lock gate. The CRDT may have absorbed keystrokes from the
+    // editor before the meta loaded, but we refuse to commit them
+    // to disk while the doc is locked. The editor's UI will also
+    // gate on `locked` and switch to read-only, so this is the
+    // server-side safety net. Admin bypass via the isFrozen helper.
+    if (meta.locked) {
+      // eslint-disable-next-line no-console
+      console.warn('[crdt] refusing autosave — doc is locked', {
+        docId,
+        path: locator.storageKey,
+      })
+      return
+    }
+    // Folder cascade — refuse if any ancestor folder is locked.
+    try {
+      const { findLockedAncestor } = await import('../stores/folderMetas.js')
+      const ancestor = await findLockedAncestor(
+        meta.owner,
+        meta.storageKey,
+        actor ? { username: actor, role: 'editor' } : null,
+      )
+      if (ancestor) {
+        // eslint-disable-next-line no-console
+        console.warn('[crdt] refusing autosave — ancestor folder locked', {
+          docId,
+          path: locator.storageKey,
+          ancestor: ancestor.storageKey,
+        })
+        return
+      }
+    } catch {
+      /* swallow — lock guard is best-effort */
+    }
     // Snapshot the PRE-edit state before we overwrite it so the
     // Versions panel has an "undo" anchor — but only for WS-direct
     // typing. Route-layer callers (chat apply-edit, MCP write,
@@ -209,11 +242,24 @@ async function materialise(
     // leaving a row with `hasText: false`.
     if (source === 'ws') {
       const { snapshotVersion } = await import('../stores/versions.js')
-      await snapshotVersion(docId, {
-        actor,
-        source: 'crdt',
-        reason: 'autosave',
-      }).catch(() => null)
+      try {
+        await snapshotVersion(docId, {
+          actor,
+          source: 'crdt',
+          reason: 'autosave',
+        })
+      } catch (err) {
+        // Surface snapshot failures — silently swallowing them
+        // (the old `.catch(() => null)`) is exactly what produced
+        // the "I edited but no new version row appeared" bug. We
+        // still let the write/ingest proceed so the doc isn't
+        // stuck — but the operator now has a trail to diagnose.
+        // eslint-disable-next-line no-console
+        console.error(
+          '[crdt] snapshotVersion failed before autosave write',
+          { docId, owner: locator.owner, path: locator.storageKey, err },
+        )
+      }
     }
     await mkdir(path.dirname(abs), { recursive: true })
     markExpectedWrite(abs, newSha)
@@ -246,8 +292,17 @@ async function materialise(
         meta: { docId, bytes: buf.length },
       }).catch(() => null)
     }
-  } catch {
-    /* see flush() — best-effort, retry on next persist. */
+  } catch (err) {
+    // Best-effort — the next persist tick retries — but at least
+    // log so a hung or throwing path doesn't make edits silently
+    // vanish (which previously surfaced as "snapshot not taken").
+    // eslint-disable-next-line no-console
+    console.error('[crdt] materialise failed', {
+      docId,
+      owner: locator.owner,
+      path: locator.storageKey,
+      err,
+    })
   }
 }
 
@@ -321,8 +376,18 @@ function attach(docId: string, locator?: DocLocator): Entry {
     // pre-existing markdown file. Fires the registry's update
     // listener exactly once — Yjs delivers that to peers as a
     // single insert, much smaller than per-char broadcasting.
-    if (locator && !snapshot.state) {
-      void maybeSeedFromDisk(doc, locator)
+    //
+    // Also runs when there IS a snapshot but the body Y.Text is
+    // empty (snapshot exists for some other field, or got
+    // truncated). Without this fallback a share recipient hitting
+    // Edit on a doc with a "valid but body-less" CRDT snapshot
+    // sees an empty editor + Offline pill — the WS syncs cleanly
+    // but the body is genuinely empty server-side.
+    if (locator) {
+      const ytext = doc.getText('body')
+      if (ytext.length === 0) {
+        void maybeSeedFromDisk(doc, locator)
+      }
     }
     doc.on('update', () => {
       // We may not have an entry anymore if the doc was evicted

@@ -1,0 +1,89 @@
+# Reader ↔ OpenWebUI overlay.
+#
+# Adds mcpo (Model Context Protocol → OpenAPI proxy) + an optional
+# OpenWebUI instance on top of the base reader stack. OpenWebUI
+# doesn't speak MCP natively; mcpo translates Reader's MCP tools
+# into OpenAPI endpoints OpenWebUI registers as a "Tool Server".
+#
+# Quick start:
+#   1. Sign in to Reader → Settings → API tokens → New token.
+#      Copy the secret (shown once).
+#   2. Add to `.env`:
+#        READER_API_TOKEN=<the token from step 1>
+#        MCPO_API_KEY=<any long random string; OpenWebUI ↔ mcpo shared secret>
+#   3. Bring the overlay up alongside the base stack:
+#        docker compose -f docker-compose.yml \
+#                       -f docker-compose.openwebui.yml \
+#                       up -d
+#   4. Open OpenWebUI at http://localhost:3000 and:
+#        Settings → Tools → Add Tool Server
+#          URL:     http://mcpo:8000
+#          API Key: <MCPO_API_KEY>
+#      The full Reader tool list (search_knowledge, upload_text,
+#      etc.) shows up under that tool server.
+#
+# If you already run OpenWebUI elsewhere, omit the `open-webui`
+# service block and point your existing instance at
+# http://<this-host>:${MCPO_PORT:-8000}.
+
+services:
+  mcpo:
+    # uv-managed Python proxy that wraps an MCP server as OpenAPI.
+    # https://github.com/open-webui/mcpo
+    image: ghcr.io/open-webui/mcpo:latest
+    container_name: reader-mcpo
+    restart: unless-stopped
+    ports:
+      - "${MCPO_PORT:-8000}:8000"
+    environment:
+      # mcpo's own auth — what OpenWebUI sends as Bearer when
+      # calling the OpenAPI endpoints. Distinct from the upstream
+      # Reader token so you can rotate either independently.
+      MCPO_API_KEY: ${MCPO_API_KEY:?set MCPO_API_KEY in .env}
+      READER_API_TOKEN: ${READER_API_TOKEN:?set READER_API_TOKEN in .env (create at Settings → API tokens)}
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${MCPO_API_KEY}
+      - --server-type
+      - streamable-http
+      - --header
+      - "Authorization=Bearer ${READER_API_TOKEN}"
+      - --
+      # Reader's MCP endpoint inside the compose network. If you're
+      # pointing at a remote Reader, replace with the public URL.
+      - http://reader:3001/mcp
+    depends_on:
+      reader:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/docs >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  # Optional — drop this block if you already host OpenWebUI elsewhere.
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: reader-open-webui
+    restart: unless-stopped
+    ports:
+      - "${OPENWEBUI_PORT:-3000}:8080"
+    environment:
+      # Point at any OpenAI-compatible chat backend. The example
+      # below uses the same Ollama instance Reader ships with —
+      # OpenWebUI has first-class Ollama support.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      # OpenWebUI's web-app secret (separate from Reader's).
+      WEBUI_SECRET_KEY: ${OPENWEBUI_SECRET_KEY:-change-me-to-a-long-random-string}
+    volumes:
+      - ./_state/open-webui:/app/backend/data
+    depends_on:
+      mcpo:
+        condition: service_healthy
+      ollama:
+        condition: service_started

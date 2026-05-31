@@ -77,6 +77,14 @@ export interface ScheduledFire {
   /** Optional human-friendly label so the admin UI can name the
    *  entry (otherwise we render the cron as the heading). */
   label?: string
+  /** IANA timezone the cron should be evaluated in (e.g.
+   *  `Asia/Kolkata`). Without this, cron-parser uses the server
+   *  process's TZ — which in a typical container is UTC, so a
+   *  user who wrote `0 6 * * 1,4` expecting their local 6 AM
+   *  would see the fire happen at 6 AM UTC. Per-schedule
+   *  override; falls back to the file-level `tz`, then
+   *  `READER_DEFAULT_TZ`, then the server TZ. */
+  tz?: string
 }
 
 export interface TemplateMetadata {
@@ -92,6 +100,9 @@ export interface TemplateMetadata {
    *  single-schedule shape. Surfaced in list_templates so a
    *  client expecting the old shape keeps working. */
   schedule?: string
+  /** File-level default timezone for all `schedules[]` entries
+   *  that don't override `tz` themselves. */
+  tz?: string
 }
 
 export interface TemplateParseResult {
@@ -169,6 +180,7 @@ function coerceScheduleEntry(raw: unknown): ScheduledFire | null {
   if (typeof r.path === 'string' && r.path.trim()) entry.path = r.path.trim()
   if (typeof r.title === 'string' && r.title.trim()) entry.title = r.title.trim()
   if (typeof r.label === 'string' && r.label.trim()) entry.label = r.label.trim()
+  if (typeof r.tz === 'string' && r.tz.trim()) entry.tz = r.tz.trim()
   return entry
 }
 
@@ -182,6 +194,7 @@ function coerceMetadata(raw: unknown): TemplateMetadata {
       if (decl) meta.vars.push(decl)
     }
   }
+  if (typeof r.tz === 'string' && r.tz.trim()) meta.tz = r.tz.trim()
   // New shape: `schedules:` array of full fire configs.
   if (Array.isArray(r.schedules)) {
     for (const item of r.schedules) {

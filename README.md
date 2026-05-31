@@ -796,6 +796,46 @@ want; deny the rest.
 - Admins: Settings → **OAuth clients** — see every registered client
   (DCR is open), delete rogue or stale registrations.
 
+### Option 3 — OpenWebUI (via mcpo)
+
+OpenWebUI doesn't speak MCP natively — its tool servers are
+OpenAPI. The standard bridge is [**mcpo**](https://github.com/open-webui/mcpo),
+a small proxy that wraps an MCP server and re-exposes its tools as
+OpenAPI endpoints OpenWebUI can register.
+
+The compose overlay does everything wiring-wise:
+
+```bash
+# 1. Get a Reader API token (Settings → API tokens → New token).
+# 2. Add to .env:
+#      READER_API_TOKEN=<the token>
+#      MCPO_API_KEY=<long random string, OpenWebUI ↔ mcpo shared secret>
+# 3. Bring the overlay up alongside the base stack:
+docker compose -f docker-compose.yml \
+               -f docker-compose.openwebui.yml \
+               up -d
+```
+
+Then in OpenWebUI at http://localhost:3000:
+
+1. **Settings → Tools → Add Tool Server**
+2. URL: `http://mcpo:8000` (or `http://<host>:8000` if OpenWebUI runs elsewhere)
+3. API Key: the `MCPO_API_KEY` from `.env`
+
+The full Reader tool catalog shows up under that tool server —
+your local LLM (Ollama, llama.cpp, anything OpenAI-compatible
+OpenWebUI is configured against) can now `search_knowledge`,
+`upload_text`, `replace_section`, etc.
+
+**Already running OpenWebUI?** Skip the `open-webui` service block
+in the overlay; the `mcpo` service alone is enough. Point your
+existing OpenWebUI at `http://<this-host>:8000`.
+
+**Pointing mcpo at a remote Reader.** The overlay assumes mcpo and
+Reader live in the same compose network. For a remote Reader,
+edit the last line of the `mcpo` service `command:` block to your
+public URL (e.g., `https://reader.example.com/mcp`).
+
 **Session-secret rotation**
 
 OAuth client secrets and webhook secrets are encrypted at rest with

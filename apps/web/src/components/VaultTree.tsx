@@ -16,6 +16,19 @@ import clsx from 'clsx'
 import { useNavigate } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { useVault } from '../lib/vault-context'
+import { useSidebarSelection } from '../lib/sidebarSelection'
+
+/**
+ * Module-level scratchpad holding the current drag's source
+ * path(s). dataTransfer reads are blocked in `dragover` for
+ * security, but we still need to know what's being dragged to
+ * tell whether a hovered folder is a valid target. The source
+ * row sets this on drag start, clears on drag end.
+ */
+const currentDragSrcRef: { path: string; bulk: string[] } = {
+  path: '',
+  bulk: [],
+}
 
 type Props = {
   node: VaultNode
@@ -40,8 +53,11 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
   const [children, setChildren] = useState<VaultNode[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [dropTarget, setDropTarget] = useState(false)
+  const [dropReject, setDropReject] = useState(false)
   const navigate = useNavigate()
   const { refreshNonce, refresh, setVaultError } = useVault()
+  const multiSel = useSidebarSelection()
+  const isMultiSelected = multiSel.isSelected(node.path)
 
   const isSelected = node.type === 'file' && selectedPath === node.path
 
@@ -97,7 +113,20 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshNonce])
 
-  const onClick = async () => {
+  const onClick = async (e: React.MouseEvent) => {
+    // Shift-click: toggle multi-select instead of navigating or
+    // expanding. Lets the user assemble a bulk selection across
+    // folders and drag the whole set in one gesture.
+    if (e.shiftKey) {
+      if (owner) return // share recipients don't get bulk-move
+      e.preventDefault()
+      e.stopPropagation()
+      multiSel.toggle(node.path)
+      return
+    }
+    // Plain click clears any prior multi-selection and falls
+    // through to the normal navigate / expand.
+    if (multiSel.selected.size > 0) multiSel.clear()
     if (node.type === 'dir') {
       const next = !expanded
       setExpanded(next)
@@ -114,8 +143,28 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
   const onDragStart = (e: React.DragEvent) => {
     // Drag-to-move is owner-only — share recipients can't restructure
     // someone else's vault.
-    if (node.type !== 'file' || owner) return
-    e.dataTransfer.setData('application/x-reader-path', node.path)
+    if (owner) return
+    // Folder drag now allowed alongside files. The server's
+    // `/api/file/move` accepts either and rewrites every
+    // descendant's storageKey when given a folder path.
+    // If THIS node is part of a multi-selection (>1 paths),
+    // ship the whole set as a JSON array so the drop target can
+    // bulk-move. Otherwise just the single path.
+    const sel = multiSel.selected
+    const isInSel = sel.has(node.path) && sel.size > 1
+    if (isInSel) {
+      const arr = Array.from(sel)
+      e.dataTransfer.setData(
+        'application/x-reader-paths',
+        JSON.stringify(arr),
+      )
+      currentDragSrcRef.path = ''
+      currentDragSrcRef.bulk = arr
+    } else {
+      e.dataTransfer.setData('application/x-reader-path', node.path)
+      currentDragSrcRef.path = node.path
+      currentDragSrcRef.bulk = []
+    }
     e.dataTransfer.effectAllowed = 'move'
     // Use the row itself as the drag image, anchored to where the cursor
     // actually grabbed it, so the preview follows the pointer instead of
@@ -131,30 +180,106 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
 
   const onDragOver = (e: React.DragEvent) => {
     if (node.type !== 'dir' || owner) return
-    if (!e.dataTransfer.types.includes('application/x-reader-path')) return
+    const types = e.dataTransfer.types
+    if (
+      !types.includes('application/x-reader-path') &&
+      !types.includes('application/x-reader-paths')
+    ) {
+      return
+    }
+    // Reject self-as-parent and folder-into-self / descendant.
+    // We can't read dataTransfer DATA in dragover (browser
+    // security), but the dragged path is in the DOM via
+    // `data-reader-drag-src` set on the source row at dragStart.
+    // Check it to decide whether to show a "won't accept" cue.
+    const dragSrc = currentDragSrcRef.path
+    const dragBulk = currentDragSrcRef.bulk
+    const wouldReject = (() => {
+      if (dragSrc) {
+        if (node.path === dragSrc) return true
+        if (node.path === dragSrc + '/' || node.path.startsWith(dragSrc + '/'))
+          return true
+        const srcParent = dragSrc.includes('/')
+          ? dragSrc.slice(0, dragSrc.lastIndexOf('/'))
+          : ''
+        if (srcParent === node.path) return true
+      }
+      if (dragBulk.length > 0) {
+        // If every bulk item would be rejected at this target,
+        // the whole drop is a no-op.
+        const allRejected = dragBulk.every((s) => {
+          if (node.path === s) return true
+          if (node.path === s + '/' || node.path.startsWith(s + '/')) return true
+          const sp = s.includes('/') ? s.slice(0, s.lastIndexOf('/')) : ''
+          return sp === node.path
+        })
+        if (allRejected) return true
+      }
+      return false
+    })()
+    if (wouldReject) {
+      e.dataTransfer.dropEffect = 'none'
+      setDropReject(true)
+      setDropTarget(false)
+      e.preventDefault()
+      return
+    }
     e.preventDefault()
     e.dataTransfer.dropEffect = 'move'
+    setDropReject(false)
     if (!dropTarget) setDropTarget(true)
   }
 
-  const onDragLeave = () => setDropTarget(false)
+  const onDragLeave = () => {
+    setDropTarget(false)
+    setDropReject(false)
+  }
 
   const onDrop = async (e: React.DragEvent) => {
     if (node.type !== 'dir') return
     setDropTarget(false)
-    const src = e.dataTransfer.getData('application/x-reader-path')
-    if (!src) return
+    // Bulk move (Cmd-click multi-select): JSON array of paths.
+    // Single move: plain string. Both are file OR folder paths
+    // — the server's /api/file/move handles either.
+    let srcs: string[] = []
+    const bulkRaw = e.dataTransfer.getData('application/x-reader-paths')
+    if (bulkRaw) {
+      try {
+        const parsed = JSON.parse(bulkRaw)
+        if (Array.isArray(parsed)) srcs = parsed.filter((p): p is string => typeof p === 'string')
+      } catch {
+        /* fall through to single-path branch */
+      }
+    }
+    if (srcs.length === 0) {
+      const single = e.dataTransfer.getData('application/x-reader-path')
+      if (single) srcs = [single]
+    }
+    if (srcs.length === 0) return
     e.preventDefault()
     e.stopPropagation()
-    const filename = src.split('/').pop()
-    if (!filename) return
-    const target = node.path ? `${node.path}/${filename}` : filename
-    if (src === target) return
-    // Bail if dropping a file into its own current directory.
-    const srcParent = src.includes('/') ? src.slice(0, src.lastIndexOf('/')) : ''
-    if (srcParent === node.path) return
+    // Refuse drops that would create a cycle (folder into itself
+    // or any descendant) or no-op moves (drop into the same
+    // parent the file already lives in).
+    const targetDir = node.path
+    const filtered: { src: string; target: string }[] = []
+    for (const src of srcs) {
+      const filename = src.split('/').pop()
+      if (!filename) continue
+      const target = targetDir ? `${targetDir}/${filename}` : filename
+      if (src === target) continue
+      if (targetDir === src) continue // folder into itself
+      if (targetDir === `${src}/` || targetDir.startsWith(src + '/')) continue
+      const srcParent = src.includes('/') ? src.slice(0, src.lastIndexOf('/')) : ''
+      if (srcParent === targetDir) continue
+      filtered.push({ src, target })
+    }
+    if (filtered.length === 0) return
     try {
-      await api.move(src, target)
+      for (const { src, target } of filtered) {
+        await api.move(src, target)
+      }
+      multiSel.clear()
       if (!expanded) {
         setExpanded(true)
         await loadChildren()
@@ -170,11 +295,40 @@ export function VaultTree({ node, depth, selectedPath, activePath, owner }: Prop
   return (
     <div>
       <div
-        className={clsx('tree-item group', isSelected && 'selected')}
-        style={{ paddingLeft: 8 + depth * 14 }}
+        className={clsx(
+          'tree-item group',
+          (isSelected || isMultiSelected) && 'selected',
+        )}
+        style={{
+          paddingLeft: 8 + depth * 14,
+          // Drag-state visuals (in priority order):
+          //   - dropReject: red dashed outline (current target
+          //     would refuse the drop — same parent / self /
+          //     descendant) so the user knows nothing will move.
+          //   - isMultiSelected: accent tint marking the bulk-
+          //     drag selection.
+          ...(dropReject
+            ? {
+                outline: '1px dashed var(--danger-fg)',
+                outlineOffset: -2,
+                cursor: 'not-allowed',
+              }
+            : isMultiSelected
+              ? {
+                  background:
+                    'color-mix(in srgb, var(--accent) 16%, transparent)',
+                  outline: '1px solid color-mix(in srgb, var(--accent) 40%, transparent)',
+                }
+              : null),
+        }}
         onClick={onClick}
-        draggable={node.type === 'file' && !owner}
+        draggable={!owner}
         onDragStart={onDragStart}
+        onDragEnd={() => {
+          currentDragSrcRef.path = ''
+          currentDragSrcRef.bulk = []
+          setDropReject(false)
+        }}
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         onDrop={onDrop}

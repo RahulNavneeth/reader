@@ -881,7 +881,7 @@ export function ChatDock({
   return (
     <aside
       className="w-[380px] shrink-0 border-l flex flex-col relative"
-      style={{ borderColor: 'var(--border)', background: 'var(--rail)' }}
+      style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}
     >
       {/* Header height pinned to h-11 so the h-7 trigger button
           has 8px of vertical air top + bottom, matching the px-2
@@ -889,7 +889,7 @@ export function ChatDock({
           so both rails align when open. */}
       <div
         className="sticky top-0 z-30 h-11 px-2 border-b flex items-center gap-1 shrink-0 relative"
-        style={{ background: 'var(--rail)', borderColor: 'var(--border)' }}
+        style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}
       >
         {/* Thread switcher dropdown. Click opens a popover listing
             every thread for this (doc, user) plus a "New chat"
@@ -1165,7 +1165,7 @@ export function ChatDock({
       {indexedOk && (
       <div
         className="shrink-0 px-3 py-2.5 relative"
-        style={{ background: 'var(--rail)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         {/* Slash-command suggestions — popped above the composer
             when the draft starts with `/`. Click to accept the
@@ -2361,7 +2361,6 @@ function SlashMenu({ draft, onAccept }: { draft: string; onAccept: (verb: string
       style={{
         background: 'var(--panel)',
         border: '1px solid var(--border)',
-        boxShadow: '0 6px 16px rgba(15, 23, 42, 0.10)',
       }}
     >
       {commands.map((c) => (

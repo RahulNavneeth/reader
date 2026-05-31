@@ -123,7 +123,12 @@ export function CollectionDetailPage() {
     >
       <header
         className="h-11 px-3 flex items-center gap-2 border-b border-app shrink-0"
-        style={{ background: 'var(--panel-2)' }}
+        // `--surface-2` matches the breadcrumb header on every
+        // other page (Archive, Trash, PathViewer, …); the previous
+        // `--panel-2` was the lightest tier in dark mode and
+        // popped as a brighter blue strip versus the surrounding
+        // chrome.
+        style={{ background: 'var(--surface-2)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0 shrink-0"
@@ -244,7 +249,7 @@ export function CollectionDetailPage() {
           <div className="flex-1 flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--surface-2)', border: '1px dashed var(--border)' }}
             >
               <Layers size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No items yet</div>
@@ -268,13 +273,8 @@ export function CollectionDetailPage() {
                 className="group relative overflow-hidden rounded-md"
                 style={{
                   aspectRatio: '1 / 1',
-                  background: 'var(--viewer)',
+                  background: 'var(--surface-2)',
                   border: '1px solid var(--border)',
-                  // Same lift the TimelinePage tiles use — the
-                  // canvas vs --viewer luminance delta is too
-                  // small in light mode without a shadow to
-                  // separate the card.
-                  boxShadow: '0 1px 3px rgba(9, 30, 66, 0.08)',
                 }}
               >
                 <button
@@ -285,7 +285,6 @@ export function CollectionDetailPage() {
                   {it.kind === 'file' ? (
                     <div
                       className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-2"
-                      style={{ background: 'var(--viewer)' }}
                     >
                       <FileText size={28} className="text-subtle" strokeWidth={1.4} />
                       <div className="text-[11px] text-fg text-center leading-tight line-clamp-3 break-all">

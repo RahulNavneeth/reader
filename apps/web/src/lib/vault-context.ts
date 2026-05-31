@@ -3,6 +3,11 @@ import { createContext, useContext } from 'react'
 export type VaultContextValue = {
   /** Open the OS file picker. */
   triggerUpload: () => void
+  /** Open the OS folder picker (Chrome/Edge/Safari, via
+   *  `webkitdirectory`). Selected files keep their relative path
+   *  in `webkitRelativePath`, which the uploader uses to recreate
+   *  the directory tree under the current vault folder. */
+  triggerFolderUpload: () => void
   /** Upload an explicit set of files. If `dir` is omitted, the destination dialog is shown. */
   uploadFiles: (files: FileList | File[], dir?: string) => Promise<void>
   /** Prompt for a folder name and create it (relative to vault root). */

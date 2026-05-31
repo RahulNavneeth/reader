@@ -9,19 +9,20 @@ import {
   FileCode,
   Sparkles,
   Upload,
+  FolderUp,
   Loader2,
   Globe,
   Lock,
-  Trash2,
+  Shield,
   X,
   Star,
   CheckSquare,
   Square,
 } from 'lucide-react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ApiError, api, type VaultNode } from '../lib/api'
 import { useVault } from '../lib/vault-context'
-import { useConfirm } from '../lib/confirm'
+import { vaultUrl } from '../lib/vaultUrl'
 import { PathBreadcrumb } from './PathBreadcrumb'
 import { MakePublicPopover } from './MakePublicPopover'
 import { ShareWithUserButton } from './ShareWithUserButton'
@@ -29,10 +30,13 @@ import { TagsButton } from './TagsButton'
 import { ActivityButton } from './ActivityButton'
 import { RevokePublicPopover } from './RevokePublicPopover'
 import { PinButton } from './PinButton'
+import { BulkDeleteButton } from './BulkDeleteButton'
+import { BulkLockButton, LockButton } from './LockButton'
 import { BulkCollectionsButton } from './BulkCollectionsButton'
 import { BulkTagsButton } from './BulkTagsButton'
 import { BulkArchiveButton } from './BulkArchiveButton'
 import { OnThisDayCard } from './OnThisDayCard'
+import { SelectIndicator, selectionTileStyle } from './SelectIndicator'
 
 type FolderMetaShape = {
   owner: string
@@ -42,6 +46,7 @@ type FolderMetaShape = {
   publicExpiresAt?: number | null
   hasPassword: boolean
   publicPasswordHash?: string | null
+  locked?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -51,20 +56,23 @@ export function FolderGrid({
   canEdit = true,
 }: { initialPath?: string; canEdit?: boolean } = {}) {
   const navigate = useNavigate()
-  const confirm = useConfirm()
   const [searchParams] = useSearchParams()
+  const routeParams = useParams()
   // When viewing a path owned by another user (via a user-to-user share),
-  // the URL carries `?owner=<username>`. We thread it through every read
-  // call so the server treats us as a cross-owner caller and consults the
-  // share grant instead of denying access.
-  const ownerHint = searchParams.get('owner') || undefined
+  // the owner shows up either as the `/u/<owner>/…` route segment
+  // (preferred) or the legacy `?owner=<username>` query string. Either
+  // way we thread it through every read call so the server treats us
+  // as a cross-owner caller and consults the share grant instead of
+  // denying access.
+  const ownerHint =
+    routeParams.owner || searchParams.get('owner') || undefined
   const callerOpts = ownerHint ? { owner: ownerHint } : undefined
   // Cross-owner context (browsing someone else's shared path). Owner-
   // only controls (Tags / Activity / Share / Public / Private / bulk
   // toolbar) hide in this mode — the recipient can read and navigate
   // but not mutate the owner's vault.
   const isSharedView = !!ownerHint
-  const { triggerUpload, refresh, refreshNonce, currentFolder, setCurrentFolder } = useVault()
+  const { triggerUpload, triggerFolderUpload, refresh, refreshNonce, currentFolder, setCurrentFolder, currentUsername } = useVault()
   const [dir, setDir] = useState<string>(initialPath ?? currentFolder)
 
   // Honor URL-driven path changes (e.g. user clicks a Public folder link in a
@@ -95,24 +103,37 @@ export function FolderGrid({
   // recipients stay navigation-only.
   const showEditControls = !isSharedView || (canEdit && !partialAccess)
 
-  const load = useCallback(async (rel: string) => {
-    setLoading(true)
-    setError(null)
-    setPartialAccess(false)
-    // Clear stale items so a failed fetch doesn't render the previous
-    // folder's tiles under the error banner.
-    setItems(null)
-    try {
-      const r = await api.list(rel, callerOpts)
-      setItems(r.items)
-      setPartialAccess(!!r.partialAccess)
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-      setItems([])
-    } finally {
-      setLoading(false)
-    }
-  }, [callerOpts?.owner])
+  /** Stale-while-revalidate: keep showing the current tiles while
+   *  re-fetching. Only blank the grid when the directory itself
+   *  changes (different vault folder) — purely a `refresh()` bump
+   *  (lock toggle, tag edit, etc.) leaves the existing tiles up
+   *  and swaps in new data when it arrives. */
+  const lastLoadDirRef = useRef<string>('')
+  const load = useCallback(
+    async (rel: string) => {
+      const isDirChange = lastLoadDirRef.current !== rel
+      lastLoadDirRef.current = rel
+      setLoading(true)
+      setError(null)
+      if (isDirChange) {
+        // Different folder — old data isn't relevant. Blank so a
+        // failed fetch doesn't render the previous folder's tiles.
+        setPartialAccess(false)
+        setItems(null)
+      }
+      try {
+        const r = await api.list(rel, callerOpts)
+        setItems(r.items)
+        setPartialAccess(!!r.partialAccess)
+      } catch (e) {
+        setError(e instanceof ApiError ? e.message : String(e))
+        if (isDirChange) setItems([])
+      } finally {
+        setLoading(false)
+      }
+    },
+    [callerOpts?.owner],
+  )
 
   useEffect(() => {
     load(dir)
@@ -168,24 +189,21 @@ export function FolderGrid({
   // paths now (no `/folder` or `/docs` prefix); VaultView's resolver
   // figures out which viewer to mount. State stays synced via the
   // initialPath effect above.
-  // Carry the `?owner=` (shared vault) query through any in-app
-  // navigation so the recipient stays in the share context as they
-  // browse around.
-  const ownerSuffix = ownerHint ? `?owner=${encodeURIComponent(ownerHint)}` : ''
+  // Carry the shared-owner namespace (`/u/<owner>/…`) through any
+  // in-app navigation so the recipient stays in the share context
+  // as they browse around.
   const goToFolder = useCallback(
     (rel: string) => {
-      const segs = rel.split('/').filter(Boolean).map(encodeURIComponent).join('/')
-      navigate(`${segs ? `/${segs}` : '/'}${ownerSuffix}`)
+      navigate(vaultUrl(rel, { owner: ownerHint, requester: currentUsername }))
     },
-    [navigate, ownerSuffix],
+    [navigate, ownerHint, currentUsername],
   )
 
   const onOpen = (node: VaultNode) => {
     if (node.type === 'dir') {
       goToFolder(node.path)
     } else {
-      const segs = node.path.split('/').map(encodeURIComponent).join('/')
-      navigate(`/${segs}${ownerSuffix}`)
+      navigate(vaultUrl(node.path, { owner: ownerHint, requester: currentUsername }))
     }
   }
 
@@ -262,6 +280,25 @@ export function FolderGrid({
     return { privateTargets: priv, publicTargets: pub }
   }, [items, selectedPaths])
 
+  // Same split-by-current-state pattern for the lock toggle.
+  // lockedTargets are the items that would UNLOCK on click; the
+  // unlocked ones would lock. Each button operates only on its
+  // own subset so a mixed selection gets two buttons (matching
+  // the Public/Private UX).
+  const { lockedTargets, unlockedTargets } = useMemo(() => {
+    const locked: string[] = []
+    const unlocked: string[] = []
+    if (!items) return { lockedTargets: locked, unlockedTargets: unlocked }
+    const byPath = new Map(items.map((n) => [n.path, n]))
+    for (const p of selectedPaths) {
+      const n = byPath.get(p)
+      if (!n) continue
+      if (n.locked) locked.push(p)
+      else unlocked.push(p)
+    }
+    return { lockedTargets: locked, unlockedTargets: unlocked }
+  }, [items, selectedPaths])
+
   // Folder-level visibility breakdown — shown as counts inside the Public
   // and Private toolbar buttons so the user can see at-a-glance how many
   // items inside are currently in each state.
@@ -297,38 +334,6 @@ export function FolderGrid({
       document.removeEventListener('keydown', onKey)
     }
   }, [selection.size])
-
-  const runBulkDelete = async () => {
-    if (selectedPaths.length === 0) return
-    const ok = await confirm({
-      title: 'Move to Trash',
-      message: `${selectedPaths.length} item${selectedPaths.length === 1 ? '' : 's'} will be moved to Trash. You can restore them within the retention window.`,
-      confirmLabel: 'Move to Trash',
-      destructive: true,
-    })
-    if (!ok) return
-    setBusy('delete')
-    setError(null)
-    try {
-      const r = await api.bulkDelete(selectedPaths)
-      setSelection(new Set())
-      refresh()
-      if (r.failed > 0 && r.errors.length > 0) {
-        // Surface the per-file reasons so the user can act on them
-        // (fix a permission, re-select after rename, etc.) instead of
-        // seeing a silent "0 deleted".
-        const preview = r.errors.slice(0, 5)
-          .map((e) => `• ${e.path} — ${e.reason}`)
-          .join('\n')
-        const more = r.errors.length > 5 ? `\n…and ${r.errors.length - 5} more` : ''
-        setError(`${r.failed} item${r.failed === 1 ? '' : 's'} could not be deleted:\n${preview}${more}`)
-      }
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e))
-    } finally {
-      setBusy(null)
-    }
-  }
 
   return (
     <div ref={rootRef} className="h-full flex flex-col" style={{ background: 'var(--surface-3)' }}>
@@ -412,9 +417,17 @@ export function FolderGrid({
                 popover. Targets are the items that would actually
                 change: revoke targets the already-public ones,
                 publish targets the already-private ones. */}
+            {/* Count is only meaningful when the selection has BOTH
+                kinds — otherwise "Public (N)" / Private(N) is just
+                duplicating the selection size. Show the bare icon in
+                a homogeneous selection. */}
             {publicTargets.length > 0 && (
               <RevokePublicPopover
-                triggerLabel={`Public (${publicTargets.length})`}
+                triggerLabel={
+                  privateTargets.length > 0
+                    ? `Public (${publicTargets.length})`
+                    : 'Public'
+                }
                 publicCount={publicTargets.length}
                 folderPublic={false}
                 onRevoke={async () => {
@@ -440,8 +453,8 @@ export function FolderGrid({
                     title={`Publish ${privateTargets.length} private item${privateTargets.length === 1 ? '' : 's'}`}
                     aria-label="Publish selected"
                   >
-                    <Lock size={13} />
-                    {privateTargets.length > 1 && (
+                    <Shield size={13} />
+                    {publicTargets.length > 0 && privateTargets.length > 1 && (
                       <span className="text-[10px] font-semibold tabular-nums">
                         {privateTargets.length}
                       </span>
@@ -460,6 +473,28 @@ export function FolderGrid({
                 that handles folder cascade. Hidden when the selection
                 is empty; the button itself confirms before firing. */}
             <BulkArchiveButton paths={selectedPaths} onChanged={refresh} />
+            {/* Lock/Unlock split — mirrors Public/Private. Locked
+                items show the Unlock button (operates only on them),
+                unlocked items show the Lock button (operates only on
+                them). In a mixed selection both buttons appear with
+                counts so the user can act on each group separately
+                instead of toggling the whole selection. */}
+            {unlockedTargets.length > 0 && (
+              <BulkLockButton
+                paths={unlockedTargets}
+                locked={true}
+                showCount={lockedTargets.length > 0 && unlockedTargets.length > 1}
+                onChanged={refresh}
+              />
+            )}
+            {lockedTargets.length > 0 && (
+              <BulkLockButton
+                paths={lockedTargets}
+                locked={false}
+                showCount={unlockedTargets.length > 0 && lockedTargets.length > 1}
+                onChanged={refresh}
+              />
+            )}
             {/* Share-with-user fans out to every selected path under
                 one recipient/permission combo — no need to pick each
                 target one at a time. */}
@@ -548,16 +583,14 @@ export function FolderGrid({
                 )}
               </button>
             )}
-            <button
-              className="btn-ghost"
-              disabled={!!busy}
-              onClick={runBulkDelete}
-              title="Move to Trash"
-              aria-label="Move to Trash"
-              style={{ color: '#BF2600' }}
-            >
-              {busy === 'delete' ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
-            </button>
+            <BulkDeleteButton
+              paths={selectedPaths}
+              onDeleted={() => {
+                setSelection(new Set())
+                refresh()
+              }}
+              onError={(m) => setError(m)}
+            />
             <button
               className="btn-ghost h-7 w-7 px-0"
               onClick={() => setSelection(new Set())}
@@ -603,7 +636,11 @@ export function FolderGrid({
                     options (cascades public). */}
                 {folderSummary.pub > 0 && (
                   <RevokePublicPopover
-                    triggerLabel={`Public (${folderSummary.pub})`}
+                    triggerLabel={
+                      folderSummary.priv > 0
+                        ? `Public (${folderSummary.pub})`
+                        : 'Public'
+                    }
                     publicCount={folderSummary.pub}
                     folderPublic={!!folderMeta.public}
                     folderExpiresAt={folderMeta.publicExpiresAt}
@@ -639,14 +676,24 @@ export function FolderGrid({
                         title={`Publish ${folderSummary.priv} private item${folderSummary.priv === 1 ? '' : 's'}`}
                         aria-label="Publish folder"
                       >
-                        <Lock size={13} />
-                        {folderSummary.priv > 1 && (
+                        <Shield size={13} />
+                        {folderSummary.pub > 0 && folderSummary.priv > 1 && (
                           <span className="text-[10px] font-semibold tabular-nums">
                             {folderSummary.priv}
                           </span>
                         )}
                       </button>
                     }
+                  />
+                )}
+                {/* Lock the entire folder — refuses every mutation
+                    inside until unlocked. Root folder excluded. */}
+                {dir !== '' && (
+                  <LockButton
+                    path={dir}
+                    locked={!!folderMeta?.locked}
+                    isFolder
+                    onChanged={refresh}
                   />
                 )}
                 {/* Pin a folder to the sidebar. Root folder (dir === "")
@@ -666,6 +713,25 @@ export function FolderGrid({
                     is icon-only with a themed confirm dialog. */}
                 {dir !== '' && (
                   <BulkArchiveButton paths={[dir]} onChanged={refresh} />
+                )}
+                {/* Move the entire folder to Trash. Same component as
+                    BulkArchiveButton sits next to, just the destructive
+                    sibling. Root folder excluded (you can't trash the
+                    whole vault). After server confirms, navigate to
+                    the parent so the user isn't left looking at a
+                    folder that no longer exists. */}
+                {dir !== '' && (
+                  <BulkDeleteButton
+                    paths={[dir]}
+                    title="Move folder to Trash"
+                    message={`"${dir.split('/').pop()}" and everything inside it will be moved to Trash. You can restore items within the retention window.`}
+                    onDeleted={() => {
+                      refresh()
+                      if (parent !== null) goToFolder(parent)
+                      else navigate('/')
+                    }}
+                    onError={(m) => setError(m)}
+                  />
                 )}
 
               </>
@@ -704,12 +770,18 @@ export function FolderGrid({
               ) : (
                 <>
                   <div className="text-[12.5px] text-muted mt-1 mb-4">
-                    Drop files anywhere on this page to upload.
+                    Drop files or a folder anywhere on this page to upload.
                   </div>
-                  <button className="btn-primary" onClick={triggerUpload}>
-                    <Upload size={14} />
-                    Upload files
-                  </button>
+                  <div className="inline-flex items-center gap-2">
+                    <button className="btn-primary" onClick={triggerUpload}>
+                      <Upload size={14} />
+                      Upload files
+                    </button>
+                    <button className="btn-ghost h-8 px-3" onClick={triggerFolderUpload}>
+                      <FolderUp size={14} />
+                      Upload folder
+                    </button>
+                  </div>
                 </>
               )}
             </div>
@@ -785,29 +857,31 @@ function GridTile({
         onOpen()
       }}
       className="group relative flex flex-col items-center justify-start gap-2 p-3 rounded-md transition-colors text-left cursor-pointer"
-      style={{
-        background: selected ? 'var(--selected)' : hover ? 'var(--border)' : 'transparent',
-        outline: selected ? '1px solid var(--accent)' : undefined,
-      }}
+      style={selectionTileStyle(selected, hover)}
     >
-      {(hover || selected) && (
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onToggleSelect()
-          }}
-          className="absolute top-1.5 left-1.5 w-4 h-4 rounded flex items-center justify-center"
+      <SelectIndicator
+        checked={selected}
+        visible={hover || selected}
+        onClick={(e) => {
+          e.stopPropagation()
+          onToggleSelect()
+        }}
+      />
+      {/* Lock indicator — same corner as the expiry chip, slightly
+          offset when both are present. Owner-controlled write
+          freeze. */}
+      {node.locked && (
+        <span
+          className="absolute top-1.5 left-1.5 inline-flex items-center justify-center w-4 h-4 rounded"
           style={{
-            background: selected ? 'var(--accent)' : 'var(--bg)',
-            border: `1px solid ${selected ? 'var(--accent)' : 'var(--border)'}`,
+            background: 'color-mix(in srgb, var(--accent) 18%, var(--panel))',
+            color: 'var(--accent)',
+            border: '1px solid color-mix(in srgb, var(--accent) 40%, transparent)',
           }}
+          title="Locked — unlock to edit, delete, or move"
         >
-          {selected && (
-            <svg width="10" height="10" viewBox="0 0 12 12" fill="none">
-              <path d="M2 6L5 9L10 3" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          )}
-        </button>
+          <Lock size={9} />
+        </span>
       )}
       {node.public && node.publicExpiresAt && (
         <span

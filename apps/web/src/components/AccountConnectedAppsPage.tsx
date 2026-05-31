@@ -194,7 +194,7 @@ export function AccountConnectedAppsPage(): JSX.Element {
 
           <div
             className="rounded-md p-3 flex items-start gap-3"
-            style={{ background: 'var(--viewer)', border: '1px solid var(--border)' }}
+            style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
           >
             <label className="flex items-start gap-2 cursor-pointer flex-1 min-w-0">
               <input

@@ -54,6 +54,11 @@ export type DocumentMeta = {
   publicPasswordHash?: string | null
   archived?: boolean
   archivedAt?: number | null
+  /** Owner-controlled write freeze. When true, every mutation
+   *  on the doc is refused with HTTP 423 until the owner unlocks. */
+  locked?: boolean
+  lockedAt?: number | null
+  lockedBy?: string | null
   templateSource?: {
     template: string
     vars: Record<string, string>
@@ -104,6 +109,9 @@ export type VaultNode = {
   public?: boolean
   publicExpiresAt?: number | null
   tags?: string[]
+  /** Owner-controlled write freeze. When true, the tile shows a
+   *  lock indicator and the server refuses every mutation with 423. */
+  locked?: boolean
 }
 
 export type SearchHit = {
@@ -269,6 +277,7 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
 
 const get = <T>(url: string) => request<T>('GET', url)
 const post = <T>(url: string, body?: unknown) => request<T>('POST', url, body)
+const del = <T>(url: string) => request<T>('DELETE', url)
 
 const q = (params: Record<string, string | number | undefined>): string => {
   const out: string[] = []
@@ -372,9 +381,33 @@ export const api = {
    *  (Accept: text/html negotiation), media tags / fetch get the raw
    *  bytes. `?p=` and `?owner=` still apply for public-password +
    *  cross-owner lookup. */
-  rawUrl: (rel: string, opts?: { password?: string; owner?: string }) => {
-    const segs = rel.split('/').filter(Boolean).map(encodeURIComponent).join('/')
-    return `/${segs}${q({ p: opts?.password, owner: opts?.owner })}`
+  rawUrl: (
+    rel: string,
+    opts?: {
+      password?: string
+      owner?: string
+      /** Parent markdown doc + its owner. When the asset is being
+       *  rendered as an inline embed, pass these so the server can
+       *  grant transitive read access (the user can read the parent
+       *  doc, and the parent embeds this asset). The asset's own
+       *  standalone URL still 403s. */
+      via?: string
+      viaOwner?: string
+    },
+  ) => {
+    // Always go through `/api/file/raw` rather than the bare path.
+    // The bare-path handler skips byte-serving when `Accept: text/html`
+    // is present (so direct browser navigations land on the SPA viewer),
+    // but iframes send exactly that Accept header — which made
+    // `<iframe src=rawUrl>` for a PDF recursively load the Reader SPA
+    // instead of the file bytes.
+    return `/api/file/raw${q({
+      path: rel,
+      p: opts?.password,
+      owner: opts?.owner,
+      via: opts?.via,
+      viaOwner: opts?.viaOwner,
+    })}`
   },
   thumbnailUrl: (rel: string, opts?: { password?: string; owner?: string }) =>
     `/api/file/thumbnail${q({ path: rel, p: opts?.password, owner: opts?.owner })}`,
@@ -450,23 +483,25 @@ export const api = {
       }[]
       folders: { path: string; name: string; owner: string; score: number }[]
     }>(`/api/files/search${q({ q: qstr, limit })}`),
-  fileVersions: (rel: string) =>
+  fileVersions: (rel: string, opts?: { owner?: string }) =>
     get<{ versions: { ts: number; sha256: string; bytes: number; title?: string; hasText: boolean }[] }>(
-      `/api/file/versions${q({ path: rel })}`,
+      `/api/file/versions${q({ path: rel, owner: opts?.owner })}`,
     ),
-  fileVersionText: (rel: string, ts: number) =>
-    get<{ ts: number; text: string }>(`/api/file/version${q({ path: rel, ts })}`),
-  fileRestoreVersion: (rel: string, ts: number) =>
+  fileVersionText: (rel: string, ts: number, opts?: { owner?: string }) =>
+    get<{ ts: number; text: string }>(
+      `/api/file/version${q({ path: rel, ts, owner: opts?.owner })}`,
+    ),
+  fileRestoreVersion: (rel: string, ts: number, opts?: { owner?: string }) =>
     post<{ document: DocumentMeta; restoredTs: number }>(
       '/api/file/version/restore',
-      { path: rel, ts },
+      { path: rel, ts, owner: opts?.owner },
     ),
   fileArchive: (rel: string, archived: boolean) =>
     post<{ document: DocumentMeta }>('/api/file/archive', { path: rel, archived }),
 
-  fileActivity: (rel: string, limit = 50) =>
+  fileActivity: (rel: string, limit = 50, opts?: { owner?: string }) =>
     get<{ entries: { ts: number; actor: string; action: string; target?: string; meta?: any }[] }>(
-      `/api/file/activity${q({ path: rel, limit })}`,
+      `/api/file/activity${q({ path: rel, limit, owner: opts?.owner })}`,
     ),
 
   // folder-level metadata
@@ -645,6 +680,29 @@ export const api = {
       '/api/account/scheduled-templates/run-now',
       { template, cron },
     ),
+  /** Per-day upcoming scheduled-template fires for the caller,
+   *  bucketed by (template, cron) so the calendar can color-code
+   *  each schedule distinctly. */
+  accountScheduledUpcoming: (from?: string, to?: string) => {
+    const params = new URLSearchParams()
+    if (from) params.set('from', from)
+    if (to) params.set('to', to)
+    const qs = params.toString()
+    return get<{
+      schedules: Array<{
+        key: string
+        template: string
+        cron: string
+        label?: string
+        color: string
+      }>
+      /** Day → list of schedule keys firing that day. No per-day
+       *  count — for a daily calendar, "fires" or "doesn't fire"
+       *  is the only relevant signal. */
+      days: Record<string, string[]>
+      total: number
+    }>(`/api/account/scheduled-templates/upcoming${qs ? `?${qs}` : ''}`)
+  },
 
   // calendar heatmap
   accountCalendar: (from?: string, to?: string) => {
@@ -710,6 +768,20 @@ export const api = {
       expiresInSeconds: opts?.expiresInSeconds ?? null,
       password: opts?.password ?? null,
     }),
+  /** Toggle the write-freeze on a file or folder. Owner / admin only.
+   *  When locked, every mutation on the target (and its descendants
+   *  if it's a folder) is refused with HTTP 423 until unlocked. */
+  lockFile: (rel: string, locked: boolean, opts?: { owner?: string }) =>
+    post<{ document?: DocumentMeta; folder?: unknown }>(
+      '/api/file/lock',
+      { path: rel, locked, owner: opts?.owner },
+    ),
+  bulkLock: (paths: string[], locked: boolean) =>
+    post<{
+      ok: number
+      failed: number
+      errors: Array<{ path: string; reason: string }>
+    }>('/api/file/bulk-lock', { paths, locked }),
   bulkDelete: (paths: string[]) =>
     post<{
       ok: number
@@ -765,15 +837,36 @@ export const api = {
     get<{
       entries: {
         id: string
+        /** 'file' (default) or 'folder' when the whole subtree was
+         *  trashed as one unit. */
+        kind?: 'file' | 'folder'
         storageKey: string
         filename: string
         docId?: string
         bytes: number
         trashedAt: number
         trashedBy: string
+        /** Folder-only: per-file manifest. */
+        children?: Array<{ storageKey: string; docId?: string; bytes: number }>
       }[]
     }>('/api/trash'),
-  trashRestore: (id: string) => post<{ ok: true }>(`/api/trash/${encodeURIComponent(id)}/restore`),
+  trashRestore: (id: string) =>
+    post<{
+      ok: boolean
+      /** Folder-entry response: number of children successfully
+       *  moved back. Omitted for file entries (always `ok: true`). */
+      restored?: number
+      /** Vault paths that couldn't be restored because something
+       *  else now lives there. Caller can show these so the user
+       *  knows what to clear before retrying. */
+      conflicts?: string[]
+      message?: string
+    }>(`/api/trash/${encodeURIComponent(id)}/restore`),
+  trashRestoreChild: (id: string, storageKey: string) =>
+    post<{ ok: true; remaining: number }>(
+      `/api/trash/${encodeURIComponent(id)}/children/restore`,
+      { storageKey },
+    ),
   trashPurge: (id: string) =>
     fetch(`/api/trash/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include', headers: { 'X-Requested-With': 'fetch' } }).then(
       async (r) => {
@@ -796,6 +889,8 @@ export const api = {
     ),
   mkdir: (rel: string) => post<{ ok: true; path: string }>('/api/folder', { path: rel }),
   move: (from: string, to: string) => post<{ ok: true }>('/api/file/move', { from, to }),
+  duplicate: (from: string, to: string) =>
+    post<{ ok: true; document: DocumentMeta }>('/api/file/duplicate', { from, to }),
 
   // search
   searchKnowledge: (
@@ -1481,6 +1576,12 @@ export const api = {
     }>(`/api/external-mounts/${encodeURIComponent(id)}/list${q({ path: rel })}`),
   externalMountFileUrl: (id: string, rel: string) =>
     `/api/external-mounts/${encodeURIComponent(id)}/file${q({ path: rel })}`,
+  importFromExternalMount: (id: string, body: { paths: string[]; dest: string }) =>
+    post<{
+      ok: boolean
+      imported: string[]
+      failed: Array<{ path: string; error: string }>
+    }>(`/api/external-mounts/${encodeURIComponent(id)}/import`, body),
 
   // admin — external library mounts
   adminListExternalMounts: () =>
@@ -1620,6 +1721,38 @@ export const api = {
       'DELETE',
       `/api/chat/${encodeURIComponent(docId)}/pending-edit/${encodeURIComponent(messageId)}/op/${opIndex}`,
     ),
+  listComments: (docId: string) =>
+    get<{ comments: CommentDTO[] }>(`/api/comments${q({ docId })}`),
+  createComment: (body: {
+    docId: string
+    text: string
+    quote: string
+    rangeStart: number
+    rangeEnd: number
+  }) => post<{ comment: CommentDTO }>('/api/comments', body),
+  resolveComment: (id: string, docId: string, resolved: boolean) =>
+    post<{ comment: CommentDTO }>(
+      `/api/comments/${encodeURIComponent(id)}/resolve`,
+      { docId, resolved },
+    ),
+  deleteComment: (id: string, docId: string) =>
+    del<{ ok: true }>(
+      `/api/comments/${encodeURIComponent(id)}${q({ docId })}`,
+    ),
+}
+
+export type CommentDTO = {
+  id: string
+  docId: string
+  author: string
+  text: string
+  quote: string
+  rangeStart: number
+  rangeEnd: number
+  createdAt: number
+  resolved: boolean
+  resolvedAt: number | null
+  resolvedBy: string | null
 }
 
 export type UserMemoryDTO = {

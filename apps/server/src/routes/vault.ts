@@ -14,7 +14,7 @@
  *   POST   /api/folder?path=<rel>       → mkdir
  */
 import path from 'node:path'
-import { mkdir, readFile, readdir, rename, rm, stat } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { nanoid } from 'nanoid'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
@@ -32,10 +32,16 @@ import {
   userCanRead,
   userCanEdit,
   isFrozenForArchive,
+  isFrozenForLock,
 } from '../stores/documents.js'
 import { generateThumbnail } from '../services/thumbnail.js'
 import { writeThumbnail, writePreview } from '../stores/documents.js'
-import { moveToTrash } from '../stores/trash.js'
+import {
+  moveToTrash,
+  moveFolderToTrash,
+  folderEntryTreePath,
+  folderEntryDocMetaPath,
+} from '../stores/trash.js'
 import { ingestDocument } from '../services/ingest.js'
 import { couldHaveGps, extractGps } from '../services/gps.js'
 import { validateUpload } from '../lib/uploadGuard.js'
@@ -55,6 +61,7 @@ import { resolveUserVault, userVaultRel, ensureUserVault, userVaultRoot } from '
 import { hashPassword as hashShareSecret, verifyPassword as verifySharePassword } from '../lib/sharePassword.js'
 import { findShareForPath } from '../stores/userShares.js'
 import {
+  findLockedAncestor,
   freshFolderMeta,
   getFolderMeta,
   listFolderMetas,
@@ -183,6 +190,42 @@ function rejectIfArchived(
   reply.code(409).send({
     error: 'document is archived — unarchive to edit',
     code: 'archived',
+  })
+  return true
+}
+
+/** Doc-level lock gate. Returns true (and sends 423) when the doc
+ *  is locked and the actor is neither the owner nor an admin. */
+function rejectIfLocked(
+  meta: DocumentMeta,
+  actor: { username: string; role: string } | null,
+  reply: import('fastify').FastifyReply,
+): boolean {
+  if (!isFrozenForLock(meta, actor)) return false
+  reply.code(423).send({
+    error: `document is locked${meta.lockedBy ? ` by ${meta.lockedBy}` : ''}`,
+    code: 'locked',
+    lockedBy: meta.lockedBy ?? null,
+  })
+  return true
+}
+
+/** Folder-cascade lock gate. Checks every ancestor of `rel` (owned
+ *  by `owner`) for a locked folder. Returns true (and sends 423)
+ *  when one is found and the actor isn't the owner / admin. */
+async function rejectIfAncestorLocked(
+  owner: string,
+  rel: string,
+  actor: { username: string; role: string } | null,
+  reply: import('fastify').FastifyReply,
+): Promise<boolean> {
+  const ancestor = await findLockedAncestor(owner, rel, actor)
+  if (!ancestor) return false
+  reply.code(423).send({
+    error: `folder "${ancestor.storageKey}" is locked${ancestor.lockedBy ? ` by ${ancestor.lockedBy}` : ''}`,
+    code: 'locked',
+    lockedFolder: ancestor.storageKey,
+    lockedBy: ancestor.lockedBy ?? null,
   })
   return true
 }
@@ -324,16 +367,16 @@ async function resolveReadContext(opts: {
   // because the parallel ingest record happens to sort first.
   const owned = docs.filter((d) => d.storageKey === rel && d.owner === requester)
   const own = owned.find((d) => d.public) ?? owned[0]
-  const pub = docs.find((d) => d.storageKey === rel && d.public)
-  const meta = own ?? pub ?? null
-  let owner = meta?.owner ?? requester ?? null
-  let sharedGrant: { canEdit: boolean } | null = null
 
-  // Share-grant fallthrough — if the requester hits a bare path (no
-  // ownerHint), they shouldn't 404 on a path that's shared with them
-  // by another user. Scan incoming shares and elevate to the share
-  // owner if any covers the path.
-  if (requester && !ownerHint && !meta) {
+  // Share-first: if the requester hits a bare path (no ownerHint) AND
+  // doesn't own a doc at this path, check incoming shares BEFORE
+  // falling back to a public copy. Otherwise a doc that's both
+  // public AND shared-with-edit would always resolve as the public
+  // read-only meta (because the public doc was found first) and the
+  // share recipient would never get the canEdit affordance — the
+  // share should take priority over the public flag for the user
+  // who actually has the share.
+  if (requester && !ownerHint && !own) {
     const { listSharesTo } = await import('../stores/userShares.js')
     const sharesIn = await listSharesTo(requester)
     const target = rel.replace(/^\/+|\/+$/g, '')
@@ -345,16 +388,16 @@ async function resolveReadContext(opts: {
       if (!covers) continue
       const sharedMeta =
         docs.find((d) => d.owner === s.owner && d.storageKey === rel) ?? null
-      owner = s.owner
-      sharedGrant = { canEdit: s.canEdit }
-      return { meta: sharedMeta, owner, sharedGrant }
+      return {
+        meta: sharedMeta,
+        owner: s.owner,
+        sharedGrant: { canEdit: s.canEdit },
+      }
     }
 
     // Collection-cascade fallthrough: a doc reached through a shared
     // collection can be served at its real owner's path even though
-    // the requester has no folder/path share for it. Cheaper than
-    // listSharesTo (one indexed query per request), so it lives here
-    // after the explicit-share path which short-circuits on hit.
+    // the requester has no folder/path share for it.
     const { grantsForUser } = await import('../db/collectionsRepo.js')
     const cg = grantsForUser(requester)
     if (cg.readableDocs.size > 0) {
@@ -370,7 +413,13 @@ async function resolveReadContext(opts: {
       }
     }
   }
-  return { meta, owner, sharedGrant }
+
+  // No share match — fall through to public-meta lookup. Anonymous
+  // visitors hit this path directly (no requester).
+  const pub = docs.find((d) => d.storageKey === rel && d.public)
+  const meta = own ?? pub ?? null
+  const owner = meta?.owner ?? requester ?? null
+  return { meta, owner, sharedGrant: null }
 }
 
 /**
@@ -525,6 +574,9 @@ type TreeNode = {
   publicExpiresAt?: number | null
   tags?: string[]
   archived?: boolean
+  /** Owner-controlled write freeze. Used by the grid tile to show
+   *  a lock indicator without needing a per-file meta fetch. */
+  locked?: boolean
 }
 
 // ─── filename helpers ───────────────────────────────────────────────────────
@@ -647,6 +699,148 @@ function inferMime(filename: string, fallback?: string): string {
 }
 
 /**
+ * Pull markdown image / link targets out of a doc's raw text so we
+ * can verify a transitive embed-grant claim ("I'm fetching this
+ * asset because the doc I CAN read embeds it").
+ *
+ * Recognises:
+ *   - `![alt](path)` and `![alt](<path>)` image embeds
+ *   - `[text](path)` and `[text](<path>)` link refs
+ *   - Both with optional title (`(path "title")`)
+ *
+ * Wikilink syntax (`[[asset]]`) is intentionally not matched here —
+ * Reader doesn't expand those to vault paths in the renderer, so
+ * they wouldn't fetch the asset anyway.
+ */
+function extractMarkdownAssetRefs(text: string): string[] {
+  const out: string[] = []
+  // Two forms: angle-bracketed `<url with spaces>` and plain
+  // `url-no-spaces`. The bracketed form is what markdown uses
+  // for paths containing spaces (e.g. `<../project abstract.png>`)
+  // — an earlier regex that disallowed whitespace inside the
+  // capture would truncate at the first space, silently denying
+  // the embed grant.
+  const re =
+    /!?\[[^\]]*\]\(\s*(?:<([^>]+)>|([^)\s]+))(?:\s+"[^"]*")?\s*\)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    const href = m[1] ?? m[2]
+    if (href) out.push(href)
+  }
+  return out
+}
+
+/** Mirror of the client's resolveRelative — vault-root-relative
+ *  form, with `./`, `../`, and `/`-prefixed absolutes handled.
+ *  Output is plain (NOT URL-encoded). */
+function resolveAssetRel(parentDir: string, href: string): string | null {
+  if (!href) return null
+  // Scheme'd URLs (http:, https:, data:, mailto:) and in-page
+  // fragments can't refer to a vault asset.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return null
+  if (href.startsWith('#')) return null
+  let pathPart = href.split(/[?#]/)[0]
+  try {
+    pathPart = decodeURIComponent(pathPart)
+  } catch {/* malformed encoding — fall through with raw */}
+  if (pathPart.startsWith('/')) return pathPart.replace(/^\/+/, '')
+  const base = parentDir.split('/').filter(Boolean)
+  const segments = pathPart.split('/').filter(Boolean)
+  const out = [...base]
+  for (const seg of segments) {
+    if (seg === '.') continue
+    if (seg === '..') {
+      out.pop()
+      continue
+    }
+    out.push(seg)
+  }
+  return out.join('/')
+}
+
+/**
+ * Transitive read-grant: does the requester have access to a
+ * "via" doc that embeds the asset they're requesting? If yes,
+ * the asset reads through — even though no direct share / ACL
+ * entry covers it.
+ *
+ * This is what makes shared markdown render with its inline
+ * images. Direct standalone access (no `via`) still hits the
+ * normal ACL path, so the asset is only reachable via the
+ * embedding doc — not as a lone entity.
+ *
+ * Returns `{ granted, owner }` so the caller can serve the
+ * asset from the via doc's owner's vault.
+ */
+async function tryTransitiveEmbedGrant(opts: {
+  rel: string
+  viaRel: string
+  viaOwner?: string
+  requester?: string
+  requesterRole?: string
+}): Promise<{ granted: boolean; owner?: string }> {
+  const { rel, viaRel, viaOwner, requester, requesterRole } = opts
+  const log = (msg: string, extra?: Record<string, unknown>) =>
+    console.log(`[transitive-embed] ${msg}`, { rel, viaRel, viaOwner, requester, ...extra })
+  if (!viaRel) {
+    log('skip: missing via')
+    return { granted: false }
+  }
+  // 1. Resolve the via doc. For anonymous requesters we just need
+  //    the metadata to check the public flag; resolveReadContext
+  //    returns it on the public-fallthrough branch even without
+  //    a requester. For authed requesters we get the share /
+  //    collection grant attached.
+  const viaCtx = await resolveReadContext({
+    rel: viaRel,
+    ownerHint: viaOwner,
+    requester,
+  })
+  if (!viaCtx.meta || !viaCtx.owner) {
+    log('deny: via doc not resolvable', {
+      hasMeta: !!viaCtx.meta,
+      owner: viaCtx.owner,
+    })
+    return { granted: false }
+  }
+  // 2. Can the requester read the via doc?
+  //    Authed: owner/admin/ACL OR share grant OR collection grant.
+  //    Anonymous: only when the via doc is marked public.
+  const isPublicVia =
+    !!viaCtx.meta.public &&
+    (viaCtx.meta.publicExpiresAt == null ||
+      viaCtx.meta.publicExpiresAt > Date.now())
+  const canReadVia = requester
+    ? !!viaCtx.sharedGrant ||
+      isPublicVia ||
+      userCanRead(viaCtx.meta, requester, requesterRole ?? 'viewer')
+    : isPublicVia
+  if (!canReadVia) {
+    log('deny: requester cannot read via doc')
+    return { granted: false }
+  }
+  // 3. Does the via doc's text actually embed `rel`?
+  const viaAbs = resolveUserVault(viaCtx.owner, viaCtx.meta.storageKey)
+  const viaText = await readFile(viaAbs, 'utf8').catch(() => null)
+  if (viaText == null) {
+    log('deny: cannot read via file from disk', { viaAbs })
+    return { granted: false }
+  }
+  const parentDir = viaCtx.meta.storageKey.split('/').slice(0, -1).join('/')
+  const refs = extractMarkdownAssetRefs(viaText)
+  const resolvedRefs = refs.map((href) => ({ href, resolved: resolveAssetRel(parentDir, href) }))
+  log('checking refs', { parentDir, refs: resolvedRefs })
+  for (const { resolved } of resolvedRefs) {
+    if (resolved && resolved === rel) {
+      log('grant: matched embed')
+      return { granted: true, owner: viaCtx.owner }
+    }
+  }
+  log('deny: no embed match')
+  return { granted: false }
+}
+
+/**
  * Stream the bytes of a vault file with full access checks. Shared by:
  *   - GET /api/file/raw                (explicit API endpoint, kept for back-compat)
  *   - the bare `/<path>` fallback      (so public/shared/owned files have a
@@ -663,9 +857,27 @@ export async function serveVaultFileBytes(
   _app: FastifyInstance,
   req: FastifyRequest,
   reply: FastifyReply,
-  opts: { rel: string; publicPassword?: string; ownerHint?: string },
+  opts: {
+    rel: string
+    publicPassword?: string
+    ownerHint?: string
+    /** Parent doc the asset is being rendered from. When supplied,
+     *  the requester gets a transitive read-grant on this asset
+     *  IFF they can read the parent AND the parent's text embeds
+     *  the asset. Lets shared markdown render its inline images
+     *  without making the assets publicly readable. */
+    viaRel?: string
+    viaOwner?: string
+  },
 ): Promise<FastifyReply> {
-  const { rel, publicPassword, ownerHint } = opts
+  const { rel, publicPassword, ownerHint, viaRel, viaOwner } = opts
+  console.log('[serve-bytes]', {
+    rel,
+    ownerHint,
+    viaRel,
+    viaOwner,
+    requester: req.currentUser?.username,
+  })
 
   // Throttle failed `?p=` attempts before scrypt-verify burns CPU.
   if (publicPassword) {
@@ -680,11 +892,38 @@ export async function serveVaultFileBytes(
 
   const requester = req.currentUser?.username
   const ctx = await resolveReadContext({ rel, ownerHint, requester })
-  if (ownerHint && ownerHint !== requester && !ctx.sharedGrant) {
+
+  // Transitive embed-grant. Only consulted when supplied — the
+  // bare URL (no `via=`) keeps the asset's standalone restriction
+  // intact. Public visitors are also eligible now: if the via
+  // doc is marked public, the embedded asset reads through too
+  // (otherwise inline images on shared public pages 404 — the
+  // visitor isn't logged in so they can't auth the asset
+  // individually).
+  let viaGranted = false
+  let viaOwnerResolved: string | undefined
+  if (viaRel) {
+    const r = await tryTransitiveEmbedGrant({
+      rel,
+      viaRel,
+      viaOwner,
+      requester,
+      requesterRole: req.currentUser?.role,
+    })
+    if (r.granted) {
+      viaGranted = true
+      viaOwnerResolved = r.owner
+    }
+  }
+
+  if (ownerHint && ownerHint !== requester && !ctx.sharedGrant && !viaGranted) {
     return reply.code(403).send({ error: 'forbidden' })
   }
   const meta = ctx.meta
-  const owner = ctx.owner
+  // When the asset isn't indexed (no meta) but a via doc grants
+  // access, fall back to the via doc's owner — that's the vault
+  // we should read the asset from.
+  const owner = ctx.owner ?? (viaGranted ? viaOwnerResolved : undefined)
   if (!owner) {
     return reply.code(401).send({ error: 'auth required' })
   }
@@ -697,7 +936,7 @@ export async function serveVaultFileBytes(
       passwordRequired: true,
     })
   }
-  if (gate !== 'ok') {
+  if (gate !== 'ok' && !viaGranted) {
     if (!req.currentUser) {
       return reply.code(401).send({ error: 'auth required' })
     }
@@ -705,7 +944,7 @@ export async function serveVaultFileBytes(
     if (meta && !ctx.sharedGrant && !userCanRead(meta, u.username, u.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
-  } else if (publicPassword) {
+  } else if (gate === 'ok' && publicPassword) {
     // Successful gate with password — reset the bucket.
     clearGateFailures(req.ip)
   }
@@ -885,6 +1124,34 @@ export async function vaultRoutes(app: FastifyInstance) {
         if (owner === requester || grant || fm?.public) {
           return { kind: 'folder', owner, public: !!fm?.public, access }
         }
+        // Transit folder: the recipient holds no grant on this folder
+        // itself but may hold grants on descendants (e.g. a single
+        // deeply-shared file with no explicit grant on its parent
+        // chain). /api/list already serves a partial-access view of
+        // these — without the matching resolve branch the sidebar's
+        // synthetic parent node 404s on click.
+        if (requester && owner !== requester) {
+          const { listSharesTo } = await import('../stores/userShares.js')
+          const sharesIn = await listSharesTo(requester)
+          const prefix = rel ? rel.replace(/\/+$/, '') + '/' : ''
+          const hasDescendantShare = sharesIn.some(
+            (sh) =>
+              sh.owner === owner &&
+              (rel === '' || sh.storageKey.startsWith(prefix)),
+          )
+          if (hasDescendantShare) {
+            return {
+              kind: 'folder',
+              owner,
+              public: false,
+              access: {
+                ownedByRequester: false,
+                sharedReadOnly: true,
+                sharedEdit: false,
+              },
+            }
+          }
+        }
       }
     }
 
@@ -901,10 +1168,29 @@ export async function vaultRoutes(app: FastifyInstance) {
         const covers = share.isFolder
           ? sk === '' || target === sk || target.startsWith(sk + '/')
           : target === sk
-        if (!covers) continue
+        // Transit-folder case: the requested path is an ANCESTOR of a
+        // shared item. Recipient navigates through the un-shared
+        // parent to reach the shared descendant — /api/list already
+        // serves a partial listing here, this surfaces the matching
+        // resolve hit instead of 404.
+        const isAncestor = target !== '' && sk.startsWith(target + '/')
+        if (!covers && !isAncestor) continue
         const abs = resolveVault(rel, share.owner)
         const s = await stat(abs).catch(() => null)
         if (!s) continue
+        if (isAncestor && !covers) {
+          if (!s.isDirectory()) continue
+          return {
+            kind: 'folder',
+            owner: share.owner,
+            public: false,
+            access: {
+              ownedByRequester: false,
+              sharedReadOnly: true,
+              sharedEdit: false,
+            },
+          }
+        }
         const docs = await listAllDocuments()
         const meta =
           docs.find((d) => d.storageKey === rel && d.owner === share.owner) ?? null
@@ -1138,6 +1424,22 @@ export async function vaultRoutes(app: FastifyInstance) {
     const folderMetas = await listFolderMetas(owner)
     const folderByPath = new Map(folderMetas.map((m) => [m.storageKey, m]))
 
+    // Effective-lock cascade for the listing folder. If the parent
+    // dir (or any of ITS ancestors) is locked, every item rendered
+    // inside it inherits the lock indicator. Mirrors what the file
+    // meta endpoint does for individual docs — same flag on the
+    // tile so the user can see at a glance "this lives in a locked
+    // subtree". Walks once per request, not per item.
+    const parentEffectiveLock = (() => {
+      if (folderByPath.get(rel)?.locked) return true
+      const parts = rel.split('/').filter(Boolean)
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const prefix = parts.slice(0, i).join('/')
+        if (folderByPath.get(prefix)?.locked) return true
+      }
+      return false
+    })()
+
     const items: TreeNode[] = []
     for (const e of entries) {
       if (shouldSkipName(e.name)) continue
@@ -1154,6 +1456,7 @@ export async function vaultRoutes(app: FastifyInstance) {
           publicExpiresAt: fm?.publicExpiresAt ?? null,
           tags: fm?.tags ?? [],
           archived: !!fm?.archived,
+          locked: parentEffectiveLock || !!fm?.locked,
         })
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase()
@@ -1181,6 +1484,7 @@ export async function vaultRoutes(app: FastifyInstance) {
           publicExpiresAt: indexed?.publicExpiresAt ?? null,
           tags: indexed?.tags ?? [],
           archived: !!indexed?.archived,
+          locked: parentEffectiveLock || !!indexed?.locked,
         })
       }
     }
@@ -1336,13 +1640,26 @@ export async function vaultRoutes(app: FastifyInstance) {
   })
 
   app.get('/api/file/raw', async (req, reply) => {
-    const { path: rel, p: publicPassword, owner: ownerHint } =
-      req.query as { path?: string; p?: string; owner?: string }
+    const {
+      path: rel,
+      p: publicPassword,
+      owner: ownerHint,
+      via: viaRel,
+      viaOwner,
+    } = req.query as {
+      path?: string
+      p?: string
+      owner?: string
+      via?: string
+      viaOwner?: string
+    }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
     return serveVaultFileBytes(app, req, reply, {
       rel,
       publicPassword,
       ownerHint,
+      viaRel,
+      viaOwner,
     })
   })
 
@@ -1668,12 +1985,34 @@ export async function vaultRoutes(app: FastifyInstance) {
       const titleField = ((fields?.title as any)?.value as string | undefined) || ''
 
       await ensureUserVault(user.username).catch(() => null)
+      // Lock cascade: refuse uploads anywhere under a locked folder
+      // (unless the actor is the owner / admin).
+      if (
+        await rejectIfAncestorLocked(user.username, targetRel, user, reply)
+      ) {
+        if (reserved > 0) releaseUploadBytes(user.username, reserved)
+        return
+      }
       const targetDir = resolveVault(targetRel, user.username)
       await mkdir(targetDir, { recursive: true })
 
       const filename = safeFilename(part.filename || 'upload.bin')
       const finalAbs = await uniquePath(targetDir, filename)
       const finalRel = toVaultRel(finalAbs, user.username)
+      // Doc-level lock: if a file already exists at this path AND
+      // its meta is locked, refuse the overwrite. uniquePath would
+      // normally give us a non-colliding name, but it returns the
+      // original when no collision exists yet.
+      {
+        const existingDocs = await listAllDocuments()
+        const existing = existingDocs.find(
+          (d) => d.storageKey === finalRel && d.owner === user.username,
+        )
+        if (existing && rejectIfLocked(existing, user, reply)) {
+          if (reserved > 0) releaseUploadBytes(user.username, reserved)
+          return
+        }
+      }
       const sha256 = sha256Of(buffer)
       // Pre-mark so chokidar's `add` doesn't fire a duplicate upload
       // webhook — we dispatch our own below.
@@ -1878,21 +2217,141 @@ export async function vaultRoutes(app: FastifyInstance) {
     const all = await listTrash()
     const entry = all.find((e) => e.id === id)
     if (!entry) return reply.code(404).send({ error: 'not found in trash' })
-    // Restore vault file under the original owner's namespace.
     if (entry.owner !== user.username && user.role !== 'admin') {
       return reply.code(403).send({ error: 'forbidden' })
     }
-    // POSIX rename clobbers — if a new file was created at the
-    // original path after deletion, restoring would silently destroy
-    // it (and the clobbered file has no trash entry, so it's gone
-    // forever). Refuse if the target already exists; require the
-    // caller to clear it first or restore via a renamed path.
     const targetAbs = resolveVault(entry.storageKey, entry.owner)
-    const existing = await stat(targetAbs).catch(() => null)
-    if (existing) {
-      return reply.code(409).send({
-        error: 'destination path is in use; remove or rename it before restoring',
+    // For files the destination must be free — restoring would
+    // otherwise silently clobber whatever was created at the same
+    // path after delete. Folder entries skip this check and resolve
+    // conflicts per-child below: an existing directory at the
+    // folder's path is fine (we merge into it); only individual
+    // child files that already exist get refused.
+    if (entry.kind !== 'folder') {
+      const existing = await stat(targetAbs).catch(() => null)
+      if (existing) {
+        return reply.code(409).send({
+          error: 'destination path is in use; remove or rename it before restoring',
+        })
+      }
+    }
+    // ── Folder entry: walk children and restore each individually
+    // so existing parent dirs merge cleanly and per-child conflicts
+    // can be reported without blocking the whole batch.
+    if (entry.kind === 'folder') {
+      // Walk children and restore each file individually. Beats a
+      // single-shot subtree move because the destination folder
+      // might already exist in the vault (a previous per-child
+      // restore created it). Per-file restore merges cleanly and
+      // surfaces per-file conflicts rather than refusing the whole
+      // batch.
+      const children = entry.children ?? []
+      const folderRoot = folderEntryTreePath(entry)
+      const folderKey = entry.storageKey.replace(/\/$/, '')
+      const restored: typeof children = []
+      const remaining: typeof children = []
+      const conflicts: string[] = []
+      for (const c of children) {
+        const childTargetAbs = resolveVault(c.storageKey, entry.owner)
+        const existing = await stat(childTargetAbs).catch(() => null)
+        if (existing) {
+          conflicts.push(c.storageKey)
+          remaining.push(c)
+          continue
+        }
+        const rel = c.storageKey.startsWith(folderKey + '/')
+          ? c.storageKey.slice(folderKey.length + 1)
+          : c.storageKey
+        const src = path.join(folderRoot, rel)
+        await mkdir(path.dirname(childTargetAbs), { recursive: true })
+        try {
+          const blobBuf = await readFile(src).catch(() => null)
+          if (blobBuf) markExpectedWrite(childTargetAbs, sha256Of(blobBuf))
+        } catch {
+          /* ignore */
+        }
+        try {
+          await moveAcrossDevices(src, childTargetAbs)
+        } catch (e: any) {
+          req.log.warn(
+            { err: e, child: c.storageKey },
+            'folder restore: child move failed',
+          )
+          remaining.push(c)
+          continue
+        }
+        if (c.docId) {
+          const docSrc = folderEntryDocMetaPath(entry.id, c.docId)
+          const docDest = path.join(config.paths.documents, c.docId)
+          const sSrc = await stat(docSrc).catch(() => null)
+          const sDest = await stat(docDest).catch(() => null)
+          if (sSrc?.isDirectory() && !sDest) {
+            await moveAcrossDevices(docSrc, docDest).catch(() => null)
+            try {
+              const metaPath = path.join(docDest, 'meta.json')
+              const metaText = await readFile(metaPath, 'utf8')
+              const restoredMeta = JSON.parse(metaText) as DocumentMeta
+              await saveMeta(restoredMeta)
+            } catch (e) {
+              req.log.warn(
+                { err: e, docId: c.docId },
+                'folder restore: meta.json missing; doc will re-ingest',
+              )
+            }
+          }
+        }
+        restored.push(c)
+        dispatchWebhook({
+          type: 'upload',
+          path: c.storageKey,
+          actor: user.username,
+          bytes: c.bytes,
+        }).catch(() => null)
+      }
+      // Purge the entry only when nothing's left. Otherwise rewrite
+      // the manifest with the survivors so the user can fix the
+      // conflicts and retry.
+      if (remaining.length === 0) {
+        await purgeTrash(entry.id)
+      } else {
+        const nextEntry = {
+          ...entry,
+          children: remaining,
+          bytes: remaining.reduce((sum, c) => sum + (c.bytes || 0), 0),
+        }
+        const manifestPath = path.join(config.paths.trash, entry.id, 'manifest.json')
+        await writeFile(manifestPath, JSON.stringify(nextEntry, null, 2), 'utf8')
+      }
+      invalidateSearchCache()
+      publish({ type: 'restore', path: entry.storageKey })
+      recordChange({
+        owner: user.username,
+        actor: user.username,
+        entityId: entry.storageKey,
+        payload: { kind: 'doc.restore', originalPath: entry.storageKey },
       })
+      await audit({
+        actor: user.username,
+        action: 'trash.restore',
+        target: entry.storageKey,
+        meta: {
+          kind: 'folder',
+          restored: restored.length,
+          conflicts: conflicts.length,
+        },
+      })
+      if (conflicts.length > 0) {
+        return {
+          ok: restored.length > 0,
+          restored: restored.length,
+          conflicts,
+          message:
+            restored.length > 0
+              ? `Restored ${restored.length} file${restored.length === 1 ? '' : 's'}. ${conflicts.length} couldn't be restored because the path is already in use.`
+              : `All ${conflicts.length} file${conflicts.length === 1 ? '' : 's'} couldn't be restored because the paths are already in use.`,
+        }
+      }
+      return { ok: true, restored: restored.length }
     }
     await mkdir(path.dirname(targetAbs), { recursive: true })
     const blobName = entry.filename.replace(/\.\./g, '_').replace(/[\/\\]/g, '_')
@@ -1926,6 +2385,24 @@ export async function vaultRoutes(app: FastifyInstance) {
       const sDest = await stat(docDest).catch(() => null)
       if (sSrc?.isDirectory() && !sDest) {
         await moveAcrossDevices(docSrc, docDest).catch(() => null)
+        // Re-insert the SQLite index row from the on-disk meta
+        // JSON. Trash tore down the SQL row (so listAllDocuments
+        // would stop returning a phantom hit) while keeping the
+        // meta dir intact; without this resurrection step the
+        // restored file would lose `templateSource`, version
+        // history pointers, tags, ACL, etc. because the watcher
+        // would re-ingest it as a brand-new doc.
+        try {
+          const metaPath = path.join(docDest, 'meta.json')
+          const metaText = await readFile(metaPath, 'utf8')
+          const restoredMeta = JSON.parse(metaText) as DocumentMeta
+          await saveMeta(restoredMeta)
+        } catch (e) {
+          req.log.warn(
+            { err: e, docId: entry.docId },
+            'restore: meta.json missing or unreadable; doc will re-ingest as fresh',
+          )
+        }
       }
     }
     await purgeTrash(entry.id)
@@ -1949,6 +2426,127 @@ export async function vaultRoutes(app: FastifyInstance) {
     }).catch(() => null)
     await audit({ actor: user.username, action: 'trash.restore', target: entry.storageKey })
     return { ok: true }
+  })
+
+  /**
+   * Restore a single file out of a folder-kind trash entry. Lets
+   * users cherry-pick from a trashed folder instead of being forced
+   * to restore the whole subtree at once. Removes the child from
+   * the entry's manifest; when no children remain the entry itself
+   * is purged.
+   */
+  app.post('/api/trash/:id/children/restore', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const { id } = req.params as { id: string }
+    const body = req.body as { storageKey?: string }
+    if (!body?.storageKey) {
+      return reply.code(400).send({ error: 'storageKey required' })
+    }
+    const { listTrash, purgeTrash } = await import('../stores/trash.js')
+    const all = await listTrash()
+    const entry = all.find((e) => e.id === id)
+    if (!entry) return reply.code(404).send({ error: 'not found in trash' })
+    if (entry.kind !== 'folder') {
+      return reply.code(400).send({ error: 'entry is not a folder' })
+    }
+    if (entry.owner !== user.username && user.role !== 'admin') {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    const children = entry.children ?? []
+    const childIdx = children.findIndex((c) => c.storageKey === body.storageKey)
+    if (childIdx < 0) {
+      return reply.code(404).send({ error: 'child not in this entry' })
+    }
+    const child = children[childIdx]
+    const targetAbs = resolveVault(child.storageKey, entry.owner)
+    const existing = await stat(targetAbs).catch(() => null)
+    if (existing) {
+      return reply.code(409).send({
+        error: 'destination path is in use; remove or rename it before restoring',
+      })
+    }
+    // Source path inside the trashed subtree. The folder's tree was
+    // rooted at trash/<id>/<folderName>; reconstruct the child's
+    // location by stripping the folder's own storageKey prefix from
+    // the child's storageKey and appending it to the tree root.
+    const folderRoot = folderEntryTreePath(entry)
+    const folderKey = entry.storageKey.replace(/\/$/, '')
+    const rel = child.storageKey.startsWith(folderKey + '/')
+      ? child.storageKey.slice(folderKey.length + 1)
+      : child.storageKey === folderKey
+        ? path.basename(folderKey)
+        : child.storageKey
+    const src = path.join(folderRoot, rel)
+    await mkdir(path.dirname(targetAbs), { recursive: true })
+    try {
+      const blobBuf = await readFile(src).catch(() => null)
+      if (blobBuf) markExpectedWrite(targetAbs, sha256Of(blobBuf))
+    } catch {
+      /* ignore */
+    }
+    try {
+      await moveAcrossDevices(src, targetAbs)
+    } catch (e: any) {
+      return reply.code(500).send({ error: `restore failed: ${e?.message ?? e}` })
+    }
+    // Restore the doc meta dir if present + re-seed SQLite row.
+    if (child.docId) {
+      const docSrc = folderEntryDocMetaPath(entry.id, child.docId)
+      const docDest = path.join(config.paths.documents, child.docId)
+      const sSrc = await stat(docSrc).catch(() => null)
+      const sDest = await stat(docDest).catch(() => null)
+      if (sSrc?.isDirectory() && !sDest) {
+        await moveAcrossDevices(docSrc, docDest).catch(() => null)
+        try {
+          const metaPath = path.join(docDest, 'meta.json')
+          const metaText = await readFile(metaPath, 'utf8')
+          const restoredMeta = JSON.parse(metaText) as DocumentMeta
+          await saveMeta(restoredMeta)
+        } catch (e) {
+          req.log.warn(
+            { err: e, docId: child.docId },
+            'child restore: meta.json missing; doc will re-ingest',
+          )
+        }
+      }
+    }
+    // Rewrite the manifest with the restored child removed. If
+    // nothing's left, purge the whole entry (folder shell included).
+    const remaining = children.filter((_, i) => i !== childIdx)
+    if (remaining.length === 0) {
+      await purgeTrash(entry.id)
+    } else {
+      const nextEntry = {
+        ...entry,
+        children: remaining,
+        bytes: remaining.reduce((sum, c) => sum + (c.bytes || 0), 0),
+      }
+      const manifestPath = path.join(config.paths.trash, entry.id, 'manifest.json')
+      await writeFile(manifestPath, JSON.stringify(nextEntry, null, 2), 'utf8')
+    }
+    invalidateSearchCache()
+    publish({ type: 'restore', path: child.storageKey })
+    recordChange({
+      owner: user.username,
+      actor: user.username,
+      entityId: child.storageKey,
+      payload: { kind: 'doc.restore', originalPath: child.storageKey },
+    })
+    dispatchWebhook({
+      type: 'upload',
+      path: child.storageKey,
+      actor: user.username,
+      bytes: child.bytes,
+    }).catch(() => null)
+    await audit({
+      actor: user.username,
+      action: 'trash.restore',
+      target: child.storageKey,
+      meta: { fromFolderEntry: entry.id },
+    })
+    return { ok: true, remaining: remaining.length }
   })
 
   app.delete('/api/trash/:id', async (req, reply) => {
@@ -2173,17 +2771,14 @@ export async function vaultRoutes(app: FastifyInstance) {
       req.log.warn({ err, path: p, reason }, 'bulk-delete: per-file failure')
     }
 
-    // Expand folder paths into their files. Each file is sent to trash one
-    // at a time; the empty directory shell is removed afterwards.
+    // Two-pass classification. Folders go through moveFolderToTrash
+    // as ONE entry each (matches the archive feature's "folder is a
+    // unit" treatment, so Trash shows one folder card to restore,
+    // not N file cards). Individual file paths still go through
+    // moveToTrash one-by-one.
     const docs = await listAllDocuments()
-    const seen = new Set<string>()
-    const fileRels: string[] = []
-    // Map every expanded file back to the original input path the
-    // caller asked about, so per-file failures get reported against
-    // something the client recognizes (and not, e.g., a deeply nested
-    // file inside a folder the user dropped on the page).
-    const fileOrigin = new Map<string, string>()
-    const folderRels: string[] = []
+    const filePaths: string[] = []
+    const folderPaths: string[] = []
     for (const inputRel of body.paths) {
       let abs: string
       try {
@@ -2197,50 +2792,135 @@ export async function vaultRoutes(app: FastifyInstance) {
         recordError(inputRel, 'not found')
         continue
       }
-      if (st.isDirectory()) folderRels.push(inputRel)
-      try {
-        const expanded = await expandFilesUnder(user.username, inputRel)
-        for (const r of expanded) {
-          if (!seen.has(r)) {
-            seen.add(r)
-            fileRels.push(r)
-            fileOrigin.set(r, inputRel)
-          }
-        }
-      } catch (e) {
-        recordError(inputRel, 'failed to list folder contents', e)
-      }
+      if (st.isDirectory()) folderPaths.push(inputRel)
+      else filePaths.push(inputRel)
     }
     let ok = 0
     let failed = 0
-    for (const rel of fileRels) {
-      const reportAs = fileOrigin.get(rel) ?? rel
+    // ── Folder pass: move each folder as a unit. Sort by depth
+    // descending so a selected child folder gets trashed before a
+    // selected parent folder (parents would otherwise swallow the
+    // child's contents).
+    folderPaths.sort((a, b) => b.split('/').length - a.split('/').length)
+    for (const folderRel of folderPaths) {
+      try {
+        const folderAbs = resolveVault(folderRel, user.username)
+        // Lock cascade — refuse if the folder itself is locked or
+        // any ancestor is locked. Admins bypass via isFrozen helpers.
+        if (user.role !== 'admin') {
+          const ownFolderMeta = await getFolderMeta(user.username, folderRel)
+          if (ownFolderMeta?.locked) {
+            failed++
+            recordError(folderRel, 'folder is locked — unlock to delete')
+            continue
+          }
+          const ancestor = await findLockedAncestor(
+            user.username,
+            folderRel,
+            user,
+          )
+          if (ancestor) {
+            failed++
+            recordError(
+              folderRel,
+              `inside locked folder "${ancestor.storageKey}"`,
+            )
+            continue
+          }
+        }
+        const childRels = await expandFilesUnder(user.username, folderRel)
+        // Permission + lock check per child.
+        const children: Array<{ storageKey: string; docId?: string; bytes: number }> = []
+        let permDenied = false
+        let lockedChild = false
+        for (const childRel of childRels) {
+          const meta = docs.find(
+            (d) => d.storageKey === childRel && d.owner === user.username,
+          )
+          if (meta && !userCanEdit(meta, user.username, user.role)) {
+            permDenied = true
+            break
+          }
+          if (meta && isFrozenForLock(meta, user)) {
+            lockedChild = true
+            break
+          }
+          const childAbs = resolveVault(childRel, user.username)
+          const cs = await stat(childAbs).catch(() => null)
+          if (cs?.isFile()) {
+            children.push({
+              storageKey: childRel,
+              docId: meta?.id,
+              bytes: cs.size,
+            })
+          }
+        }
+        if (permDenied) {
+          failed++
+          recordError(folderRel, 'permission denied on at least one item inside')
+          continue
+        }
+        if (lockedChild) {
+          failed++
+          recordError(folderRel, 'locked file inside')
+          continue
+        }
+        await moveFolderToTrash({
+          storageKey: folderRel,
+          vaultAbs: folderAbs,
+          owner: user.username,
+          trashedBy: user.username,
+          children,
+        })
+        // Drop SQL rows for every indexed child so search/list stop
+        // pointing at the now-trashed files. The on-disk meta dirs
+        // were preserved inside the trash entry (see moveFolderToTrash).
+        for (const c of children) {
+          if (c.docId) await deleteDocument(c.docId).catch(() => null)
+        }
+        ok++
+      } catch (e) {
+        failed++
+        recordError(
+          folderRel,
+          `trash failed: ${(e as Error).message ?? 'unknown'}`,
+          e,
+        )
+      }
+    }
+    // ── File pass: standard per-file moveToTrash.
+    for (const rel of filePaths) {
       let abs: string
       try {
         abs = resolveVault(rel, user.username)
       } catch (e) {
         failed++
-        recordError(reportAs, 'invalid path', e)
+        recordError(rel, 'invalid path', e)
         continue
       }
       const meta = docs.find((d) => d.storageKey === rel && d.owner === user.username)
       if (meta && !userCanEdit(meta, user.username, user.role)) {
         failed++
-        recordError(reportAs, 'permission denied')
+        recordError(rel, 'permission denied')
+        continue
+      }
+      if (meta && isFrozenForLock(meta, user)) {
+        failed++
+        recordError(rel, 'document is locked — unlock to delete')
+        continue
+      }
+      if (await findLockedAncestor(user.username, rel, user)) {
+        failed++
+        recordError(rel, 'inside a locked folder — unlock to delete')
         continue
       }
       const s = await stat(abs).catch(() => null)
       if (!s) {
         failed++
-        recordError(reportAs, 'not found')
+        recordError(rel, 'not found')
         continue
       }
-      if (!s.isFile()) {
-        // Reached here only via the folder-expansion path; treat as
-        // a non-fatal skip rather than a failure (the folder itself
-        // is handled in the sweep below).
-        continue
-      }
+      if (!s.isFile()) continue
       try {
         await moveToTrash({
           storageKey: rel,
@@ -2250,27 +2930,11 @@ export async function vaultRoutes(app: FastifyInstance) {
           bytes: s.size,
           trashedBy: user.username,
         })
-        // Drop the dangling SQL row so search / list_documents stop
-        // pointing at the now-missing file. Same rationale as the
-        // single-file DELETE path above.
         if (meta?.id) await deleteDocument(meta.id).catch(() => null)
         ok++
       } catch (e) {
         failed++
-        recordError(reportAs, `trash failed: ${(e as Error).message ?? 'unknown'}`, e)
-      }
-    }
-    // Now sweep the now-empty folder shells. Sort by depth descending so
-    // children get removed before parents.
-    folderRels.sort((a, b) => b.split('/').length - a.split('/').length)
-    for (const rel of folderRels) {
-      try {
-        await rm(resolveVault(rel, user.username), { recursive: true, force: true })
-      } catch (e) {
-        // Folder failures don't bump `failed` (the per-file counter)
-        // but they DO show up in `errors[]` so the user sees why a
-        // folder they expected to vanish is still there.
-        recordError(rel, `folder removal failed: ${(e as Error).message ?? 'unknown'}`, e)
+        recordError(rel, `trash failed: ${(e as Error).message ?? 'unknown'}`, e)
       }
     }
     invalidateSearchCache()
@@ -2279,8 +2943,8 @@ export async function vaultRoutes(app: FastifyInstance) {
       action: 'vault.bulk-trash',
       meta: {
         inputs: body.paths.length,
-        files: fileRels.length,
-        folders: folderRels.length,
+        files: filePaths.length,
+        folders: folderPaths.length,
         ok,
         failed,
         errorCount: errors.length,
@@ -2598,7 +3262,12 @@ export async function vaultRoutes(app: FastifyInstance) {
         (d) => d.storageKey === from && d.owner === user.username,
       )
       if (srcMeta && rejectIfArchived(srcMeta, reply)) return
+      if (srcMeta && rejectIfLocked(srcMeta, user, reply)) return
     }
+    // Lock cascade — refuse the move if it'd cross a locked folder
+    // on either side (source or destination).
+    if (await rejectIfAncestorLocked(user.username, from, user, reply)) return
+    if (await rejectIfAncestorLocked(user.username, to, user, reply)) return
     await mkdir(path.dirname(absTo), { recursive: true })
     await rename(absFrom, absTo)
 
@@ -2611,31 +3280,54 @@ export async function vaultRoutes(app: FastifyInstance) {
     } else if (srcStat.isDirectory()) {
       // Folder move: rewrite the storageKey on every descendant doc
       // and folder-meta so public/tag state survives the move and the
-      // index doesn't point at the old path.
+      // index doesn't point at the old path. Parallelize the writes
+      // — sequential awaits made a folder-of-N-files take O(N) round
+      // trips and the sidebar reflected the move only seconds later.
       const fromPrefix = from.replace(/\/+$/, '') + '/'
       const toPrefix = to.replace(/\/+$/, '') + '/'
-      for (const d of docs) {
-        if (d.owner !== user.username) continue
-        if (d.storageKey !== from && !d.storageKey.startsWith(fromPrefix)) continue
-        const next =
-          d.storageKey === from ? to : toPrefix + d.storageKey.slice(fromPrefix.length)
-        await saveMeta({ ...d, storageKey: next, updatedAt: Date.now() })
-      }
+      const docMoves = docs
+        .filter(
+          (d) =>
+            d.owner === user.username &&
+            (d.storageKey === from || d.storageKey.startsWith(fromPrefix)),
+        )
+        .map((d) => {
+          const next =
+            d.storageKey === from
+              ? to
+              : toPrefix + d.storageKey.slice(fromPrefix.length)
+          return saveMeta({ ...d, storageKey: next, updatedAt: Date.now() })
+        })
       const { deleteFolderMeta } = await import('../stores/folderMetas.js')
       const folderMetas = await listFolderMetas(user.username)
-      for (const fm of folderMetas) {
-        if (fm.storageKey !== from && !fm.storageKey.startsWith(fromPrefix)) continue
-        const nextKey =
-          fm.storageKey === from ? to : toPrefix + fm.storageKey.slice(fromPrefix.length)
-        await saveFolderMeta({ ...fm, storageKey: nextKey, updatedAt: Date.now() })
-        if (nextKey !== fm.storageKey) {
-          await deleteFolderMeta(user.username, fm.storageKey).catch(() => null)
-        }
-      }
+      const folderMoves = folderMetas
+        .filter(
+          (fm) =>
+            fm.storageKey === from || fm.storageKey.startsWith(fromPrefix),
+        )
+        .map(async (fm) => {
+          const nextKey =
+            fm.storageKey === from
+              ? to
+              : toPrefix + fm.storageKey.slice(fromPrefix.length)
+          await saveFolderMeta({
+            ...fm,
+            storageKey: nextKey,
+            updatedAt: Date.now(),
+          })
+          if (nextKey !== fm.storageKey) {
+            await deleteFolderMeta(user.username, fm.storageKey).catch(() => null)
+          }
+        })
+      await Promise.all([...docMoves, ...folderMoves])
     }
     invalidateSearchCache()
-    await audit({ actor: user.username, action: 'vault.move', target: from, meta: { to } })
-    dispatchWebhook({
+    // Fire and forget — these are nice-to-have side effects that
+    // don't gate the response. Awaiting them on the request path
+    // adds noticeable latency to sidebar refresh after a move
+    // without any user-visible benefit.
+    void audit({ actor: user.username, action: 'vault.move', target: from, meta: { to } }).catch(() => null)
+    void dispatchWebhook({
       type: 'move',
       path: to,
       actor: user.username,
@@ -2643,7 +3335,91 @@ export async function vaultRoutes(app: FastifyInstance) {
       to,
       isFolder: srcStat.isDirectory(),
     }).catch(() => null)
+    // SSE fan-out so other tabs (and this one's other surfaces)
+    // refresh their tree slice without waiting for the next poll.
+    // Emit both source and destination paths so listeners filtered
+    // on either can react.
+    publish({ type: 'edit', path: to })
+    if (from !== to) publish({ type: 'edit', path: from })
     return { ok: true }
+  })
+
+  // Duplicate a single file (not folder) into a destination path.
+  // Distinct from `/api/file/move`: the source stays in place. A
+  // fresh doc record is created so the copy gets its own id, share
+  // grants, public flag, etc — duplicate-then-edit should NOT
+  // accidentally rewrite the original's index entry.
+  //
+  // Body: { from: string; to: string }
+  //   from – existing vault-relative file path
+  //   to   – destination path; refuses if already exists, creates
+  //          missing intermediate directories
+  app.post('/api/file/duplicate', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const { from, to } = req.body as { from?: string; to?: string }
+    if (!from || !to) return reply.code(400).send({ error: 'missing from/to' })
+    if (from === to) return reply.code(400).send({ error: 'from and to are identical' })
+    const absFrom = resolveVault(from, user.username)
+    const absTo = resolveVault(to, user.username)
+    const srcStat = await stat(absFrom).catch(() => null)
+    if (!srcStat) return reply.code(404).send({ error: 'source not found' })
+    if (!srcStat.isFile()) {
+      // Folder duplication is a separate, much harder feature
+      // (needs a recursive walker + per-descendant id allocation).
+      // Out of scope here — the toolbar only wires this for files.
+      return reply.code(400).send({ error: 'only files can be duplicated' })
+    }
+    const dstStat = await stat(absTo).catch(() => null)
+    if (dstStat) return reply.code(409).send({ error: 'destination already exists' })
+    if (await rejectIfAncestorLocked(user.username, from, user, reply)) return
+    if (await rejectIfAncestorLocked(user.username, to, user, reply)) return
+    await mkdir(path.dirname(absTo), { recursive: true })
+    const { copyFile } = await import('node:fs/promises')
+    await copyFile(absFrom, absTo)
+    // Build a fresh meta for the copy. Source meta (if any) is
+    // cloned for tags/title but with a NEW id, private visibility,
+    // empty ACL, and a pending ingest. The owner is always the
+    // requesting user — even if the source meta belonged to a
+    // different owner (e.g. an admin duplicating a shared file).
+    const docs = await listAllDocuments()
+    const srcMeta = docs.find(
+      (d) => d.storageKey === from && d.owner === user.username,
+    )
+    const { readFile } = await import('node:fs/promises')
+    const buffer = await readFile(absTo)
+    const id = nanoid()
+    const baseTitle = path.basename(to, path.extname(to))
+    const fresh: DocumentMeta = {
+      id,
+      title: srcMeta?.title ?? baseTitle,
+      originalFilename: path.basename(to),
+      mime: srcMeta?.mime ?? inferMime(to),
+      bytes: buffer.length,
+      sha256: sha256Of(buffer),
+      storageKey: to,
+      owner: user.username,
+      acl: { readers: [], editors: [] },
+      public: false,
+      publicExpiresAt: null,
+      publicPasswordHash: null,
+      tags: srcMeta?.tags ? [...srcMeta.tags] : [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ingest: { status: 'pending', embedded: false },
+    }
+    await saveMeta(fresh)
+    const final = await ingestDocument(fresh, buffer)
+    invalidateSearchCache()
+    void audit({
+      actor: user.username,
+      action: 'vault.duplicate',
+      target: from,
+      meta: { to, newId: id },
+    }).catch(() => null)
+    publish({ type: 'edit', path: to })
+    return { ok: true, document: final }
   })
 
 
@@ -2697,11 +3473,40 @@ export async function vaultRoutes(app: FastifyInstance) {
       //   public link    → strict — strip id, ACL, sha256
       const isOwner = !!requester && meta.owner === requester
       const isShareRecipient = !!ctx.sharedGrant
+      // Effective lock — the doc is "locked" from the client's POV
+      // if its own meta.locked is true OR any ancestor folder is
+      // locked. The editor uses this single flag to decide whether
+      // to enable the Edit pencil, so the folder-cascade has to be
+      // surfaced here too (otherwise typing goes into the live
+      // Y.Doc but the server refuses to materialise it — confusing
+      // UX where edits silently vanish on reload).
+      let effectiveLocked = !!meta.locked
+      let effectiveLockedBy = meta.lockedBy ?? null
+      if (!effectiveLocked) {
+        try {
+          const ancestor = await findLockedAncestor(
+            meta.owner,
+            meta.storageKey,
+            req.currentUser
+              ? { username: req.currentUser.username, role: req.currentUser.role }
+              : null,
+          )
+          if (ancestor) {
+            effectiveLocked = true
+            effectiveLockedBy = ancestor.lockedBy ?? null
+          }
+        } catch {
+          /* swallow — best-effort */
+        }
+      }
+      const withEffectiveLock: DocumentMeta = effectiveLocked
+        ? { ...meta, locked: true, lockedBy: effectiveLockedBy }
+        : meta
       const safe = isOwner
-        ? redactPublicMeta(meta)
+        ? redactPublicMeta(withEffectiveLock)
         : isShareRecipient
-          ? (redactForShareRecipient(meta) as DocumentMeta)
-          : (redactForPublicViewer(meta) as DocumentMeta)
+          ? (redactForShareRecipient(withEffectiveLock) as DocumentMeta)
+          : (redactForPublicViewer(withEffectiveLock) as DocumentMeta)
       if (meta.public) {
         const gate = publicGate(meta, publicPassword)
         if (gate === 'password-required' || gate === 'password-wrong') {
@@ -3042,6 +3847,156 @@ export async function vaultRoutes(app: FastifyInstance) {
       meta: { docId: meta.id, kind: 'file' },
     })
     return { document: redactPublicMeta(next) }
+  })
+
+  // ---- lock --------------------------------------------------------------
+  // Owner-controlled write freeze. Setting locked=true prevents every
+  // mutation (CRDT autosave, MCP edit, /api/file/upload overwrite,
+  // chat apply-edit, delete, move, rmdir, etc.) for non-owners; the
+  // owner and admins can still write. Folder locks cascade through
+  // descendants (see findLockedAncestor). Mirrors the archive route's
+  // file-vs-folder dispatch.
+  app.post('/api/file/lock', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { path?: string; locked?: boolean }
+    if (!body?.path) return reply.code(400).send({ error: 'missing path' })
+    if (typeof body.locked !== 'boolean') {
+      return reply.code(400).send({ error: 'missing locked flag' })
+    }
+    const abs = resolveVault(body.path, user.username)
+    const s = await stat(abs).catch(() => null)
+    if (!s) return reply.code(404).send({ error: 'not found' })
+
+    if (s.isDirectory()) {
+      const existing = await getFolderMeta(user.username, body.path)
+      const next = {
+        ...(existing ?? freshFolderMeta(user.username, body.path)),
+        locked: body.locked,
+        lockedAt: body.locked ? Date.now() : null,
+        lockedBy: body.locked ? user.username : null,
+        updatedAt: Date.now(),
+      }
+      await saveFolderMeta(next)
+      publish({ type: 'lock', path: body.path, locked: body.locked })
+      recordChange({
+        owner: user.username,
+        actor: user.username,
+        entityId: body.path,
+        payload: { kind: 'folder.lock', locked: body.locked },
+      })
+      await audit({
+        actor: user.username,
+        action: body.locked ? 'vault.lock' : 'vault.unlock',
+        target: body.path,
+        meta: { kind: 'folder' },
+      })
+      return { folder: next }
+    }
+
+    const docs = await listAllDocuments()
+    const meta = docs.find(
+      (d) => d.storageKey === body.path && d.owner === user.username,
+    )
+    if (!meta) return reply.code(404).send({ error: 'not indexed' })
+    // Lock toggle is owner-only (or admin). Even share-recipients
+    // with edit access can't flip their host's lock.
+    if (meta.owner !== user.username && user.role !== 'admin') {
+      return reply.code(403).send({ error: 'forbidden — owner only' })
+    }
+    const next: DocumentMeta = {
+      ...meta,
+      locked: body.locked,
+      lockedAt: body.locked ? Date.now() : null,
+      lockedBy: body.locked ? user.username : null,
+      updatedAt: Date.now(),
+    }
+    await saveMeta(next)
+    publish({ type: 'lock', path: body.path, locked: body.locked })
+    recordChange({
+      owner: user.username,
+      actor: user.username,
+      entityId: body.path,
+      payload: { kind: 'doc.lock', locked: body.locked },
+    })
+    await audit({
+      actor: user.username,
+      action: body.locked ? 'vault.lock' : 'vault.unlock',
+      target: body.path,
+      meta: { docId: meta.id, kind: 'file' },
+    })
+    return { document: redactPublicMeta(next) }
+  })
+
+  // Fan-out variant — flip lock state across many paths (files and
+  // folders mixed). Mirrors /api/file/bulk-archive's shape.
+  app.post('/api/file/bulk-lock', async (req, reply) => {
+    if (!requireAuth(req, reply)) return
+    const user = req.currentUser!
+    if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
+    const body = req.body as { paths?: string[]; locked?: boolean }
+    if (!Array.isArray(body?.paths) || typeof body.locked !== 'boolean') {
+      return reply.code(400).send({ error: 'paths[] + locked required' })
+    }
+    const errors: Array<{ path: string; reason: string }> = []
+    let ok = 0
+    const docs = await listAllDocuments()
+    for (const rel of body.paths) {
+      try {
+        const abs = resolveVault(rel, user.username)
+        const s = await stat(abs).catch(() => null)
+        if (!s) {
+          errors.push({ path: rel, reason: 'not found' })
+          continue
+        }
+        if (s.isDirectory()) {
+          const existing = await getFolderMeta(user.username, rel)
+          const next = {
+            ...(existing ?? freshFolderMeta(user.username, rel)),
+            locked: body.locked,
+            lockedAt: body.locked ? Date.now() : null,
+            lockedBy: body.locked ? user.username : null,
+            updatedAt: Date.now(),
+          }
+          await saveFolderMeta(next)
+          ok++
+          continue
+        }
+        const meta = docs.find(
+          (d) => d.storageKey === rel && d.owner === user.username,
+        )
+        if (!meta) {
+          errors.push({ path: rel, reason: 'not indexed' })
+          continue
+        }
+        if (meta.owner !== user.username && user.role !== 'admin') {
+          errors.push({ path: rel, reason: 'owner only' })
+          continue
+        }
+        await saveMeta({
+          ...meta,
+          locked: body.locked,
+          lockedAt: body.locked ? Date.now() : null,
+          lockedBy: body.locked ? user.username : null,
+          updatedAt: Date.now(),
+        })
+        ok++
+      } catch (e) {
+        errors.push({
+          path: rel,
+          reason: (e as Error)?.message ?? 'unknown',
+        })
+      }
+    }
+    publish({ type: 'lock', path: '', locked: body.locked })
+    await audit({
+      actor: user.username,
+      action: body.locked ? 'vault.bulk-lock' : 'vault.bulk-unlock',
+      target: '',
+      meta: { count: body.paths.length, ok, failed: errors.length },
+    })
+    return { ok, failed: errors.length, errors }
   })
 
   // ---- tags ---------------------------------------------------------------
@@ -3411,16 +4366,30 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/versions', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
-    const { path: rel } = req.query as { path?: string }
-    if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
-    if (!meta) return reply.code(404).send({ error: 'not indexed' })
-    if (!userCanRead(meta, user.username, user.role)) {
-      return reply.code(403).send({ error: 'forbidden' })
+    const { path: rel, owner: ownerHint } = req.query as {
+      path?: string
+      owner?: string
     }
+    if (!rel) return reply.code(400).send({ error: 'missing path' })
+    // Reuse the shared read-context resolver so share grants +
+    // collection-cascade grants count, not just owner/ACL. The
+    // previous implementation only ran `userCanRead`, which
+    // returned forbidden for a shared editor opening the Versions
+    // panel on someone else's doc.
+    const ctx = await resolveReadContext({
+      rel,
+      ownerHint,
+      requester: user.username,
+    })
+    if (!ctx.meta) {
+      return reply.code(404).send({ error: 'not indexed' })
+    }
+    // resolveReadContext already verified the requester can read
+    // (either as owner, via ACL, via share, or via collection
+    // grant) — if `meta` came back non-null with the right owner
+    // resolved, access is granted.
     const { listVersions } = await import('../stores/versions.js')
-    const versions = await listVersions(meta.id)
+    const versions = await listVersions(ctx.meta.id)
     return { versions }
   })
 
@@ -3431,16 +4400,22 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/version', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
-    const { path: rel, ts } = req.query as { path?: string; ts?: string }
+    const { path: rel, ts, owner: ownerHint } = req.query as {
+      path?: string
+      ts?: string
+      owner?: string
+    }
     if (!rel || !ts) return reply.code(400).send({ error: 'missing path or ts' })
-    const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
-    if (!meta) return reply.code(404).send({ error: 'not indexed' })
-    if (!userCanRead(meta, user.username, user.role)) {
-      return reply.code(403).send({ error: 'forbidden' })
+    const ctx = await resolveReadContext({
+      rel,
+      ownerHint,
+      requester: user.username,
+    })
+    if (!ctx.meta) {
+      return reply.code(404).send({ error: 'not indexed' })
     }
     const { readVersionText } = await import('../stores/versions.js')
-    const text = await readVersionText(meta.id, Number(ts))
+    const text = await readVersionText(ctx.meta.id, Number(ts))
     if (text == null) return reply.code(404).send({ error: 'version not found' })
     return { ts: Number(ts), text }
   })
@@ -3457,16 +4432,28 @@ export async function vaultRoutes(app: FastifyInstance) {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
     if (user.role === 'viewer') return reply.code(403).send({ error: 'forbidden' })
-    const body = req.body as { path?: string; ts?: number }
+    const body = req.body as { path?: string; ts?: number; owner?: string }
     const rel = body?.path
     const ts = Number(body?.ts)
+    const ownerHint = body?.owner
     if (!rel || !Number.isFinite(ts)) {
       return reply.code(400).send({ error: 'missing path or ts' })
     }
-    const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
+    // Resolve through the shared-grant-aware context so a recipient
+    // with `canEdit` (the "shared · edit" badge) can restore. The
+    // older `docs.find(rel)` + `userCanEdit` combo was owner/ACL/
+    // admin only and 403'd legitimate share-edit users.
+    const ctx = await resolveReadContext({
+      rel,
+      ownerHint,
+      requester: user.username,
+    })
+    const meta = ctx.meta
     if (!meta) return reply.code(404).send({ error: 'not indexed' })
-    if (!userCanEdit(meta, user.username, user.role)) {
+    const canEdit =
+      userCanEdit(meta, user.username, user.role) ||
+      (ctx.sharedGrant?.canEdit ?? false)
+    if (!canEdit) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     if (rejectIfArchived(meta, reply)) return
@@ -3530,11 +4517,18 @@ export async function vaultRoutes(app: FastifyInstance) {
   app.get('/api/file/activity', async (req, reply) => {
     if (!requireAuth(req, reply)) return
     const user = req.currentUser!
-    const { path: rel, limit } = req.query as { path?: string; limit?: string }
+    const { path: rel, owner: ownerHint, limit } =
+      req.query as { path?: string; owner?: string; limit?: string }
     if (!rel) return reply.code(400).send({ error: 'missing path' })
-    const docs = await listAllDocuments()
-    const meta = docs.find((d) => d.storageKey === rel)
-    if (meta && !userCanRead(meta, user.username, user.role)) {
+    // Use the same resolver the other read endpoints use so share
+    // recipients (and collection-grant viewers) can see the audit
+    // trail. Plain meta + userCanRead is owner/ACL/admin only, which
+    // wrongly 403'd on a file the user could open in view mode.
+    const ctx = await resolveReadContext({ rel, ownerHint, requester: user.username })
+    if (ownerHint && ownerHint !== user.username && !ctx.sharedGrant) {
+      return reply.code(403).send({ error: 'forbidden' })
+    }
+    if (ctx.meta && !ctx.sharedGrant && !userCanRead(ctx.meta, user.username, user.role)) {
       return reply.code(403).send({ error: 'forbidden' })
     }
     const { listAudit } = await import('../stores/audit.js')

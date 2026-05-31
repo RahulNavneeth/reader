@@ -123,26 +123,38 @@ export function AccountTokensPage() {
 
         {newSecret && (
           <section
-            className="rounded-md p-3 space-y-2"
+            className="rounded-md overflow-hidden"
             style={{
               background: 'var(--surface-2)',
               border: '1px solid var(--border)',
-              borderLeft: '2px solid var(--accent)',
             }}
           >
-            <div className="text-[12.5px] font-semibold text-fg inline-flex items-center gap-1.5">
+            <div
+              className="flex items-center gap-2 px-3 py-2"
+              style={{ borderBottom: '1px solid var(--border)' }}
+            >
               <KeyRound size={12} className="text-accent shrink-0" />
-              Copy your new token — you won't see it again.
+              <div className="text-[12.5px] font-medium text-fg">
+                Copy your new token
+              </div>
+              <span className="text-subtle">·</span>
+              <div className="text-[11.5px] text-subtle">
+                you won't see it again
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <code
-                className="flex-1 px-2 py-1.5 rounded text-[12.5px] break-all font-mono"
-                style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}
+            <div className="flex items-center gap-2 px-3 py-2.5">
+              <div
+                className="flex-1 px-2.5 h-8 rounded text-[12.5px] flex items-center break-all"
+                style={{
+                  background: 'var(--input-bg)',
+                  border: '1px solid var(--input-border)',
+                  color: 'var(--fg)',
+                }}
               >
                 {newSecret}
-              </code>
+              </div>
               <button
-                className="btn-ghost shrink-0"
+                className="btn-ghost h-8 shrink-0"
                 onClick={async () => {
                   const ok = await copyText(newSecret)
                   if (!ok) {
@@ -156,12 +168,21 @@ export function AccountTokensPage() {
                   setTimeout(() => setCopied(false), 1500)
                 }}
                 title={copied ? 'Copied' : 'Copy'}
-                aria-label="Copy token"
               >
-                {copied ? <Check size={12} className="text-accent" /> : <Copy size={12} />}
+                {copied ? (
+                  <>
+                    <Check size={12} className="text-accent" />
+                    Copied
+                  </>
+                ) : (
+                  <>
+                    <Copy size={12} />
+                    Copy
+                  </>
+                )}
               </button>
               <button
-                className="btn-ghost shrink-0"
+                className="btn-ghost h-8 shrink-0"
                 onClick={() => setNewSecret(null)}
               >
                 Done

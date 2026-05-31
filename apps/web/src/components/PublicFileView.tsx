@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Download, FileText, Globe, AlertCircle, Loader2, Lock } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -7,6 +7,11 @@ import rehypeSlug from 'rehype-slug'
 import 'highlight.js/styles/github.css'
 import { ApiError, api, type DocumentMeta } from '../lib/api'
 import { setFaviconForFile } from '../lib/favicon'
+import {
+  parseImageSize,
+  resolveImageSrc,
+  resolveLinkHref,
+} from '../lib/markdownAssetResolver'
 
 type Props = {
   path: string
@@ -35,6 +40,74 @@ export function PublicFileView({ path, onNotPublic }: Props) {
   const [passwordWrong, setPasswordWrong] = useState(false)
   const [password, setPassword] = useState('')
   const [submittedPwd, setSubmittedPwd] = useState<string>('')
+  const mdRef = useRef<HTMLDivElement>(null)
+
+  // Deep-link to a heading via URL fragment. Public docs are
+  // fetched async, so the browser's initial hash-jump fires before
+  // the markdown body exists in the DOM. After the body renders
+  // we re-consume the hash + retry across ~2.5s while late-loading
+  // images / PDFs / embeds reshape the layout, then bail out on
+  // user interaction. Same recipe as PathViewer; fix needs to
+  // live in both since public visitors come in via /<path>
+  // without going through PathViewer.
+  useEffect(() => {
+    if (text == null) return
+    const root = mdRef.current
+    if (!root) return
+    const hash = window.location.hash.replace(/^#/, '')
+    if (!hash) return
+    let slug: string
+    try {
+      slug = decodeURIComponent(hash)
+    } catch {
+      slug = hash
+    }
+    let cancelled = false
+    let settleTimer: number | null = null
+    let done = false
+    const tryScroll = () => {
+      if (cancelled || done) return
+      const el = root.querySelector<HTMLElement>(`#${CSS.escape(slug)}`)
+      if (!el) return
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      done = true
+      stopReanchoring()
+    }
+    const markUnstable = () => {
+      if (done || cancelled) return
+      if (settleTimer != null) window.clearTimeout(settleTimer)
+      settleTimer = window.setTimeout(tryScroll, 120)
+    }
+    let ro: ResizeObserver | null = null
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(markUnstable)
+      ro.observe(root)
+    }
+    markUnstable()
+    const ceiling = window.setTimeout(tryScroll, 1500)
+    function stopReanchoring() {
+      ro?.disconnect()
+      ro = null
+      if (settleTimer != null) window.clearTimeout(settleTimer)
+      window.clearTimeout(ceiling)
+      window.removeEventListener('wheel', stopReanchoring)
+      window.removeEventListener('touchstart', stopReanchoring)
+      window.removeEventListener('keydown', stopReanchoring)
+    }
+    window.addEventListener('wheel', stopReanchoring, { passive: true })
+    window.addEventListener('touchstart', stopReanchoring, { passive: true })
+    window.addEventListener('keydown', stopReanchoring)
+    const onHashChange = () => {
+      done = false
+      markUnstable()
+    }
+    window.addEventListener('hashchange', onHashChange)
+    return () => {
+      cancelled = true
+      stopReanchoring()
+      window.removeEventListener('hashchange', onHashChange)
+    }
+  }, [text, path])
 
   const ext = useMemo(() => {
     const i = path.lastIndexOf('.')
@@ -120,6 +193,10 @@ export function PublicFileView({ path, onNotPublic }: Props) {
   }, [path, isMarkdown, isText, isHtml, isOfficeDoc, onNotPublic, submittedPwd])
 
   const filename = path.split('/').pop() || path
+  const parentDir = useMemo(() => {
+    const i = path.lastIndexOf('/')
+    return i < 0 ? '' : path.slice(0, i)
+  }, [path])
 
   if (passwordRequired) {
     return (
@@ -240,9 +317,49 @@ export function PublicFileView({ path, onNotPublic }: Props) {
         )}
 
         {isMarkdown && text != null && (
-          <div className="px-10 py-10">
+          <div ref={mdRef} className="px-10 py-10">
             <article className="md">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSlug, rehypeHighlight]}>
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[rehypeSlug, rehypeHighlight]}
+                components={{
+                  // Same as PathViewer used to do: resolve relative
+                  // paths against the doc's folder. For public
+                  // visitors the asset itself isn't public, but the
+                  // server grants a transitive embed read when the
+                  // request carries `via=<this doc>` — see
+                  // `tryTransitiveEmbedGrant` on the server.
+                  img: ({ src, alt, ...rest }) => {
+                    const embedOpts = { via: path }
+                    const resolved =
+                      typeof src === 'string'
+                        ? resolveImageSrc(parentDir, src, embedOpts)
+                        : src
+                    const { alt: cleanAlt, width, height } = parseImageSize(alt)
+                    const style: React.CSSProperties = {}
+                    if (width) style.width = width
+                    if (height) style.height = height
+                    return (
+                      <img
+                        src={resolved as string}
+                        alt={cleanAlt || alt}
+                        style={Object.keys(style).length ? style : undefined}
+                        {...rest}
+                      />
+                    )
+                  },
+                  a: ({ href, children, ...rest }) => {
+                    if (typeof href !== 'string')
+                      return <a {...rest}>{children}</a>
+                    const resolved = resolveLinkHref(parentDir, href)
+                    return (
+                      <a href={resolved} {...rest}>
+                        {children}
+                      </a>
+                    )
+                  },
+                }}
+              >
                 {text}
               </ReactMarkdown>
             </article>

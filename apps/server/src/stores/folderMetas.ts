@@ -26,6 +26,14 @@ export type FolderMeta = {
    *  folder is a single-state-flip that restores all descendants. */
   archived?: boolean
   archivedAt?: number | null
+  /** Owner-controlled write freeze on the folder. When true, every
+   *  mutation under this folder (file create / edit / delete /
+   *  move, folder delete) returns 423 Locked for non-owners. The
+   *  lock cascades — children of a locked folder behave as if they
+   *  themselves were locked. */
+  locked?: boolean
+  lockedAt?: number | null
+  lockedBy?: string | null
   createdAt: number
   updatedAt: number
 }
@@ -120,6 +128,35 @@ export async function sweepExpiredPublicFolders(): Promise<number> {
     }).catch(() => { /* never break the sweep on an audit failure */ })
   }
   return flipped
+}
+
+/** Walk up the path looking for any locked ancestor folder. Returns
+ *  the FIRST locked ancestor (closest to the file) or null. Locked
+ *  folders cascade: every descendant — files, subfolders, the folder
+ *  itself — is treated as frozen for non-owners.
+ *
+ *  Callers should also check the doc-level `isFrozenForLock` for
+ *  doc-targeted ops; this only handles the ancestor-cascade side. */
+export async function findLockedAncestor(
+  owner: string,
+  storageKey: string,
+  _actor: { username: string; role: string } | null,
+): Promise<FolderMeta | null> {
+  // No bypass — locks apply to everyone (owner + admin included).
+  // The unlock action itself is owner-/admin-only; once unlocked,
+  // they can mutate. This matches the user's mental model that a
+  // lock is a hard freeze, not a per-role suggestion.
+  void _actor
+  const parts = storageKey.split('/').filter(Boolean)
+  // Walk every prefix from longest (immediate parent of file) up to
+  // root. We want the closest locked ancestor so the UI banner can
+  // name the right folder.
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const prefix = parts.slice(0, i).join('/')
+    const fm = await getFolderMeta(owner, prefix)
+    if (fm?.locked) return fm
+  }
+  return null
 }
 
 /** Default scaffold used when no meta exists yet. */

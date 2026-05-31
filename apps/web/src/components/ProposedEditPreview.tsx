@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronLeft, Loader2, Check, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
 import rehypeSlug from 'rehype-slug'
 import rehypeHighlight from 'rehype-highlight'
 import { ApiError, api, type ProposedEditOpDTO } from '../lib/api'
@@ -372,9 +373,11 @@ export function ProposedEditPreview({
 
   return (
     <div className="flex flex-col h-full">
+      {/* In-viewer sticky banner — surface-2 for visual parity
+          with the editor / breadcrumb / chat sub-headers. */}
       <div
         className="sticky top-0 z-10 px-3 h-11 flex items-center gap-3 border-b shrink-0"
-        style={{ background: 'var(--bg)', borderColor: 'var(--border)' }}
+        style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0"
@@ -517,7 +520,7 @@ function UnchangedSegment({
   if (!text.trim()) return null
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={[remarkGfm, remarkBreaks]}
       rehypePlugins={[rehypeSlug, rehypeHighlight]}
       components={mdComponents(parentDir, callerOpts)}
     >
@@ -730,7 +733,7 @@ function DiffChunk({
       }}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         rehypePlugins={[rehypeSlug, rehypeHighlight]}
         components={mdComponents(parentDir, callerOpts)}
       >

@@ -10,9 +10,14 @@ import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 export function ActivityButton({
   path,
   kind = 'file',
+  owner,
 }: {
   path: string
   kind?: 'file' | 'folder'
+  /** Owner hint for shared-with-me file activity. Threaded
+   *  through so the audit endpoint can resolve via the same
+   *  shared-grant path as the read endpoints. */
+  owner?: string
 }) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -77,7 +82,7 @@ export function ActivityButton({
             </span>
           </div>
           <div className="flex-1 overflow-y-auto">
-            <ActivityPanel path={path} kind={kind} />
+            <ActivityPanel path={path} kind={kind} owner={owner} />
           </div>
         </div>
       )}

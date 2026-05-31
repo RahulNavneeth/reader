@@ -81,15 +81,22 @@ export function resolveRelative(parentDir: string, href: string): string {
   return out.join('/') + trailing
 }
 
-/** Append `?owner=…&p=…` to an API URL, mirroring callerOpts. */
+/** Append `?owner=…&p=…&via=…&viaOwner=…` to an API URL, mirroring
+ *  callerOpts. `via` / `viaOwner` carry the parent doc identity so
+ *  the server can grant a transitive embed read on inline assets
+ *  even when the requester has no direct share on the asset. */
 function appendCaller(
   base: string,
-  callerOpts: { owner?: string; password?: string } | undefined,
+  callerOpts:
+    | { owner?: string; password?: string; via?: string; viaOwner?: string }
+    | undefined,
 ): string {
   if (!callerOpts) return base
   const params = new URLSearchParams()
   if (callerOpts.owner) params.set('owner', callerOpts.owner)
   if (callerOpts.password) params.set('p', callerOpts.password)
+  if (callerOpts.via) params.set('via', callerOpts.via)
+  if (callerOpts.viaOwner) params.set('viaOwner', callerOpts.viaOwner)
   const q = params.toString()
   if (!q) return base
   return base.includes('?') ? `${base}&${q}` : `${base}?${q}`
@@ -105,7 +112,12 @@ function encodeVaultPath(rel: string): string {
 export function resolveImageSrc(
   parentDir: string,
   src: string,
-  callerOpts?: { owner?: string; password?: string },
+  callerOpts?: {
+    owner?: string
+    password?: string
+    via?: string
+    viaOwner?: string
+  },
 ): string {
   if (isPassThrough(src)) return src
   const rel = resolveRelative(parentDir, src)

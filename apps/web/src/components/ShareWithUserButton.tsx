@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Users, Loader2, X } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import { Users, Loader2, ChevronDown, Pencil, Eye, Trash2 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
@@ -59,7 +60,12 @@ export function ShareWithUserButton({ paths }: Props) {
     refresh()
     const onDocClick = (e: MouseEvent) => {
       if (!rootRef.current) return
-      if (rootRef.current.contains(e.target as Node)) return
+      const target = e.target as Element | null
+      if (rootRef.current.contains(target as Node)) return
+      // Per-row permission menu is portaled into <body>, so it's
+      // outside rootRef. Treat clicks landing inside it as in-popover
+      // so the parent doesn't slam shut while the user is choosing.
+      if (target?.closest('[data-share-permission-menu]')) return
       setOpen(false)
     }
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false)
@@ -199,40 +205,40 @@ export function ShareWithUserButton({ paths }: Props) {
       </button>
       {open && (
         <div
-          className="absolute top-full mt-1 z-50 w-[340px] rounded-md shadow-card overflow-hidden"
+          className="absolute top-full mt-1 z-50 w-[340px] rounded-md shadow-card overflow-hidden flex flex-col"
           style={{
             background: 'var(--panel)',
             border: '1px solid var(--border)',
             ...alignStyle(resolvedAlign),
           }}
         >
-          {/* Header bar mirrors MakePublicPopover so the two access
-              affordances feel like the same component family — icon,
-              title, status pill on the right showing current state. */}
+          {/* Inset sub-header bar to match the standard sub-panel
+              pattern used by Similar documents / Chat dock / version
+              banners — surface-2 strip with a bottom rule. */}
           <div
-            className="flex items-center gap-2 px-3 h-8"
+            className="flex items-center gap-2 px-3 h-8 shrink-0"
             style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
-            <Users size={13} className="text-muted" />
+            <Users size={13} className="text-accent shrink-0" />
             <span className="text-[12px] font-semibold text-fg flex-1">
               {isBulk ? `Share ${paths.length} items` : 'Share with a user'}
             </span>
-            <span className="text-[10.5px] text-subtle">
-              {aggregated.length === 0
-                ? 'Not shared'
-                : `Shared with ${aggregated.length}`}
-            </span>
+            {aggregated.length > 0 && (
+              <span className="text-[10.5px] text-subtle">
+                {aggregated.length} shared
+              </span>
+            )}
           </div>
-          <div className="p-3 space-y-2" style={{ borderBottom: '1px solid var(--border)' }}>
+          <div className="p-3 space-y-2">
             <input
-              className="input h-7 text-[12.5px]"
+              className="input h-8 text-[12.5px]"
               placeholder="Username"
               value={recipient}
               onChange={(e) => setRecipient(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && create()}
               autoFocus
             />
-            <label className="flex items-center gap-2 text-[12px] text-fg">
+            <label className="flex items-center gap-2 text-[12px] text-fg select-none cursor-pointer">
               <input
                 type="checkbox"
                 checked={canEdit}
@@ -241,7 +247,7 @@ export function ShareWithUserButton({ paths }: Props) {
               Allow this user to edit
             </label>
             <button
-              className="btn-primary w-full h-7"
+              className="btn-primary w-full h-8"
               onClick={create}
               disabled={busy || !recipient.trim()}
             >
@@ -249,82 +255,256 @@ export function ShareWithUserButton({ paths }: Props) {
               Share
             </button>
             {error && (
-              <div className="text-[11px]" style={{ color: '#BF2600' }}>
+              <div className="text-[11px]" style={{ color: 'var(--danger-fg)' }}>
                 {error}
               </div>
             )}
           </div>
-          <div className="max-h-[200px] overflow-y-auto">
+          {/* People list. Bordered top separates from the form,
+              individual rows hover-tinted (no per-row borders so
+              the list reads as a clean stack rather than a grid). */}
+          <div
+            className="max-h-[200px] overflow-y-auto"
+            style={{ borderTop: '1px solid var(--border)' }}
+          >
             {shares == null ? (
-              <div className="px-3 py-2 text-[11.5px] text-muted flex items-center gap-1.5">
+              <div className="px-3 py-3 text-[11.5px] text-muted flex items-center gap-1.5">
                 <Loader2 size={12} className="animate-spin" /> Loading…
               </div>
             ) : aggregated.length === 0 ? (
-              <div className="px-3 py-2 text-[11.5px] text-subtle">
+              <div className="px-3 py-3 text-[11.5px] text-subtle text-center">
                 {isBulk
                   ? 'None of the selected items are shared.'
-                  : 'Not shared with anyone yet.'}
+                  : 'Not shared yet'}
               </div>
             ) : (
-              aggregated.map((row) => {
-                const coverage = isBulk
-                  ? ` — ${row.coveredCount} of ${paths.length}`
-                  : ''
-                return (
-                  <div
-                    key={`${row.recipient}-${row.canEdit ? 'e' : 'r'}`}
-                    className="flex items-center gap-2 px-3 py-1.5"
-                    style={{ borderTop: '1px solid var(--border)' }}
-                  >
-                    <span className="text-[12px] text-fg flex-1 truncate">
-                      {row.recipient}
-                      <span className="text-subtle">{coverage}</span>
-                    </span>
-                    {/* Permission chip — click to flip. Server dedupes
-                        on (owner, recipient, storageKey) so updating
-                        an existing grant in place is just a
-                        createUserShare with the new canEdit. */}
-                    <button
-                      className="text-[10.5px] font-medium px-1.5 h-5 rounded"
-                      onClick={() =>
-                        togglePermission(
-                          row.recipient,
-                          !row.canEdit,
-                          `${row.recipient}-${row.canEdit ? 'e' : 'r'}`,
-                        )
+              <div>
+                {aggregated.map((row) => {
+                  const rowKey = `${row.recipient}-${row.canEdit ? 'e' : 'r'}`
+                  const initial = row.recipient.slice(0, 1).toUpperCase()
+                  const isBusy = rowBusy === rowKey
+                  const coverage = isBulk
+                    ? ` · ${row.coveredCount}/${paths.length}`
+                    : ''
+                  const hue =
+                    Math.abs(
+                      row.recipient
+                        .split('')
+                        .reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 0),
+                    ) % 360
+                  return (
+                    <ShareRow
+                      key={rowKey}
+                      recipient={row.recipient}
+                      initial={initial}
+                      avatarHue={hue}
+                      coverage={coverage}
+                      canEdit={row.canEdit}
+                      busy={isBusy}
+                      onSetEdit={() =>
+                        !row.canEdit &&
+                        togglePermission(row.recipient, true, rowKey)
                       }
-                      disabled={rowBusy === `${row.recipient}-${row.canEdit ? 'e' : 'r'}`}
-                      title={`Click to switch to ${row.canEdit ? 'read-only' : 'edit'}`}
-                      style={{
-                        background: row.canEdit ? 'var(--selected)' : 'var(--bg)',
-                        color: row.canEdit ? 'var(--accent)' : 'var(--fg)',
-                        border: '1px solid var(--border)',
-                      }}
-                    >
-                      {row.canEdit ? 'edit' : 'read-only'}
-                    </button>
-                    <button
-                      className="btn-ghost h-6 w-6 px-0"
-                      onClick={() =>
-                        revoke(row.ids, `${row.recipient}-${row.canEdit ? 'e' : 'r'}`)
+                      onSetReadOnly={() =>
+                        row.canEdit &&
+                        togglePermission(row.recipient, false, rowKey)
                       }
-                      disabled={rowBusy === `${row.recipient}-${row.canEdit ? 'e' : 'r'}`}
-                      title={
+                      onRevoke={() => revoke(row.ids, rowKey)}
+                      revokeLabel={
                         row.ids.length > 1
-                          ? `Revoke all ${row.ids.length} grants`
-                          : 'Revoke'
+                          ? `Remove all ${row.ids.length} grants`
+                          : 'Remove access'
                       }
-                      style={{ color: '#BF2600' }}
-                    >
-                      <X size={11} />
-                    </button>
-                  </div>
-                )
-              })
+                    />
+                  )
+                })}
+              </div>
             )}
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * One row in the shared-with list. Replaces the previous
+ * "chip + X" pair with a single permission dropdown that
+ * surfaces the three meaningful states inline (Google
+ * Drive / Notion pattern):
+ *
+ *   • Can edit
+ *   • View only
+ *   • ────────
+ *   • Remove access
+ *
+ * Reads as one obvious affordance per row instead of two
+ * cramped controls.
+ */
+function ShareRow({
+  recipient,
+  initial,
+  avatarHue,
+  coverage,
+  canEdit,
+  busy,
+  onSetEdit,
+  onSetReadOnly,
+  onRevoke,
+  revokeLabel,
+}: {
+  recipient: string
+  initial: string
+  avatarHue: number
+  coverage: string
+  canEdit: boolean
+  busy: boolean
+  onSetEdit: () => void
+  onSetReadOnly: () => void
+  onRevoke: () => void
+  revokeLabel: string
+}) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  // Menu uses `position: fixed` so it escapes the popover's
+  // `overflow-hidden` + the list's `overflow-y-auto` (both
+  // would otherwise clip it). The trigger's bounding rect
+  // anchors the menu top + right.
+  const [menuPos, setMenuPos] = useState<{
+    top: number
+    left: number
+  } | null>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  const toggleMenu = () => {
+    if (menuOpen) {
+      setMenuOpen(false)
+      return
+    }
+    if (!triggerRef.current) return
+    const r = triggerRef.current.getBoundingClientRect()
+    const MENU_WIDTH = 124
+    setMenuPos({
+      top: r.bottom + 4,
+      left: Math.round((r.left + r.right) / 2 - MENU_WIDTH / 2),
+    })
+    setMenuOpen(true)
+  }
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (triggerRef.current?.contains(t)) return
+      if (menuRef.current?.contains(t)) return
+      setMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [menuOpen])
+
+  return (
+    <div className="flex items-center gap-3 px-3 py-2.5">
+      <span
+        className="inline-flex items-center justify-center w-7 h-7 rounded-full text-[11px] font-semibold text-white shrink-0"
+        style={{ background: `hsl(${avatarHue}, 60%, 50%)` }}
+        aria-hidden="true"
+      >
+        {initial}
+      </span>
+      <span className="text-[12.5px] text-fg flex-1 truncate">
+        {recipient}
+        {coverage && (
+          <span className="text-subtle text-[11.5px]">{coverage}</span>
+        )}
+      </span>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="inline-flex items-center gap-1 text-[11.5px] font-medium h-7 px-2.5 rounded transition-colors hover:bg-[var(--hover)]"
+        onClick={toggleMenu}
+        disabled={busy}
+        style={{ color: 'var(--fg-muted)' }}
+        title="Change permission"
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+      >
+        {busy ? (
+          <Loader2 size={11} className="animate-spin" />
+        ) : (
+          <>
+            {canEdit ? 'Can edit' : 'View only'}
+            <ChevronDown size={11} />
+          </>
+        )}
+      </button>
+      {menuOpen && menuPos &&
+        createPortal(
+          <div
+            ref={menuRef}
+            role="menu"
+            data-share-permission-menu
+            className="rounded-md shadow-card overflow-hidden"
+            style={{
+              position: 'fixed',
+              top: menuPos.top,
+              left: menuPos.left,
+              zIndex: 1000,
+              width: 124,
+              background: 'var(--panel)',
+              border: '1px solid var(--border)',
+            }}
+          >
+            <button
+              role="menuitem"
+              type="button"
+              className="w-full flex items-center gap-2 px-2 h-7 text-left text-[12px] hover:bg-[var(--hover)]"
+              onClick={() => {
+                setMenuOpen(false)
+                onSetEdit()
+              }}
+              style={{
+                background: canEdit ? 'var(--selected)' : 'transparent',
+                color: canEdit ? 'var(--accent)' : 'var(--fg)',
+              }}
+            >
+              <Pencil size={11} />
+              <span>Can edit</span>
+            </button>
+            <button
+              role="menuitem"
+              type="button"
+              className="w-full flex items-center gap-2 px-2 h-7 text-left text-[12px] hover:bg-[var(--hover)]"
+              onClick={() => {
+                setMenuOpen(false)
+                onSetReadOnly()
+              }}
+              style={{
+                background: !canEdit ? 'var(--selected)' : 'transparent',
+                color: !canEdit ? 'var(--accent)' : 'var(--fg)',
+              }}
+            >
+              <Eye size={11} />
+              <span>View only</span>
+            </button>
+            <div style={{ borderTop: '1px solid var(--border)' }} />
+            <button
+              role="menuitem"
+              type="button"
+              aria-label={revokeLabel}
+              className="w-full flex items-center gap-2 px-2 h-7 text-left text-[12px] hover:bg-[var(--danger-bg)]"
+              onClick={() => {
+                setMenuOpen(false)
+                onRevoke()
+              }}
+              style={{ color: 'var(--danger-fg)' }}
+            >
+              <Trash2 size={11} />
+              <span>Remove</span>
+            </button>
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }

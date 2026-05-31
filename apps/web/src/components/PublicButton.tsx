@@ -1,4 +1,4 @@
-import { Lock } from 'lucide-react'
+import { Shield } from 'lucide-react'
 import { api } from '../lib/api'
 import { MakePublicPopover } from './MakePublicPopover'
 import { RevokePublicPopover } from './RevokePublicPopover'
@@ -149,7 +149,7 @@ export function PublicButton({
           aria-label="Make public"
           style={forceActiveStyle ? { color: '#00875A' } : undefined}
         >
-          <Lock size={13} />
+          <Shield size={13} />
         </button>
       }
     />

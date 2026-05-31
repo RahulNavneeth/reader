@@ -27,6 +27,7 @@ import * as Y from 'yjs'
 import { WebsocketProvider } from 'y-websocket'
 import { IndexeddbPersistence } from 'y-indexeddb'
 import type { Awareness } from 'y-protocols/awareness'
+import * as awarenessProtocol from 'y-protocols/awareness'
 
 const WS_BASE = (() => {
   if (typeof window === 'undefined') return ''
@@ -42,6 +43,14 @@ export type CrdtBody = {
   /** True after the first `synced` event from the WebSocket. Until
    *  then the local IndexedDB cache is the only source of truth. */
   synced: boolean
+  /** True whenever the WebSocket transport is open — surfaces a
+   *  "we're talking to the server" signal that's more reliable
+   *  than `synced` for the toolbar's Autosaving / Offline pill.
+   *  Some short-doc / already-synced reconnects never fire a
+   *  fresh `sync` event (the syncStep2 reply is empty so the
+   *  client treats it as a no-op), leaving `synced` stuck at
+   *  `false` even though edits are flowing. */
+  connected: boolean
   /** Imperative API for callers that want to write through the
    *  CRDT (Phase 4 chat/MCP-style operators). For pure read
    *  surfaces (the current PathViewer) this stays unused. */
@@ -62,6 +71,7 @@ export function useCrdtBody(
 ): CrdtBody | null {
   const [text, setText] = useState('')
   const [synced, setSynced] = useState(false)
+  const [connected, setConnected] = useState(false)
   // Y.Doc + awareness live in state (not refs) because the
   // editor binds via React props and needs a render when they
   // (re)initialise. Refs would silently keep the editor pointed
@@ -74,6 +84,7 @@ export function useCrdtBody(
     if (!enabled || !docId) {
       setText('')
       setSynced(false)
+      setConnected(false)
       setDoc(null)
       setAwareness(null)
       return
@@ -108,35 +119,17 @@ export function useCrdtBody(
       connect: true,
     })
     setAwareness(provider.awareness)
-    // Seed a minimal awareness state from the moment the doc is
-    // open, before the user enters edit mode. The CrdtEditor
-    // upgrades the `name` to the signed-in username when it
-    // mounts; until then we use the per-tab id so other peers
-    // can at least see "someone else is here".
-    try {
-      const k = 'reader:crdtTab'
-      let tabId = ''
-      try {
-        tabId = sessionStorage.getItem(k) ?? ''
-        if (!tabId) {
-          tabId = Math.random().toString(36).slice(2, 10)
-          sessionStorage.setItem(k, tabId)
-        }
-      } catch {
-        tabId = Math.random().toString(36).slice(2, 10)
-      }
-      let hash = 0
-      for (let i = 0; i < tabId.length; i++) hash = (hash * 31 + tabId.charCodeAt(i)) | 0
-      const hue = Math.abs(hash) % 360
-      provider.awareness.setLocalStateField('user', {
-        name: tabId,
-        color: `hsl(${hue}, 70%, 55%)`,
-        colorLight: `hsl(${hue}, 70%, 85%)`,
-      })
-    } catch {
-      /* awareness seed is non-critical — pill just won't show
-       * this peer until something else sets state. */
-    }
+    // Intentionally DON'T seed an awareness state for view-mode
+    // tabs. Two reasons:
+    //   1. We don't have the signed-in username here without
+    //      drilling auth state into the hook; using a random
+    //      `tabId` as the name surfaced as "dnr3933q"-style
+    //      ghosts in the other tab's Peers panel.
+    //   2. Conceptually only edit-mode tabs are "editing now";
+    //      a view-only reader doesn't belong in the peers list.
+    // CrdtEditor publishes awareness when it mounts (with the
+    // actual username + a hue-stable colour from the tab id), so
+    // peers correctly populate from edit-mode tabs only.
 
     const onSync = (isSynced: boolean) => {
       setSynced(isSynced)
@@ -147,6 +140,19 @@ export function useCrdtBody(
       }
     }
     provider.on('sync', onSync)
+    // `status` fires { status: 'connected' | 'connecting' | 'disconnected' }
+    // each time the WebSocket transitions. Drives the toolbar's
+    // Autosaving / Offline label directly — `synced` can stay
+    // false forever on a short-doc reconnect (no syncStep2 payload
+    // to trigger the event) and would mislead the user.
+    const onStatus = (s: { status: 'connected' | 'connecting' | 'disconnected' }) => {
+      setConnected(s.status === 'connected')
+    }
+    provider.on('status', onStatus)
+    // Seed the initial value in case the provider connects before
+    // we attach the listener (y-websocket's connect is sync after
+    // `connect: true`).
+    setConnected((provider as unknown as { wsconnected?: boolean }).wsconnected ?? false)
 
     const ytext = doc.getText('body')
     const onUpdate = () => {
@@ -154,9 +160,27 @@ export function useCrdtBody(
     }
     ytext.observe(onUpdate)
 
+    // Hard-refresh cleanup: y-websocket registers its own
+    // beforeunload, but the awareness-removal frame can lose the
+    // race with TCP close. Send the explicit removeAwarenessStates
+    // ourselves so the server's `applyAwarenessUpdate` runs before
+    // the connection drops — eliminates the brief "ghost peer"
+    // window between an unload and the staleness sweep.
+    const onBeforeUnload = () => {
+      try {
+        awarenessProtocol.removeAwarenessStates(
+          provider.awareness,
+          [doc.clientID],
+          'window unload',
+        )
+      } catch {/* best-effort during unload */}
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
     return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload)
       ytext.unobserve(onUpdate)
       provider.off('sync', onSync)
+      provider.off('status', onStatus)
       provider.disconnect()
       provider.destroy()
       persistence.destroy()
@@ -164,6 +188,7 @@ export function useCrdtBody(
       docRef.current = null
       setDoc(null)
       setAwareness(null)
+      setConnected(false)
     }
   }, [docId, enabled])
 
@@ -178,5 +203,5 @@ export function useCrdtBody(
   }
 
   if (!enabled || !docId) return null
-  return { text, synced, replace, doc, awareness }
+  return { text, synced, connected, replace, doc, awareness }
 }

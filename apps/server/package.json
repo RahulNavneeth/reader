@@ -1,10 +1,10 @@
 {
   "name": "@reader/server",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.11.0",
   "type": "module",
   "scripts": {
-    "dev": "DATA_DIR=${DATA_DIR:-../../data} APP_URL=${APP_URL:-http://localhost:5174} tsx watch src/index.ts",
+    "dev": "DATA_DIR=${DATA_DIR:-../../data} APP_URL=${APP_URL:-http://localhost:5174} tsx watch --env-file-if-exists=../../.env src/index.ts",
     "build": "tsc -p tsconfig.json && node -e \"const{cpSync}=require('node:fs');cpSync('src/db/migrations','dist/db/migrations',{recursive:true})\"",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",

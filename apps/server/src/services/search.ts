@@ -33,12 +33,30 @@ type Cache = {
 
 let cache: Cache | null = null
 let building: Promise<Cache> | null = null
+/**
+ * Epoch ticks on every invalidate. A build that snapshotted
+ * documents at epoch=N can only install its result when
+ * `buildEpoch` is still N — otherwise an invalidate ran
+ * mid-build and the snapshot is stale. Without this guard, an
+ * in-flight build started before an MCP upload would resolve
+ * AFTER `invalidateSearchCache()` had cleared the cache and
+ * re-install its pre-upload snapshot, so subsequent reads kept
+ * seeing the old data until another invalidate landed.
+ */
+let buildEpoch = 0
 
 export function invalidateSearchCache(): void {
   cache = null
+  // Drop the reference so new getCache callers start a fresh
+  // build. The previously-captured `building` promise still
+  // resolves for any waiter that was already awaiting it, but
+  // its installer (below) checks the epoch and won't write the
+  // stale snapshot into `cache`.
+  building = null
+  buildEpoch++
 }
 
-async function build(): Promise<Cache> {
+async function build(epoch: number): Promise<Cache> {
   const docs = await listAllDocuments()
   const fullTexts = new Map<string, string>()
   const clipByDoc = new Map<string, number[]>()
@@ -51,13 +69,26 @@ async function build(): Promise<Cache> {
       if (vec && vec.length) clipByDoc.set(d.id, vec)
     }
   }
-  return { builtAt: Date.now(), docs, fullTexts, clipByDoc }
+  const built: Cache = { builtAt: Date.now(), docs, fullTexts, clipByDoc }
+  if (epoch === buildEpoch) cache = built
+  return built
 }
 
 async function getCache(): Promise<Cache> {
   if (cache) return cache
-  if (!building) building = build().then((c) => (cache = c))
-  return building.then((c) => (building = null, c))
+  if (!building) {
+    const epoch = buildEpoch
+    const p = build(epoch)
+    building = p
+    // Self-cleanup so a stale reference doesn't pin the
+    // promise after it resolves. Only clear if `building` is
+    // still our promise (an `invalidateSearchCache` could
+    // have already nulled it).
+    p.finally(() => {
+      if (building === p) building = null
+    }).catch(() => {/* swallow — handled by caller */})
+  }
+  return building
 }
 
 export function cosine(a: Float32Array, b: Float32Array, normA: number): number {

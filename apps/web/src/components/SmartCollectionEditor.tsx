@@ -144,8 +144,8 @@ export function SmartCollectionEditor({ collectionId, initialQuery, onChanged }:
               className="w-full text-[12.5px] px-2 py-1.5 rounded resize-none outline-none"
               rows={2}
               style={{
-                background: 'var(--surface-1)',
-                border: '1px solid var(--border)',
+                background: 'var(--input-bg)',
+                border: '1px solid var(--input-border)',
                 color: 'var(--fg)',
               }}
             />
@@ -165,8 +165,8 @@ export function SmartCollectionEditor({ collectionId, initialQuery, onChanged }:
                 placeholder="comma, separated"
                 className="w-full text-[12.5px] px-2 py-1.5 rounded outline-none"
                 style={{
-                  background: 'var(--surface-1)',
-                  border: '1px solid var(--border)',
+                  background: 'var(--input-bg)',
+                  border: '1px solid var(--input-border)',
                   color: 'var(--fg)',
                 }}
               />
@@ -180,8 +180,8 @@ export function SmartCollectionEditor({ collectionId, initialQuery, onChanged }:
                 placeholder="e.g. journal/"
                 className="w-full text-[12.5px] px-2 py-1.5 rounded outline-none"
                 style={{
-                  background: 'var(--surface-1)',
-                  border: '1px solid var(--border)',
+                  background: 'var(--input-bg)',
+                  border: '1px solid var(--input-border)',
                   color: 'var(--fg)',
                 }}
               />
@@ -195,8 +195,8 @@ export function SmartCollectionEditor({ collectionId, initialQuery, onChanged }:
                 onChange={(e) => setMimeKind(e.target.value as typeof mimeKind)}
                 className="w-full text-[12.5px] px-2 py-1.5 rounded outline-none"
                 style={{
-                  background: 'var(--surface-1)',
-                  border: '1px solid var(--border)',
+                  background: 'var(--input-bg)',
+                  border: '1px solid var(--input-border)',
                   color: 'var(--fg)',
                 }}
               >

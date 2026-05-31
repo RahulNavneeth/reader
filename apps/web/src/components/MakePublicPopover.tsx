@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Globe, Lock, Loader2 } from 'lucide-react'
+import { Globe, Shield, Loader2 } from 'lucide-react'
 import { alignStyle, useAnchoredAlign } from '../lib/anchoredAlign'
 
 type Props = {
@@ -130,7 +130,7 @@ export function MakePublicPopover({
             className="flex items-center gap-2 px-3 h-8"
             style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}
           >
-            <Lock size={13} className="text-muted" />
+            <Shield size={13} className="text-muted" />
             <span className="text-[12px] font-semibold text-fg flex-1">{title}</span>
             <span className="text-[10.5px] text-subtle">Off</span>
           </div>

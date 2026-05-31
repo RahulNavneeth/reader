@@ -147,7 +147,7 @@ export function BulkTagsButton({ paths }: { paths: string[] }) {
           <div
             className="px-2 py-1.5 cursor-text"
             style={{
-              background: 'var(--bg)',
+              background: 'var(--input-bg)',
               borderBottom: hasSuggestionArea
                 ? '1px solid var(--border)'
                 : undefined,

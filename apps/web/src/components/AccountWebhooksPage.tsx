@@ -590,25 +590,18 @@ function WebhookRow({
           </div>
           <div className="text-[11.5px] text-subtle mt-0.5">
             {hook.events.length === ALL_EVENTS.length
-              ? 'All events'
+              ? 'all events'
               : hook.events.length <= 4
                 ? hook.events.map((e) => EVENT_LABEL[e]).join(' · ')
                 : `${hook.events
                     .slice(0, 3)
                     .map((e) => EVENT_LABEL[e])
                     .join(' · ')} · +${hook.events.length - 3} more`}
-            {hook.hasSecret && (
-              <span className="ml-1.5 opacity-70">· signed</span>
-            )}
+            {hook.hasSecret ? ' · signed' : ' · unsigned'}
+            {hook.lastDelivery
+              ? ` · last ${timeAgo(hook.lastDelivery.ts)}`
+              : ' · never delivered'}
           </div>
-          {hook.lastDelivery && (
-            <div className="text-[11px] text-subtle mt-0.5">
-              last delivery {timeAgo(hook.lastDelivery.ts)} · status {hook.lastDelivery.status ?? '—'}
-              {hook.lastDelivery.error && (
-                <span style={{ color: '#BF2600' }}> · {hook.lastDelivery.error}</span>
-              )}
-            </div>
-          )}
           {testResult && (
             <div
               className="text-[11px] mt-1"
@@ -622,38 +615,34 @@ function WebhookRow({
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <button
-            className="btn-ghost"
+            className="btn-ghost h-7 px-2 text-[11.5px]"
             onClick={toggleEnabled}
             disabled={togglingEnabled}
             title={enabled ? 'Pause this webhook' : 'Resume this webhook'}
-            aria-label={enabled ? 'Pause' : 'Resume'}
           >
             {togglingEnabled ? (
-              <Loader2 size={12} className="animate-spin" />
+              <Loader2 size={11} className="animate-spin" />
+            ) : enabled ? (
+              'On'
             ) : (
-              <span
-                className="text-[10px] font-semibold uppercase tracking-wider px-1.5"
-                style={{ color: enabled ? 'var(--accent)' : 'var(--fg-subtle)' }}
-              >
-                {enabled ? 'On' : 'Off'}
-              </span>
+              'Off'
             )}
           </button>
           <button
-            className="btn-ghost"
+            className="btn-ghost h-7 w-7 px-0 grid place-items-center"
             onClick={runTest}
             disabled={testing}
             title="Send test ping"
             aria-label="Send test ping"
           >
             {testing ? (
-              <Loader2 size={12} className="animate-spin" />
+              <Loader2 size={11} className="animate-spin" />
             ) : (
-              <Send size={12} />
+              <Send size={11} />
             )}
           </button>
           <button
-            className="btn-ghost"
+            className="btn-ghost h-7 w-7 px-0 grid place-items-center"
             onClick={() => {
               setEditUrl(hook.url)
               setEditEvents(new Set(hook.events))
@@ -664,15 +653,15 @@ function WebhookRow({
             aria-label="Edit"
             style={editing ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
           >
-            <Pencil size={12} />
+            <Pencil size={11} />
           </button>
           <button
-            className="btn-ghost-danger"
+            className="btn-ghost-danger h-7 w-7 px-0 grid place-items-center"
             onClick={onDelete}
             title="Delete webhook"
             aria-label="Delete webhook"
           >
-            <Trash2 size={12} />
+            <Trash2 size={11} />
           </button>
         </div>
       </div>

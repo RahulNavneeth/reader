@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { ChevronLeft, Loader2, RotateCcw } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
 import rehypeSlug from 'rehype-slug'
 import rehypeHighlight from 'rehype-highlight'
 import { ApiError, api } from '../lib/api'
@@ -64,18 +65,55 @@ export function VersionDiffView({
 }: Props) {
   const confirm = useConfirm()
   const [snapshot, setSnapshot] = useState<string | null>(null)
+  /** The text this snapshot is diffed against — the NEXT
+   *  more-recent snapshot's text, or current text when this is
+   *  the latest snapshot. Per-edit isolation so the diff only
+   *  shows what changed IN this snapshot's session, not every
+   *  edit since. */
+  const [afterText, setAfterText] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [restoring, setRestoring] = useState(false)
   const [restoreError, setRestoreError] = useState<string | null>(null)
+  // Default to Diff — when the user opens a snapshot from the
+  // version rail they almost always want to see "what changed
+  // since then", not re-read the whole doc. Snapshot mode is a
+  // single toggle away.
+  const [view, setView] = useState<'snapshot' | 'diff'>('diff')
 
   useEffect(() => {
     let cancelled = false
     setSnapshot(null)
+    setAfterText(null)
     setError(null)
-    api
-      .fileVersionText(path, ts)
-      .then((r) => {
-        if (!cancelled) setSnapshot(r.text ?? '')
+    Promise.all([
+      api
+        .fileVersionText(path, ts)
+        .then((r) => r.text ?? '')
+        .catch((e) => {
+          throw e
+        }),
+      api
+        .fileVersions(path)
+        .then((r) => r.versions)
+        .catch(() => [] as Array<{ ts: number }>),
+    ])
+      .then(async ([snapText, vers]) => {
+        if (cancelled) return
+        setSnapshot(snapText)
+        // Next-newer snapshot ts is the right side of the diff.
+        // None → this is the latest snapshot; use current text.
+        const nextNewer = vers
+          .filter((v) => v.ts > ts)
+          .sort((a, b) => a.ts - b.ts)[0]
+        if (!nextNewer) {
+          setAfterText(currentText)
+          return
+        }
+        const r = await api
+          .fileVersionText(path, nextNewer.ts)
+          .catch(() => ({ text: '' }))
+        if (cancelled) return
+        setAfterText(r.text ?? '')
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof ApiError ? e.message : String(e))
@@ -83,7 +121,7 @@ export function VersionDiffView({
     return () => {
       cancelled = true
     }
-  }, [path, ts])
+  }, [path, ts, currentText])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -94,8 +132,8 @@ export function VersionDiffView({
   }, [onExit])
 
   const chunks = useMemo(() => {
-    if (snapshot === null) return null
-    const ops = computeLineDiff(snapshot, currentText)
+    if (snapshot === null || afterText === null) return null
+    const ops = computeLineDiff(snapshot, afterText)
     // Coalesce consecutive ops of the same kind into chunks. Each
     // chunk becomes one ReactMarkdown block in the rendered view.
     const groups: Array<{ kind: 'eq' | 'ins' | 'del'; text: string }> = []
@@ -116,7 +154,7 @@ export function VersionDiffView({
     }
     flush()
     return groups
-  }, [snapshot, currentText])
+  }, [snapshot, afterText])
 
   const stats = useMemo(() => {
     if (!chunks) return null
@@ -132,12 +170,13 @@ export function VersionDiffView({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Sticky banner inside the doc viewer's scrollable area. Tells
-          the user they're in a diff view and gives them a one-click
-          exit back to the current rendering. */}
+      {/* Sticky banner inside the doc viewer's scrollable area —
+          surface-2 to match every other sub-header bar across
+          the app (editor header, doc breadcrumb, chat dock
+          header). */}
       <div
         className="sticky top-0 z-10 px-3 h-11 flex items-center gap-3 border-b shrink-0"
-        style={{ background: 'var(--bg)', borderColor: 'var(--border)' }}
+        style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}
       >
         <button
           className="btn-ghost h-7 w-7 px-0"
@@ -148,15 +187,53 @@ export function VersionDiffView({
           <ChevronLeft size={13} />
         </button>
         <div className="text-[12.5px] text-fg min-w-0 truncate">
-          <span className="text-subtle">Comparing with snapshot from </span>
+          <span className="text-subtle">
+            {view === 'snapshot' ? 'Snapshot from ' : 'Changes since '}
+          </span>
           <span className="font-semibold">{formatFriendlyTimestamp(ts)}</span>
         </div>
-        {stats && (
+        {view === 'diff' && stats && (
           <div className="text-[12px] font-semibold flex items-center gap-2 ml-auto whitespace-nowrap tabular-nums">
             <span style={{ color: '#00875A' }}>+{stats.added}</span>
             <span style={{ color: 'var(--danger-fg)' }}>−{stats.removed}</span>
           </div>
         )}
+        {/* Snapshot ↔ Diff toggle. Snapshot mode renders the
+            historical text as a clean doc (what the file looked
+            like then). Diff mode overlays insertions and deletions
+            against current — useful when reviewing changes. */}
+        <div
+          className={
+            'inline-flex rounded-md p-0.5 shrink-0 ' +
+            (view === 'diff' && stats ? '' : 'ml-auto')
+          }
+          style={{
+            background: 'var(--hover)',
+            border: '1px solid var(--border)',
+          }}
+          role="tablist"
+          aria-label="Version view mode"
+        >
+          {(['snapshot', 'diff'] as const).map((m) => {
+            const active = view === m
+            return (
+              <button
+                key={m}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => setView(m)}
+                className="text-[11px] font-medium px-2.5 h-6 rounded transition-colors"
+                style={{
+                  background: active ? 'var(--selected)' : 'transparent',
+                  color: active ? 'var(--accent)' : 'var(--fg-muted)',
+                }}
+              >
+                {m === 'snapshot' ? 'Snapshot' : 'Diff'}
+              </button>
+            )
+          })}
+        </div>
         {onRestored && snapshot !== null && (
           <button
             className="btn-ghost h-7 px-2 inline-flex items-center gap-1.5 text-[12px]"
@@ -171,7 +248,7 @@ export function VersionDiffView({
               setRestoring(true)
               setRestoreError(null)
               try {
-                await api.fileRestoreVersion(path, ts)
+                await api.fileRestoreVersion(path, ts, callerOpts)
                 await onRestored?.()
                 onExit()
               } catch (e) {
@@ -214,12 +291,35 @@ export function VersionDiffView({
             {error}
           </div>
         )}
-        {chunks && chunks.length === 0 && (
+        {/* Snapshot mode — render the historical text as a clean
+            markdown doc. No diff colors, no "what changed" overlay.
+            This is the "show me what the file looked like at time
+            X" view that the user intuitively expects when picking
+            an older version. */}
+        {view === 'snapshot' && snapshot !== null && (
+          snapshot.trim().length === 0 ? (
+            <div className="text-[12px] text-subtle">
+              This snapshot has no extracted text. The file may have been a
+              binary upload, or its initial ingest hadn't completed when the
+              snapshot was taken.
+            </div>
+          ) : (
+            <article className="md">
+              <DiffChunk
+                kind="eq"
+                text={snapshot}
+                parentDir={parentDir}
+                callerOpts={callerOpts}
+              />
+            </article>
+          )
+        )}
+        {view === 'diff' && chunks && chunks.length === 0 && (
           <div className="text-[12px] text-subtle">
             No textual differences — the doc body is identical to this snapshot.
           </div>
         )}
-        {chunks && chunks.length > 0 && (
+        {view === 'diff' && chunks && chunks.length > 0 && (
           <article className="md">
             {chunks.map((g, i) => (
               <DiffChunk
@@ -273,7 +373,7 @@ function DiffChunk({
   if (kind === 'eq') {
     return (
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         rehypePlugins={[rehypeSlug, rehypeHighlight]}
         components={components}
       >
@@ -297,7 +397,7 @@ function DiffChunk({
       }}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         rehypePlugins={[rehypeSlug, rehypeHighlight]}
         components={components}
       >

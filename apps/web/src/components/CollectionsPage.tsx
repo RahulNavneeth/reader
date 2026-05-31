@@ -206,7 +206,7 @@ export function CollectionsPage() {
           <div className="h-full flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--surface-2)', border: '1px dashed var(--border)' }}
             >
               <Layers size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">No collections yet</div>
@@ -285,7 +285,7 @@ function CollectionCard({
          own subtle treatments instead. */
       className="group block rounded-md overflow-hidden no-underline"
       style={{
-        background: 'var(--panel)',
+        background: 'var(--surface-2)',
         border: '1px solid var(--border)',
       }}
     >

@@ -2653,6 +2653,23 @@ export async function mcpRoutes(app: FastifyInstance) {
         })
     }
 
+    // Streamable HTTP session passthrough. Spec-strict clients send
+    // `Mcp-Session-Id` after init; we're stateless per-call so we
+    // just echo whatever the client provides. On `initialize` with
+    // no header from the client, mint a fresh id so the client has
+    // something to send back on subsequent requests.
+    const sessionIdIn = req.headers['mcp-session-id']
+    let sessionId =
+      typeof sessionIdIn === 'string' && sessionIdIn.length > 0
+        ? sessionIdIn
+        : null
+    const isInit =
+      !!req.body &&
+      typeof req.body === 'object' &&
+      (req.body as any).method === 'initialize'
+    if (!sessionId && isInit) sessionId = nanoid()
+    if (sessionId) reply.header('Mcp-Session-Id', sessionId)
+
     // Throttle per principal. The bucket key already encodes whether
     // this is an API token or an OAuth client so two distinct
     // grants from the same user don't share a budget.
@@ -2691,8 +2708,59 @@ export async function mcpRoutes(app: FastifyInstance) {
     return reply.send(res)
   })
 
-  app.get('/mcp', async (_req, reply) => {
-    return reply.code(405).send({ error: 'streaming not implemented; use POST /mcp' })
+  /** GET /mcp — server-initiated event stream for Streamable HTTP
+   *  clients (mcpo, OpenWebUI tool-server proxy, spec-strict
+   *  clients) that open a long-poll for server pushes. Reader has
+   *  no server-initiated notifications today, so the stream just
+   *  stays alive with comment keepalives until the client closes
+   *  it. Without this, spec-strict clients refuse to complete the
+   *  init handshake. */
+  app.get('/mcp', async (req: FastifyRequest, reply: FastifyReply) => {
+    const token = await authHeaderToken(req)
+    if (!token) {
+      return reply
+        .code(401)
+        .header(
+          'WWW-Authenticate',
+          `Bearer realm="reader-mcp", resource_metadata="${config.appUrl.replace(/\/$/, '')}/.well-known/oauth-protected-resource"`,
+        )
+        .send({ error: 'authentication required' })
+    }
+    // Strict spec-compliant clients send Mcp-Session-Id obtained
+    // from the init response. Stateless server, so we just echo.
+    const sessionIdIn = req.headers['mcp-session-id']
+    const sessionId =
+      typeof sessionIdIn === 'string' && sessionIdIn.length > 0
+        ? sessionIdIn
+        : null
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+      ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}),
+    })
+    // Initial comment so proxies flush headers + the client knows
+    // the stream is alive.
+    reply.raw.write(': stream open\n\n')
+    const heartbeat = setInterval(() => {
+      try {
+        reply.raw.write(': keepalive\n\n')
+      } catch {
+        clearInterval(heartbeat)
+      }
+    }, 15_000)
+    const done = () => {
+      clearInterval(heartbeat)
+      try {
+        reply.raw.end()
+      } catch {/* already closed */}
+    }
+    req.raw.once('close', done)
+    req.raw.once('aborted', done)
+    // Don't return — the connection stays open until the client
+    // disconnects. Tell Fastify the response is hijacked.
+    return reply.hijack()
   })
 }
 

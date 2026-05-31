@@ -86,9 +86,15 @@ function clusterWindowFor(action: string): number {
 export function ActivityPanel({
   path,
   kind = 'file',
+  owner,
 }: {
   path: string
   kind?: 'file' | 'folder'
+  /** Owner hint for cross-user reads. Threaded to the audit
+   *  endpoint so share recipients get their permitted activity
+   *  instead of 403 (the server side resolves via the same
+   *  resolveReadContext the other read endpoints use). */
+  owner?: string
 }) {
   const [entries, setEntries] = useState<Entry[] | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -98,7 +104,10 @@ export function ActivityPanel({
     let cancelled = false
     setEntries(null)
     setError(null)
-    const fetcher = kind === 'folder' ? api.folderActivity(path) : api.fileActivity(path)
+    const fetcher =
+      kind === 'folder'
+        ? api.folderActivity(path)
+        : api.fileActivity(path, 50, owner ? { owner } : undefined)
     fetcher
       .then((r) => {
         if (!cancelled) setEntries(r.entries)
@@ -109,7 +118,7 @@ export function ActivityPanel({
     return () => {
       cancelled = true
     }
-  }, [path, kind])
+  }, [path, kind, owner])
 
   // Filter + dedup pipeline. Filter first so the dedup window doesn't
   // accidentally cluster two unrelated actions because the matching

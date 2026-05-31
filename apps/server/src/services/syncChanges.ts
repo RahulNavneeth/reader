@@ -24,10 +24,12 @@ export type SyncChangeKind =
   | 'doc.tags'
   | 'doc.visibility'
   | 'doc.archive'
+  | 'doc.lock'
   | 'doc.restore'
   | 'folder.mkdir'
   | 'folder.rmdir'
   | 'folder.archive'
+  | 'folder.lock'
 
 type Base = { owner: string; actor: string; clientOpId?: string | null }
 
@@ -56,10 +58,12 @@ type Payloads =
       expiresAt?: number | null
     }
   | { kind: 'doc.archive'; archived: boolean }
+  | { kind: 'doc.lock'; locked: boolean }
   | { kind: 'doc.restore'; /** Trash-restore (NOT version restore). */ originalPath: string }
   | { kind: 'folder.mkdir' }
   | { kind: 'folder.rmdir'; recursive: boolean }
   | { kind: 'folder.archive'; archived: boolean }
+  | { kind: 'folder.lock'; locked: boolean }
 
 export type SyncChangePayload = Payloads
 

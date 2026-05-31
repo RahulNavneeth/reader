@@ -210,6 +210,176 @@ export async function externalMountsRoutes(app: FastifyInstance) {
       reply.raw.end()
     })
   })
+
+  // Import file(s) / folder(s) from a mount into the requester's
+  // own vault. Read-only mounts are still imported FROM safely
+  // (we copy bytes; the mount itself is never written to).
+  //
+  // Body: { paths: string[]; dest: string }
+  //   paths – mount-relative file or folder paths
+  //   dest  – vault-relative destination directory ("" = root).
+  //           Files keep their basename; folder imports preserve
+  //           the subtree under `<dest>/<folderName>/…`.
+  app.post('/api/external-mounts/:id/import', async (req, reply) => {
+    if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
+    const user = req.currentUser
+    if (user.role === 'viewer') {
+      return reply.code(403).send({ error: 'viewers cannot import' })
+    }
+    const { id } = req.params as { id: string }
+    const body = req.body as { paths?: string[]; dest?: string }
+    const paths = Array.isArray(body?.paths)
+      ? body.paths.filter((p): p is string => typeof p === 'string')
+      : []
+    const dest = String(body?.dest ?? '').replace(/^\/+|\/+$/g, '')
+    if (paths.length === 0) {
+      return reply.code(400).send({ error: 'no paths to import' })
+    }
+    const s = await loadSettings()
+    const mount = (s.externalMounts ?? []).find((m) => m.id === id)
+    if (!mount) return reply.code(404).send({ error: 'mount not found' })
+    const { resolveUserVault, ensureUserVault } = await import('../lib/userVault.js')
+    const { saveMeta, sha256Of } = await import('../stores/documents.js')
+    type Doc = import('../types.js').DocumentMeta
+    const { ingestDocument } = await import('../services/ingest.js')
+    const { invalidateSearchCache } = await import('../services/search.js')
+    const { publish } = await import('../services/events.js')
+    const { mkdir, readFile, writeFile } = await import('node:fs/promises')
+    await ensureUserVault(user.username)
+
+    // Recursively walk a mount path, yielding files-only with
+    // their relative path under that path's root.
+    const walk = async (
+      mountAbs: string,
+      mountRelRoot: string,
+    ): Promise<{ abs: string; rel: string }[]> => {
+      const out: { abs: string; rel: string }[] = []
+      const st = await fsStat(mountAbs).catch(() => null)
+      if (!st) return out
+      if (st.isFile()) {
+        out.push({ abs: mountAbs, rel: '' })
+        return out
+      }
+      if (!st.isDirectory()) return out
+      const stack: { abs: string; rel: string }[] = [{ abs: mountAbs, rel: '' }]
+      while (stack.length > 0) {
+        const { abs, rel } = stack.pop()!
+        let names: string[]
+        try {
+          names = await new Promise<string[]>((res, rej) =>
+            readdir(abs, (err, files) => (err ? rej(err) : res(files))),
+          )
+        } catch {
+          continue
+        }
+        for (const n of names) {
+          if (n.startsWith('.')) continue
+          const childAbs = path.join(abs, n)
+          const childRel = rel ? `${rel}/${n}` : n
+          const childSt = await fsStat(childAbs).catch(() => null)
+          if (!childSt) continue
+          if (childSt.isDirectory()) {
+            stack.push({ abs: childAbs, rel: childRel })
+          } else if (childSt.isFile()) {
+            out.push({ abs: childAbs, rel: childRel })
+          }
+        }
+      }
+      // We don't need the mountRelRoot for the walker itself, but
+      // callers use it to know where to place the imported file
+      // in the user's vault (see below). Returning the relative
+      // path keeps the import-side logic simple.
+      void mountRelRoot
+      return out
+    }
+
+    const imported: string[] = []
+    const failed: { path: string; error: string }[] = []
+    for (const p of paths) {
+      let mountAbs: string
+      try {
+        mountAbs = resolveInMount(mount, p)
+      } catch (e: any) {
+        failed.push({ path: p, error: e?.message ?? 'invalid path' })
+        continue
+      }
+      const sourceSt = await fsStat(mountAbs).catch(() => null)
+      if (!sourceSt) {
+        failed.push({ path: p, error: 'not found' })
+        continue
+      }
+      const sourceBase = path.basename(p) || path.basename(mount.absPath)
+      // Files become `<dest>/<basename>`. Folders become a
+      // subtree rooted at `<dest>/<folderName>/…`.
+      const targetRoot = sourceSt.isDirectory()
+        ? (dest ? `${dest}/${sourceBase}` : sourceBase)
+        : dest
+      const files = await walk(mountAbs, p)
+      for (const { abs, rel } of files) {
+        const filename = rel || sourceBase
+        const vaultRel = targetRoot
+          ? `${targetRoot}/${filename}`
+          : filename
+        try {
+          const vaultAbs = resolveUserVault(user.username, vaultRel)
+          await mkdir(path.dirname(vaultAbs), { recursive: true })
+          // Don't clobber existing vault files — append " (1)",
+          // " (2)" etc until we find a free slot. Cheap collision
+          // handling is enough; the user can rename later.
+          let finalAbs = vaultAbs
+          let finalRel = vaultRel
+          let n = 1
+          while (await fsStat(finalAbs).then(() => true).catch(() => false)) {
+            const ext = path.extname(vaultRel)
+            const base = vaultRel.slice(0, vaultRel.length - ext.length)
+            finalRel = `${base} (${n})${ext}`
+            finalAbs = resolveUserVault(user.username, finalRel)
+            n++
+            if (n > 999) throw new Error('too many collisions')
+          }
+          const buf = await readFile(abs)
+          await writeFile(finalAbs, buf)
+          const id = nanoid()
+          const meta: Doc = {
+            id,
+            title: path.basename(finalRel, path.extname(finalRel)),
+            originalFilename: path.basename(finalRel),
+            mime: guessMime(path.extname(finalRel).toLowerCase()),
+            bytes: buf.length,
+            sha256: sha256Of(buf),
+            storageKey: finalRel,
+            owner: user.username,
+            acl: { readers: [], editors: [] },
+            public: false,
+            publicExpiresAt: null,
+            publicPasswordHash: null,
+            tags: [],
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            ingest: { status: 'pending', embedded: false },
+          }
+          await saveMeta(meta)
+          await ingestDocument(meta, buf)
+          imported.push(finalRel)
+          publish({ type: 'edit', path: finalRel })
+        } catch (e: any) {
+          failed.push({ path: rel ? `${p}/${rel}` : p, error: e?.message ?? 'import failed' })
+        }
+      }
+    }
+    invalidateSearchCache()
+    void audit({
+      actor: user.username,
+      action: 'library.import',
+      target: dest || '(vault root)',
+      meta: { mountId: id, count: imported.length, failed: failed.length },
+    }).catch(() => null)
+    return reply.code(imported.length > 0 ? 200 : 207).send({
+      ok: imported.length > 0,
+      imported,
+      failed,
+    })
+  })
 }
 
 function guessMime(ext: string): string {

@@ -1,22 +1,21 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   X,
   Globe,
   Lock,
   Sparkles,
-  Star,
   Copy,
   Check,
   Calendar,
   Hash,
-  Loader2,
   Share2,
   Tag,
   MapPin,
+  FileText,
 } from 'lucide-react'
 import { Map, Marker } from 'pigeon-maps'
 import { api, type DocumentMeta } from '../lib/api'
-import { useVault } from '../lib/vault-context'
 import { copyText } from '../lib/clipboard'
 
 type Props = {
@@ -36,9 +35,7 @@ type Props = {
  * PathViewer already has loaded.
  */
 export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
-  const { refresh } = useVault()
-  const [pinned, setPinned] = useState<boolean | null>(null)
-  const [pinBusy, setPinBusy] = useState(false)
+  const navigate = useNavigate()
   const [thumbFailed, setThumbFailed] = useState(false)
   const [activity, setActivity] = useState<Array<{ ts: number; action: string }>>([])
   const [versionsCount, setVersionsCount] = useState<number | null>(null)
@@ -48,17 +45,10 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
     if (!open) return
     let cancelled = false
     Promise.all([
-      api.listPins().catch(() => ({ pins: [] })),
       api.fileActivity(path, 6).catch(() => ({ entries: [] })),
       api.fileVersions(path).catch(() => ({ versions: [] })),
-    ]).then(([pinsR, actR, versR]) => {
+    ]).then(([actR, versR]) => {
       if (cancelled) return
-      const norm = path.replace(/^\/+|\/+$/g, '')
-      setPinned(
-        pinsR.pins.some(
-          (p) => p.storageKey === norm && (owner ? p.owner === owner : true),
-        ),
-      )
       setActivity(actR.entries.map((e) => ({ ts: e.ts, action: e.action })))
       setVersionsCount(versR.versions.length)
     })
@@ -77,23 +67,6 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
   if (!open) return null
 
   const filename = meta?.originalFilename ?? path.split('/').pop() ?? path
-
-  const togglePin = async () => {
-    if (pinBusy || pinned == null) return
-    setPinBusy(true)
-    try {
-      if (pinned) {
-        await api.removePin({ path, owner })
-        setPinned(false)
-      } else {
-        await api.addPin({ path, owner, isFolder: false })
-        setPinned(true)
-      }
-      refresh()
-    } finally {
-      setPinBusy(false)
-    }
-  }
 
   return (
     <>
@@ -151,31 +124,6 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
             </div>
           </div>
 
-          {/* Quick action row. */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <button
-              className="btn-ghost"
-              onClick={togglePin}
-              disabled={pinBusy || pinned == null}
-              style={
-                pinned
-                  ? { background: 'var(--selected)', color: 'var(--accent)' }
-                  : undefined
-              }
-            >
-              {pinBusy ? (
-                <Loader2 size={12} className="animate-spin" />
-              ) : (
-                <Star
-                  size={12}
-                  fill={pinned ? 'currentColor' : 'none'}
-                  strokeWidth={1.8}
-                />
-              )}
-              {pinned ? 'Pinned' : 'Pin'}
-            </button>
-          </div>
-
           {meta && (
             <Section title="About">
               <Row
@@ -226,6 +174,30 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
                   )
                 }
               />
+              {meta.templateSource && (
+                <Row
+                  label="Template"
+                  value={
+                    <span
+                      className="inline-flex items-center gap-1 hover:underline cursor-pointer"
+                      style={{ color: 'var(--accent)' }}
+                      title={`Open ${meta.templateSource.template}`}
+                      onClick={() => {
+                        const tpl = meta.templateSource?.template
+                        if (!tpl) return
+                        const segs = tpl
+                          .split('/')
+                          .map(encodeURIComponent)
+                          .join('/')
+                        navigate(`/${segs}`)
+                      }}
+                    >
+                      <FileText size={11} />
+                      {meta.templateSource.template.replace(/^_templates\//, '')}
+                    </span>
+                  }
+                />
+              )}
             </Section>
           )}
 
@@ -388,10 +360,15 @@ export function MetadataPanel({ path, meta, owner, open, onClose }: Props) {
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  // Background uses `--panel-2`, which sits one tier above `--panel`
+  // (the outer Details panel) in BOTH themes — light: #FAFBFC over
+  // #F4F5F7, dark: #122142 over #0F1B33. Gives each section a
+  // visible elevation step without inventing new tokens; the outer
+  // panel reads as the container, each section as a card inside.
   return (
     <section
       className="rounded-md p-3"
-      style={{ border: '1px solid var(--border)' }}
+      style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}
     >
       <div className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle mb-2">
         {title}

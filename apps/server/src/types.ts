@@ -85,6 +85,17 @@ export type DocumentMeta = {
   archived?: boolean
   /** Timestamp the doc was archived. Cleared on unarchive. */
   archivedAt?: number | null
+  /** Owner-controlled write freeze. When true, every mutation
+   *  (CRDT autosave, MCP edit, /api/file/upload overwrite, chat
+   *  apply-edit, delete, move, etc.) returns 423 Locked unless the
+   *  actor is the doc owner or an admin. Distinct from `archived`
+   *  (which only hides from default views — still editable). */
+  locked?: boolean
+  /** Timestamp the doc was locked. Cleared on unlock. */
+  lockedAt?: number | null
+  /** Username that locked the doc. Surfaced in the UI banner so
+   *  share-recipients know who to ask for an unlock. */
+  lockedBy?: string | null
   /** Provenance for docs created from a template. Captures the
    *  source template path and the vars the user (or agent) passed
    *  in. Powers the "Refresh from template" affordance — we re-run

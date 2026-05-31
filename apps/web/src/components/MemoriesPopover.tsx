@@ -127,7 +127,6 @@ export function MemoriesPopover({ docId, open, onClose, anchorRef }: Props) {
       style={{
         background: 'var(--panel)',
         border: '1px solid var(--border)',
-        boxShadow: '0 8px 24px rgba(15, 23, 42, 0.12)',
         maxHeight: 'calc(100vh - 120px)',
       }}
     >
@@ -239,8 +238,8 @@ function Section({
         <input
           className="flex-1 text-[12px] px-2 h-7 rounded"
           style={{
-            background: 'var(--bg)',
-            border: '1px solid var(--border)',
+            background: 'var(--input-bg)',
+            border: '1px solid var(--input-border)',
             color: 'var(--fg)',
             outline: 'none',
           }}

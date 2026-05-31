@@ -10,9 +10,11 @@ import {
   Folder,
   ArrowUp,
   Loader2,
+  X,
 } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
 import { useVault } from '../lib/vault-context'
+import { SelectIndicator, selectionTileStyle } from './SelectIndicator'
 
 type Folder = Awaited<ReturnType<typeof api.accountArchive>>['folders'][number]
 type FileItem = Awaited<ReturnType<typeof api.accountArchive>>['files'][number]
@@ -90,6 +92,46 @@ export function ArchivePage() {
     }
   }
 
+  const [selection, setSelection] = useState<Set<string>>(new Set())
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const toggleSelected = (p: string) => {
+    setSelection((prev) => {
+      const next = new Set(prev)
+      if (next.has(p)) next.delete(p)
+      else next.add(p)
+      return next
+    })
+  }
+  const clearSelection = () => setSelection(new Set())
+  const bulkUnarchive = async () => {
+    if (selection.size === 0) return
+    setBulkBusy(true)
+    setError(null)
+    const paths = Array.from(selection)
+    try {
+      // Per-item rather than a batch endpoint — keeps the server
+      // surface simple, and N is small for typical archive sizes.
+      // Run in parallel so dozens of items don't block on a slow
+      // first response.
+      const results = await Promise.allSettled(
+        paths.map((p) => api.fileArchive(p, false)),
+      )
+      const ok = results.filter((r) => r.status === 'fulfilled').length
+      if (ok > 0) {
+        setFolders((prev) => prev.filter((f) => !selection.has(f.path)))
+        setFiles((prev) => prev.filter((f) => !selection.has(f.path)))
+        refresh()
+      }
+      const failed = results.length - ok
+      if (failed > 0) setError(`${failed} item(s) failed to unarchive`)
+      clearSelection()
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err))
+    } finally {
+      setBulkBusy(false)
+    }
+  }
+
   const totalItems = folders.length + files.length
 
   return (
@@ -118,6 +160,38 @@ export function ArchivePage() {
         )}
       </header>
 
+      {selection.size > 0 && (
+        <div
+          className="h-10 px-3 flex items-center gap-2 border-b shrink-0"
+          style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}
+        >
+          <div className="text-[12.5px] font-medium text-fg">
+            {selection.size} selected
+          </div>
+          <button
+            className="btn-ghost h-7"
+            onClick={bulkUnarchive}
+            disabled={bulkBusy}
+          >
+            {bulkBusy ? (
+              <Loader2 size={12} className="animate-spin" />
+            ) : (
+              <ArchiveRestore size={12} />
+            )}
+            Unarchive
+          </button>
+          <button
+            className="btn-ghost h-7 ml-auto"
+            onClick={clearSelection}
+            title="Clear selection"
+            aria-label="Clear selection"
+          >
+            <X size={12} />
+            Clear
+          </button>
+        </div>
+      )}
+
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6">
         {error && (
           <div
@@ -136,7 +210,7 @@ export function ArchivePage() {
           <div className="h-full flex items-center justify-center">
             <div
               className="rounded-xl p-8 text-center max-w-md"
-              style={{ background: 'var(--viewer)', border: '1px dashed var(--border)' }}
+              style={{ background: 'var(--surface-2)', border: '1px dashed var(--border)' }}
             >
               <Archive size={22} className="text-subtle mx-auto mb-2" />
               <div className="text-[14px] text-fg font-medium">Nothing archived</div>
@@ -159,9 +233,15 @@ export function ArchivePage() {
                 key={`folder:${f.path}`}
                 label={f.name}
                 kind="folder"
-                onOpen={() => openItem(f.path)}
+                onOpen={() => {
+                  if (selection.size > 0) toggleSelected(f.path)
+                  else openItem(f.path)
+                }}
                 onUnarchive={(e) => unarchive(e, f.path)}
                 busy={busyPath === f.path}
+                selected={selection.has(f.path)}
+                onToggleSelect={() => toggleSelected(f.path)}
+                hasSelection={selection.size > 0}
               />
             ))}
             {files.map((it) => (
@@ -174,9 +254,15 @@ export function ArchivePage() {
                     ? api.thumbnailUrl(it.path)
                     : undefined
                 }
-                onOpen={() => openItem(it.path)}
+                onOpen={() => {
+                  if (selection.size > 0) toggleSelected(it.path)
+                  else openItem(it.path)
+                }}
                 onUnarchive={(e) => unarchive(e, it.path)}
                 busy={busyPath === it.path}
+                selected={selection.has(it.path)}
+                onToggleSelect={() => toggleSelected(it.path)}
+                hasSelection={selection.size > 0}
               />
             ))}
           </div>
@@ -210,6 +296,9 @@ function ArchiveTile({
   busy,
   onOpen,
   onUnarchive,
+  selected = false,
+  onToggleSelect,
+  hasSelection = false,
 }: {
   label: string
   kind: 'folder' | 'image' | 'video' | 'file'
@@ -217,18 +306,38 @@ function ArchiveTile({
   busy?: boolean
   onOpen: () => void
   onUnarchive: (e: React.MouseEvent) => void
+  selected?: boolean
+  onToggleSelect?: () => void
+  hasSelection?: boolean
 }) {
   return (
     <div
-      onClick={onOpen}
+      onClick={(e) => {
+        if ((e.metaKey || e.ctrlKey) && onToggleSelect) {
+          e.preventDefault()
+          onToggleSelect()
+          return
+        }
+        onOpen()
+      }}
       className="group relative overflow-hidden rounded-md cursor-pointer"
       style={{
         aspectRatio: '1 / 1',
-        background: 'var(--bg)',
-        border: '1px solid var(--border)',
+        ...selectionTileStyle(selected),
+        background: selected ? 'var(--selected)' : 'var(--bg)',
+        border: selected ? '1px solid var(--accent)' : '1px solid var(--border)',
       }}
       title={label}
     >
+      <SelectIndicator
+        checked={selected}
+        visible={selected || hasSelection}
+        variant={kind === 'image' || kind === 'video' ? 'over-image' : 'light'}
+        onClick={(e) => {
+          e.stopPropagation()
+          onToggleSelect?.()
+        }}
+      />
       {kind === 'folder' ? (
         <div
           className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-2"
@@ -291,7 +400,6 @@ function ArchiveTile({
         style={{
           background: 'var(--accent)',
           color: 'white',
-          boxShadow: '0 2px 6px -2px rgba(0, 0, 0, 0.35)',
         }}
         title="Restore to default vault listings"
       >

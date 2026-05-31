@@ -152,7 +152,6 @@ export function MentionMenu({ query, attachedIds, excludeDocId, onPick, onClose 
       style={{
         background: 'var(--panel)',
         border: '1px solid var(--border)',
-        boxShadow: '0 6px 18px rgba(15, 23, 42, 0.18)',
       }}
     >
       <div className="px-2.5 py-1.5 text-[10.5px] uppercase tracking-wider font-semibold text-subtle"

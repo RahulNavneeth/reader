@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Upload, Folder, FileText, Loader2, CornerDownLeft, X } from 'lucide-react'
+import { Upload, FolderUp, Folder, FileText, Loader2, CornerDownLeft, X } from 'lucide-react'
 import { api } from '../lib/api'
 
 /**
@@ -33,6 +33,19 @@ export function UploadButton({
   onConfirm: (files: File[], dir: string) => Promise<void>
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  // React strips non-standard attrs like `webkitdirectory` when set
+  // via JSX, so attach them imperatively on mount. Without this,
+  // the input behaves as a regular file picker instead of a folder
+  // picker (was: dialog showed mixed files + folders, "Open" went
+  // into the folder instead of selecting it).
+  useEffect(() => {
+    const el = folderInputRef.current
+    if (!el) return
+    el.setAttribute('webkitdirectory', '')
+    el.setAttribute('directory', '')
+    el.setAttribute('mozdirectory', '')
+  }, [])
   const inputRef = useRef<HTMLInputElement>(null)
   const [dir, setDir] = useState('')
   const [folderList, setFolderList] = useState<string[]>([])
@@ -147,6 +160,17 @@ export function UploadButton({
           e.target.value = ''
         }}
       />
+      <input
+        ref={folderInputRef}
+        type="file"
+        className="hidden"
+        onChange={(e) => {
+          const files = e.target.files
+          if (!files || files.length === 0) return
+          setPendingFiles(Array.from(files))
+          e.target.value = ''
+        }}
+      />
       <button
         type="button"
         onMouseDown={(e) => e.preventDefault()}
@@ -158,6 +182,16 @@ export function UploadButton({
         style={open ? { background: 'var(--selected)', color: 'var(--accent)' } : undefined}
       >
         <Upload size={13} />
+      </button>
+      <button
+        type="button"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => folderInputRef.current?.click()}
+        className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-hover text-subtle hover:text-fg transition-colors"
+        title="Upload folder"
+        aria-label="Upload folder"
+      >
+        <FolderUp size={13} />
       </button>
       {open && pendingFiles && createPortal(
         // Backdrop: dim everything + click-out cancels. Pinned at

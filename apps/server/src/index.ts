@@ -1,3 +1,7 @@
+// MUST be first import — populates process.env from repo-root .env
+// before any other module evaluates (including `config.ts`).
+import './loadEnv.js'
+
 import Fastify from 'fastify'
 import cookie from '@fastify/cookie'
 import cors from '@fastify/cors'
@@ -29,6 +33,7 @@ import { userSharesRoutes } from './routes/userShares.js'
 import { pinsRoutes } from './routes/pins.js'
 import { exportRoutes } from './routes/export.js'
 import { memoriesRoutes } from './routes/memories.js'
+import { commentsRoutes } from './routes/comments.js'
 import { accountRoutes } from './routes/account.js'
 import { feedRoutes } from './routes/feed.js'
 import { timelineRoutes } from './routes/timeline.js'
@@ -122,11 +127,20 @@ async function tryServeBarePath(
   const q = (req.query as Record<string, string | undefined>) ?? {}
   const publicPassword = typeof q.p === 'string' ? q.p : undefined
   const ownerHint = typeof q.owner === 'string' ? q.owner : undefined
+  // Transitive embed-grant params — when a markdown viewer renders
+  // an inline asset, it appends `?via=<parent>&viaOwner=<owner>` so
+  // the server grants this read because the user can read the
+  // parent doc embedding it. Standalone URLs (no `via`) keep the
+  // asset's normal ACL behaviour.
+  const viaRel = typeof q.via === 'string' ? q.via : undefined
+  const viaOwner = typeof q.viaOwner === 'string' ? q.viaOwner : undefined
   try {
     await serveVaultFileBytes(req.server, req, reply, {
       rel,
       publicPassword,
       ownerHint,
+      viaRel,
+      viaOwner,
     })
   } catch {
     // The helper may have started setting headers before throwing.
@@ -240,21 +254,48 @@ export async function buildApp(opts: BuildAppOptions = {}) {
     "base-uri 'self'",
     "form-action 'self'",
   ].join('; ')
+  // Looser variant for file-byte responses — PDFs in particular need
+  // to be embeddable in Reader's own document viewer. Keep everything
+  // else locked down; only `frame-ancestors` is broadened.
+  const CSP_FILE = CSP.replace(
+    "frame-ancestors 'none'",
+    "frame-ancestors 'self'",
+  )
 
   app.addHook('onSend', async (req, reply, payload) => {
     reply.header('X-Content-Type-Options', 'nosniff')
-    reply.header('X-Frame-Options', 'DENY')
     reply.header('Referrer-Policy', 'strict-origin-when-cross-origin')
     reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+    // Frame policy. The SPA shell stays DENY (so external sites can't
+    // iframe Reader). File-byte responses — PDFs especially — need to
+    // be framable by Reader's own document viewer, so they get
+    // SAMEORIGIN. Without this, the production iframe just shows
+    // "refused to connect" the moment the PDF viewer tries to mount.
+    const contentType = (reply.getHeader('content-type') as string | undefined) ?? ''
+    const isHtml = contentType.startsWith('text/html')
+    // File-byte routes: both the bare vault path (`/foo.pdf`) AND
+    // the explicit `/api/file/raw` endpoint, plus the thumbnail /
+    // preview helpers. All of these stream bytes that the SPA's
+    // iframe / <img> / <video> tags need to mount.
+    const isFileByteRoute =
+      req.method === 'GET' &&
+      (req.url.startsWith('/api/file/raw') ||
+        req.url.startsWith('/api/file/thumbnail') ||
+        req.url.startsWith('/api/file/preview') ||
+        (!req.url.startsWith('/api') && !req.url.startsWith('/mcp')))
+    if (isFileByteRoute && !isHtml) {
+      reply.header('X-Frame-Options', 'SAMEORIGIN')
+    } else {
+      reply.header('X-Frame-Options', 'DENY')
+    }
     // CSP only on HTML responses — JSON/file/SSE responses don't get
     // executed in a document context, so the policy is irrelevant
-    // there and the header just wastes bytes.
-    const contentType = (reply.getHeader('content-type') as string | undefined) ?? ''
-    if (
-      contentType.startsWith('text/html') ||
-      (req.method === 'GET' && !req.url.startsWith('/api') && !req.url.startsWith('/mcp'))
-    ) {
+    // there and the header just wastes bytes. File-byte responses
+    // get the looser variant so the SPA's iframe can mount them.
+    if (isHtml) {
       reply.header('Content-Security-Policy', CSP)
+    } else if (isFileByteRoute) {
+      reply.header('Content-Security-Policy', CSP_FILE)
     }
     if (isProdEnv) {
       // 1 year HSTS — only emitted in prod, since dev runs over plain
@@ -354,6 +395,7 @@ export async function buildApp(opts: BuildAppOptions = {}) {
   await app.register(pinsRoutes)
   await app.register(exportRoutes)
   await app.register(memoriesRoutes)
+  await app.register(commentsRoutes)
   await app.register(externalMountsRoutes)
   await app.register(accountRoutes)
   await app.register(feedRoutes)

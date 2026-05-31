@@ -8,6 +8,7 @@ import {
   Users as UsersIcon,
   Settings,
   ChevronLeft,
+  ChevronDown,
   Database,
   Sparkles,
   UserPlus,
@@ -24,6 +25,8 @@ import {
   Plug,
   Archive,
   Play,
+  User as UserIcon,
+  FileText,
 } from 'lucide-react'
 import clsx from 'clsx'
 import { useNavigate } from 'react-router-dom'
@@ -39,6 +42,7 @@ import { useConfirm } from '../lib/confirm'
 import { useVault } from '../lib/vault-context'
 import { AdminWebhooksPanel } from './AdminWebhooksPanel'
 import { AdminOauthClientsPanel } from './AdminOauthClientsPanel'
+import { SettingsListEmpty } from './SettingsList'
 
 type Section = 'general' | 'users' | 'duplicates' | 'embeddings' | 'storage' | 'mounts' | 'mail' | 'webhooks' | 'oauth-clients' | 'advanced' | 'backup'
 
@@ -96,7 +100,7 @@ export function AdminPanel() {
     <div className="flex-1 flex overflow-hidden">
       <aside
         className="border-r border-app shrink-0 w-[240px] flex flex-col"
-        style={{ background: 'var(--surface-3)' }}
+        style={{ background: 'var(--surface-2)' }}
       >
         <div
           className="h-11 px-2 flex items-center gap-1.5 border-b shrink-0"
@@ -1574,106 +1578,112 @@ function UsersPanel() {
           </button>
         }
       >
-        <div className="rounded border border-app overflow-hidden">
-          <table className="w-full text-[13px]">
-            <thead style={{ background: 'var(--table-header-bg)' }}>
-              <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
-                <th className="px-3 py-2 font-semibold">Username</th>
-                <th className="px-3 py-2 font-semibold">Role</th>
-                <th className="px-3 py-2 font-semibold">Created</th>
-                <th className="px-3 py-2 font-semibold">Status</th>
-                <th className="px-3 py-2"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {users?.map((u) => (
-                <Fragment key={u.username}>
-                  <tr className="border-t border-soft" style={{ borderColor: 'var(--border)' }}>
-                    <td className="px-3 py-2 font-medium text-fg">{u.username}</td>
-                    <td className="px-3 py-2">
-                      <select
+        {users && users.length === 0 ? (
+          <div className="text-[12.5px] text-subtle">No users yet.</div>
+        ) : (
+          <div className="space-y-1.5">
+            {users?.map((u) => (
+              <Fragment key={u.username}>
+                <div
+                  className="flex items-center gap-3 px-3 py-2 rounded"
+                  style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                >
+                  <UserIcon size={14} className="text-muted shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] font-medium text-fg truncate">
+                      {u.username}
+                    </div>
+                    <div className="text-[11px] text-subtle truncate">
+                      created {new Date(u.createdAt).toLocaleDateString()}
+                    </div>
+                  </div>
+                  <div className="relative shrink-0">
+                    <select
+                      className="appearance-none h-7 pl-2.5 pr-7 rounded text-[12px] cursor-pointer outline-none transition-colors hover:bg-[var(--hover)] focus:border-[color:var(--accent)]"
+                      style={{
+                        width: 90,
+                        background: 'transparent',
+                        border: '1px solid var(--border)',
+                        color: 'var(--fg)',
+                      }}
+                      value={u.role}
+                      onChange={(e) => updateRole(u, e.target.value as Role)}
+                    >
+                      <option value="viewer">viewer</option>
+                      <option value="editor">editor</option>
+                      <option value="admin">admin</option>
+                    </select>
+                    <ChevronDown
+                      size={11}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-subtle"
+                    />
+                  </div>
+                  <button
+                    className="inline-flex items-center px-1.5 h-5 rounded text-[10px] font-semibold uppercase tracking-wider transition-opacity hover:opacity-80 shrink-0"
+                    title={u.disabled ? 'Click to enable' : 'Click to disable'}
+                    style={
+                      u.disabled
+                        ? {
+                            background: 'color-mix(in srgb, #BF2600 12%, transparent)',
+                            color: '#BF2600',
+                          }
+                        : {
+                            background: 'color-mix(in srgb, #00875A 12%, transparent)',
+                            color: '#00875A',
+                          }
+                    }
+                    onClick={() => toggleDisabled(u)}
+                  >
+                    {u.disabled ? 'Disabled' : 'Active'}
+                  </button>
+                  <button
+                    className="btn-ghost shrink-0"
+                    onClick={() => (editing === u.username ? setEditing(null) : startEdit(u))}
+                    title="Edit access"
+                  >
+                    Access
+                  </button>
+                  <button
+                    className="btn-ghost shrink-0"
+                    onClick={() => remove(u)}
+                    title="Delete user"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+                {editing === u.username && (
+                  <div
+                    className="rounded px-3 py-2"
+                    style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                  >
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
+                        Quota
+                      </span>
+                      <input
+                        type="number"
+                        min={0}
                         className="input h-7 text-[12px]"
-                        style={{ width: 110 }}
-                        value={u.role}
-                        onChange={(e) => updateRole(u, e.target.value as Role)}
-                      >
-                        <option value="viewer">viewer</option>
-                        <option value="editor">editor</option>
-                        <option value="admin">admin</option>
-                      </select>
-                    </td>
-                    <td className="px-3 py-2 text-muted">
-                      {new Date(u.createdAt).toLocaleDateString()}
-                    </td>
-                    <td className="px-3 py-2">
-                      <button
-                        className="inline-flex items-center px-1.5 h-5 rounded text-[10px] font-semibold uppercase tracking-wider transition-opacity hover:opacity-80"
-                        title={u.disabled ? 'Click to enable' : 'Click to disable'}
-                        style={
-                          u.disabled
-                            ? {
-                                background: 'color-mix(in srgb, #BF2600 12%, transparent)',
-                                color: '#BF2600',
-                              }
-                            : {
-                                background: 'color-mix(in srgb, #00875A 12%, transparent)',
-                                color: '#00875A',
-                              }
-                        }
-                        onClick={() => toggleDisabled(u)}
-                      >
-                        {u.disabled ? 'Disabled' : 'Active'}
+                        style={{ width: 120 }}
+                        placeholder="Unlimited"
+                        value={editQuotaMB}
+                        onChange={(e) => setEditQuotaMB(e.target.value)}
+                      />
+                      <span className="text-[11px] text-subtle">MB</span>
+                      <div className="flex-1" />
+                      <button className="btn-ghost h-7" onClick={() => setEditing(null)}>
+                        Cancel
                       </button>
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      <button
-                        className="btn-ghost"
-                        onClick={() => (editing === u.username ? setEditing(null) : startEdit(u))}
-                        title="Edit access"
-                      >
-                        Access
+                      <button className="btn-primary h-7" onClick={saveEdit}>
+                        Save
                       </button>
-                      <button className="btn-ghost ml-1" onClick={() => remove(u)} title="Delete user">
-                        <Trash2 size={12} />
-                      </button>
-                    </td>
-                  </tr>
-                  {editing === u.username && (
-                    <tr style={{ borderTop: '1px solid var(--border)' }}>
-                      <td colSpan={5} className="px-3 py-2" style={{ background: 'var(--table-stripe-bg)' }}>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-[10.5px] uppercase tracking-wider font-semibold text-subtle">
-                            Quota
-                          </span>
-                          <input
-                            type="number"
-                            min={0}
-                            className="input h-7 text-[12px]"
-                            style={{ width: 120 }}
-                            placeholder="Unlimited"
-                            value={editQuotaMB}
-                            onChange={(e) => setEditQuotaMB(e.target.value)}
-                          />
-                          <span className="text-[11px] text-subtle">MB</span>
-                          <div className="flex-1" />
-                          <button className="btn-ghost h-7" onClick={() => setEditing(null)}>
-                            Cancel
-                          </button>
-                          <button className="btn-primary h-7" onClick={saveEdit}>
-                            Save
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
-              ))}
-              {users && users.length === 0 && (
-                <tr><td colSpan={5} className="px-3 py-4 text-center text-muted">No users yet.</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+                    </div>
+                  </div>
+                )}
+              </Fragment>
+            ))}
+          </div>
+        )}
       </Card>
 
       {settings && (
@@ -1742,7 +1752,13 @@ function DuplicatesPanel() {
 
   if (error) return <ErrText text={error} />
   if (!groups) return <Muted text="Loading…" />
-  if (groups.length === 0) return <Muted text="No duplicates — every file's sha256 + perceptual hash is unique." />
+  if (groups.length === 0)
+    return (
+      <SettingsListEmpty
+        title="No duplicates"
+        hint="Every file's sha256 + perceptual hash is unique."
+      />
+    )
 
   return (
     <div className="space-y-5">
@@ -1764,46 +1780,41 @@ function DuplicatesPanel() {
           <code className="text-[11px] text-muted break-all block mb-2">
             {g.kind === 'exact' ? g.sha256 : g.pHash}
           </code>
-          <div className="rounded border border-app overflow-hidden">
-            <table className="w-full text-[12.5px]">
-              <thead style={{ background: 'var(--table-header-bg)' }}>
-                <tr className="text-left text-[11px] uppercase tracking-wider text-subtle">
-                  <th className="px-3 py-1.5 font-semibold">Path</th>
-                  <th className="px-3 py-1.5 font-semibold">Owner</th>
-                  <th className="px-3 py-1.5 font-semibold">Uploaded</th>
-                  <th className="px-3 py-1.5"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {g.docs.map((d, i) => (
-                  <tr key={d.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
-                    <td className="px-3 py-1.5 text-fg break-all">
-                      {d.storageKey}
-                      {i === 0 && (
-                        <span className="ml-1 text-[10.5px] text-subtle">(oldest)</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-1.5 text-muted">{d.owner}</td>
-                    <td className="px-3 py-1.5 text-muted">{new Date(d.createdAt).toLocaleString()}</td>
-                    <td className="px-3 py-1.5 text-right">
-                      <button
-                        className="btn-ghost"
-                        disabled={busy === d.storageKey}
-                        onClick={() => trash(d.storageKey)}
-                        style={{ color: '#BF2600' }}
-                      >
-                        {busy === d.storageKey ? (
-                          <Loader2 size={12} className="animate-spin" />
-                        ) : (
-                          <Trash2 size={12} />
-                        )}
-                        Trash
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="space-y-1.5">
+            {g.docs.map((d, i) => (
+              <div
+                key={d.id}
+                className="flex items-center gap-3 px-3 py-2 rounded"
+                style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+              >
+                <FileText size={14} className="text-muted shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] font-medium text-fg truncate">
+                    {d.storageKey}
+                    {i === 0 && (
+                      <span className="ml-1 text-[10.5px] text-subtle">(oldest)</span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-subtle truncate">
+                    {d.owner}
+                    <span className="mx-1.5 opacity-60">·</span>
+                    uploaded {new Date(d.createdAt).toLocaleString()}
+                  </div>
+                </div>
+                <button
+                  className="btn-ghost-danger shrink-0"
+                  disabled={busy === d.storageKey}
+                  onClick={() => trash(d.storageKey)}
+                >
+                  {busy === d.storageKey ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : (
+                    <Trash2 size={12} />
+                  )}
+                  Trash
+                </button>
+              </div>
+            ))}
           </div>
         </Card>
       ))}
@@ -2079,8 +2090,8 @@ function ExternalMountsPanel() {
             onChange={(e) => setAbsPath(e.target.value)}
             disabled={busy}
           />
-          <button className="btn-ghost" onClick={add} disabled={busy || !name || !absPath}>
-            {busy ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
+          <button className="btn-primary h-8" onClick={add} disabled={busy || !name || !absPath}>
+            {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
             Add
           </button>
         </div>

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Lock, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle, ArrowUp, Pencil, Braces } from 'lucide-react'
+import { Download, X, AlertCircle, ExternalLink, Sparkles, RefreshCw, Shield, Info, Copy as CopyIcon, Trash2, Loader2, Check, MessageCircle, ArrowUp, Pencil, Braces } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeSlug from 'rehype-slug'
 import rehypeAutolinkHeadings from 'rehype-autolink-headings'
@@ -33,14 +34,18 @@ import { MetadataPanel } from './MetadataPanel'
 import { ChatDock } from './ChatDock'
 import { SelectionPopover } from './SelectionPopover'
 import { PinButton } from './PinButton'
+import { LockButton } from './LockButton'
 import { ArchiveButton } from './ArchiveButton'
+import { DuplicateButton } from './DuplicateButton'
 import { SaveAsTemplateButton } from './SaveAsTemplateButton'
 import { RefreshTemplateButton } from './RefreshTemplateButton'
 import { MediaPlayer } from './MediaPlayer'
 import { useReaderEvents } from '../lib/events'
 import { useCrdtBody } from '../lib/crdt/useCrdtBody'
 import { CrdtEditor } from './CrdtEditor'
-import { AwarenessPill } from './AwarenessPill'
+import { PasteMediaDialog } from './PasteMediaDialog'
+import { CommentHighlights } from './CommentHighlights'
+import type { EditorView } from '@codemirror/view'
 
 type Props = {
   path: string
@@ -99,6 +104,225 @@ function summariseFrontmatter(yaml: string): string {
   return bits.length > 0 ? bits.join(' · ') : 'Frontmatter'
 }
 
+/** Per-document caret position keyed by vault path. Survives
+ *  navigation within a session: open `a.md`, scroll/edit, open
+ *  `b.md`, come back to `a.md` — caret lands where it was. */
+const docCursorMap = new Map<string, { anchor: number; head: number }>()
+
+/**
+ * Rehype plugin: walks text nodes in the HAST tree and wraps
+ * `{{…}}` tokens in styled `<span>`s so the rendered preview
+ * highlights template-engine syntax the same way the editor
+ * used to. Two categories:
+ *
+ *   - `{{#if …}}` / `{{else}}` / `{{/if}}` etc. — `md-tmpl-control`
+ *   - `{{varname}}` (anything else) — `md-tmpl-var`
+ *
+ * Skips text inside `<code>` / `<pre>` so a literal `{{x}}` in
+ * a code sample reads as code, not as a template token.
+ */
+function rehypeTemplateSyntax() {
+  const re = /\{\{\s*([^{}]+?)\s*\}\}/g
+  type Node = {
+    type: string
+    tagName?: string
+    value?: string
+    properties?: Record<string, unknown>
+    children?: Node[]
+  }
+  const inCode = (parents: Node[]) =>
+    parents.some(
+      (p) => p.tagName === 'code' || p.tagName === 'pre',
+    )
+  const walk = (node: Node, parents: Node[]) => {
+    if (!node.children) return
+    for (let i = 0; i < node.children.length; i++) {
+      const child = node.children[i]
+      if (child.type === 'text' && !inCode(parents.concat(node))) {
+        const text = child.value ?? ''
+        re.lastIndex = 0
+        if (!re.test(text)) continue
+        re.lastIndex = 0
+        const out: Node[] = []
+        let lastIdx = 0
+        let m: RegExpExecArray | null
+        while ((m = re.exec(text)) !== null) {
+          if (m.index > lastIdx) {
+            out.push({ type: 'text', value: text.slice(lastIdx, m.index) })
+          }
+          const inner = m[1].trim()
+          const isControl =
+            inner.startsWith('#') ||
+            inner.startsWith('/') ||
+            inner === 'else'
+          // Three-part chip: opening braces, inner expression,
+          // closing braces. CSS dims the braces so the body
+          // reads as the meaningful part of the token.
+          const inner_text = m[0].slice(2, -2)
+          out.push({
+            type: 'element',
+            tagName: 'span',
+            properties: {
+              className: [
+                'md-tmpl-token',
+                isControl ? 'md-tmpl-control' : 'md-tmpl-var',
+              ],
+            },
+            children: [
+              {
+                type: 'element',
+                tagName: 'span',
+                properties: { className: ['md-tmpl-brace'] },
+                children: [{ type: 'text', value: '{{' }],
+              },
+              {
+                type: 'element',
+                tagName: 'span',
+                properties: { className: ['md-tmpl-body'] },
+                children: [{ type: 'text', value: inner_text }],
+              },
+              {
+                type: 'element',
+                tagName: 'span',
+                properties: { className: ['md-tmpl-brace'] },
+                children: [{ type: 'text', value: '}}' }],
+              },
+            ],
+          })
+          lastIdx = m.index + m[0].length
+        }
+        if (lastIdx < text.length) {
+          out.push({ type: 'text', value: text.slice(lastIdx) })
+        }
+        node.children.splice(i, 1, ...out)
+        i += out.length - 1
+      } else if (child.type === 'element') {
+        walk(child, parents.concat(node))
+      }
+    }
+  }
+  return (tree: Node) => walk(tree, [])
+}
+
+/**
+ * Stamps every block-level element produced by remark with a
+ * `data-source-line` attribute carrying its 1-based start line
+ * in the markdown source. Reader's edit ↔ preview scroll sync
+ * uses this to land the editor on the exact line the user was
+ * reading in the preview, not just the nearest heading. The
+ * position data comes from remark-parse and survives the
+ * remark-rehype hop via `node.position`.
+ */
+function rehypeSourceLine() {
+  type Node = {
+    type: string
+    tagName?: string
+    properties?: Record<string, unknown>
+    children?: Node[]
+    position?: { start?: { line?: number } }
+  }
+  const walk = (node: Node) => {
+    if (node.type === 'element' && node.tagName && node.position?.start?.line) {
+      const props = (node.properties ??= {}) as Record<string, unknown>
+      if (props['data-source-line'] == null) {
+        props['data-source-line'] = String(node.position.start.line)
+      }
+    }
+    for (const child of node.children ?? []) {
+      if (child.type === 'element' || child.type === 'root') walk(child)
+    }
+  }
+  return (tree: Node) => walk(tree)
+}
+
+/**
+ * After `rehypeTemplateSyntax` has wrapped `{{…}}` tokens, this
+ * second pass pairs balanced `{{#if}}` / `{{/if}}` (and similar
+ * `#each` / `#unless`) paragraphs at the document root and
+ * wraps everything between an opener and its matching closer in
+ * a `<div class="md-tmpl-block">`. CSS adds the indent + a
+ * subtle left rule so the block structure of a template doc
+ * reads at a glance.
+ *
+ * Properly handles nested blocks via a stack — outer `#if`
+ * doesn't get its content double-indented just because an inner
+ * `#if` happens before its closer.
+ */
+function rehypeTemplateIndent() {
+  type Node = {
+    type: string
+    tagName?: string
+    properties?: Record<string, unknown>
+    children?: Node[]
+  }
+  /** Returns 'open' / 'close' if this root child is a paragraph
+   *  whose only meaningful content is a single template control
+   *  token (`{{#…}}` or `{{/…}}`). */
+  const classify = (n: Node): 'open' | 'close' | null => {
+    if (n.type !== 'element' || n.tagName !== 'p') return null
+    const meaningful = (n.children || []).filter(
+      (c) =>
+        !(c.type === 'text' && /^\s*$/.test(((c as { value?: string }).value) || '')),
+    )
+    if (meaningful.length !== 1) return null
+    const sole = meaningful[0]
+    if (sole.type !== 'element' || sole.tagName !== 'span') return null
+    const cls = (sole.properties?.className as string[] | undefined) ?? []
+    if (!cls.includes('md-tmpl-control')) return null
+    const body = (sole.children || []).find(
+      (c) =>
+        c.type === 'element' &&
+        c.tagName === 'span' &&
+        (
+          ((c.properties?.className as string[] | undefined) ?? []) as string[]
+        ).includes('md-tmpl-body'),
+    )
+    const txt =
+      (body?.children?.[0] as { value?: string } | undefined)?.value ?? ''
+    const trimmed = txt.trim()
+    if (trimmed.startsWith('/')) return 'close'
+    if (trimmed.startsWith('#')) return 'open'
+    return null
+  }
+
+  return (tree: Node) => {
+    if (!tree.children) return
+    const children = tree.children
+    // Stack of opener indices at the root level. Each entry is
+    // the index of an `{{#…}}` paragraph waiting for its match.
+    const stack: number[] = []
+    // Pairs of [openerIdx, closerIdx] — collected first, then
+    // applied in reverse so wrapping doesn't perturb earlier
+    // indices.
+    const pairs: Array<[number, number]> = []
+    for (let i = 0; i < children.length; i++) {
+      const kind = classify(children[i])
+      if (kind === 'open') {
+        stack.push(i)
+      } else if (kind === 'close') {
+        const opener = stack.pop()
+        if (opener != null) pairs.push([opener, i])
+      }
+    }
+    // Apply outer-most first when working bottom-up (innermost
+    // pairs come first in `pairs` since they're pushed earlier).
+    // Sort by opener index descending so each wrap operation
+    // works on still-valid indices.
+    pairs.sort((a, b) => b[0] - a[0])
+    for (const [opener, closer] of pairs) {
+      if (closer - opener <= 1) continue // empty block, nothing to wrap
+      const inside = children.splice(opener + 1, closer - opener - 1)
+      const wrapper: Node = {
+        type: 'element',
+        tagName: 'div',
+        properties: { className: ['md-tmpl-block'] },
+        children: inside,
+      }
+      children.splice(opener + 1, 0, wrapper)
+    }
+  }
+}
+
 export function PathViewer({ path, canEdit = true }: Props) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
@@ -107,7 +331,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
   // resolve under the right namespace instead of the requester's.
   const ownerOpt = searchParams.get('owner') || undefined
   const callerOpts = ownerOpt ? { owner: ownerOpt } : undefined
-  const { setCurrentFolder, refresh, chatEnabled } = useVault()
+  const { setCurrentFolder, refresh, chatEnabled, currentUsername } = useVault()
   const confirm = useConfirm()
   const [copyBusy, setCopyBusy] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -117,6 +341,50 @@ export function PathViewer({ path, canEdit = true }: Props) {
   // Y.Text via useCrdtBody.replace, which broadcasts to every
   // other connected viewer of this docId.
   const [editing, setEditing] = useState(false)
+  // Latest editor caret/selection — backed by the module-level
+  // map so it persists across file switches in the session.
+  const editorSelectionRef = useRef<{ anchor: number; head: number } | null>(
+    null,
+  )
+  // Scroll-sync target line, captured at toggle time. The next
+  // mounted view (CrdtEditor or the rendered preview) reads it
+  // to align its viewport.
+  const scrollAnchorLineRef = useRef<number | null>(null)
+  // Viewer scrollTop right AFTER the Edit→Preview anchor scroll
+  // lands. Used at the next Preview→Edit toggle to decide whether
+  // the user scrolled inside the viewer:
+  //   - unchanged → snap editor back to the cursor (smooth round-trip)
+  //   - changed   → follow the new scroll position via the topmost
+  //                 heading in view
+  const viewerLandingScrollRef = useRef<number | null>(null)
+  // Top-of-viewport line in the editor at the moment we leave Edit
+  // mode. When the user round-trips back without scrolling the
+  // viewer, we restore THIS line at the viewport top instead of
+  // re-centering on the cursor (which can push the heading off
+  // screen) or using raw scrollTop (which gets clamped by CM's
+  // virtual-viewport measurement on remount).
+  const editorTopLineRef = useRef<number | null>(null)
+  // Imperative handle to the live CodeMirror view, populated
+  // by CrdtEditor on mount. Lets us read the top viewport line
+  // at toggle time without prop-drilling.
+  const crdtViewRef = useRef<EditorView | null>(null)
+  /** When the user pastes a file blob in edit mode, CrdtEditor
+   *  prevents the default text-paste and bubbles the file up
+   *  here. We then render the PasteMediaDialog so the user can
+   *  pick destination + filename before upload. */
+  const [pastedMediaFile, setPastedMediaFile] = useState<File | null>(null)
+  // Save/restore the caret as we navigate between files. Cleanup
+  // runs JUST BEFORE the new path replaces the current one.
+  useEffect(() => {
+    editorSelectionRef.current = docCursorMap.get(path) ?? null
+    scrollAnchorLineRef.current = null
+    editorTopLineRef.current = null
+    viewerLandingScrollRef.current = null
+    return () => {
+      const sel = editorSelectionRef.current
+      if (sel) docCursorMap.set(path, sel)
+    }
+  }, [path])
   const [frontmatterOpen, setFrontmatterOpen] = useState(false)
   const [frontmatterError, setFrontmatterError] = useState<string | null>(null)
   const [text, setText] = useState<string | null>(null)
@@ -141,6 +409,23 @@ export function PathViewer({ path, canEdit = true }: Props) {
   useEffect(() => {
     try { localStorage.setItem('reader:versionsRailOpen', versionsOpen ? '1' : '0') } catch { /* ignore */ }
   }, [versionsOpen])
+  // Peers rail section — sits below Versions in the right rail.
+  // Visible only when peers are present (DocRail hides itself
+  // when none).
+  const [peersOpen, setPeersOpen] = useState<boolean>(false)
+  // Comments rail section — sits below Peers. Available for any
+  // markdown doc the viewer can read. Storage + RBAC happen in
+  // /api/comments; we cache the list here so the floating "+"
+  // button can push new rows without re-fetching.
+  const [commentsOpen, setCommentsOpen] = useState<boolean>(false)
+  const [comments, setComments] = useState<import('../lib/api').CommentDTO[] | null>(null)
+  const viewerBodyRef = useRef<HTMLDivElement | null>(null)
+  // Platform-aware shortcut hint shown on the Edit button + the
+  // aria-keyshortcuts attribute. `⌘E` on macOS, `Ctrl+E` else.
+  const editShortcutHint = useMemo(() => {
+    if (typeof navigator === 'undefined') return 'Ctrl+E'
+    return /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘E' : 'Ctrl+E'
+  }, [])
   /** Active diff state. When non-null, the main content area
    *  swaps from rendered markdown to an inline line-by-line diff
    *  between this version's snapshot and the current text. */
@@ -165,6 +450,302 @@ export function PathViewer({ path, canEdit = true }: Props) {
    *  /api/file/versions so the new pre-restore snapshot row appears
    *  at the top of the list without a page reload. */
   const [versionsReloadKey, setVersionsReloadKey] = useState(0)
+  // Load comments whenever the open doc changes. Re-fires on
+  // ownerOpt too because shared-with-me edits share the same docId
+  // but we want to refetch when the active vault flips. We DON'T
+  // re-fetch on every text change — comments only mutate via the
+  // explicit POST/DELETE/resolve actions, and those update local
+  // state inline.
+  useEffect(() => {
+    if (!meta?.id) {
+      setComments(null)
+      return
+    }
+    const docId = meta.id
+    let cancelled = false
+    api
+      .listComments(docId)
+      .then((r) => {
+        if (!cancelled) setComments(r.comments)
+      })
+      .catch(() => {
+        if (!cancelled) setComments([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [meta?.id, ownerOpt])
+  const handleCommentCreated = useCallback(
+    (c: import('../lib/api').CommentDTO) => {
+      setComments((prev) => (prev ? [...prev, c] : [c]))
+      setCommentsOpen(true)
+    },
+    [],
+  )
+  /** Click on an in-doc highlight → open the rail + flash the
+   *  matching row. The rail already supports scroll-to-anchor for
+   *  the inverse direction. */
+  const [focusedCommentId, setFocusedCommentId] = useState<string | null>(null)
+  const handleHighlightClick = useCallback(
+    (c: import('../lib/api').CommentDTO) => {
+      setCommentsOpen(true)
+      setFocusedCommentId(c.id)
+      // Auto-clear the focus flash so the next interaction starts
+      // clean. 1.5s is enough for the user to spot it.
+      window.setTimeout(() => {
+        setFocusedCommentId((cur) => (cur === c.id ? null : cur))
+      }, 1500)
+    },
+    [],
+  )
+  const handleCommentResolve = useCallback(
+    async (c: import('../lib/api').CommentDTO, resolved: boolean) => {
+      if (!meta?.id) return
+      try {
+        const { comment } = await api.resolveComment(c.id, meta.id, resolved)
+        setComments((prev) =>
+          prev ? prev.map((x) => (x.id === comment.id ? comment : x)) : prev,
+        )
+      } catch {
+        /* swallow — the optimistic state will reconcile on next fetch */
+      }
+    },
+    [meta?.id],
+  )
+  const handleCommentDelete = useCallback(
+    async (c: import('../lib/api').CommentDTO) => {
+      if (!meta?.id) return
+      try {
+        await api.deleteComment(c.id, meta.id)
+        setComments((prev) => (prev ? prev.filter((x) => x.id !== c.id) : prev))
+      } catch {
+        /* swallow */
+      }
+    },
+    [meta?.id],
+  )
+  /** Pending scroll target — populated when the user clicks a
+   *  rail row while the doc is in edit mode. We flip back to
+   *  preview, then an effect re-runs the scroll once viewerBodyRef
+   *  is mounted again. */
+  const pendingScrollCommentRef = useRef<import('../lib/api').CommentDTO | null>(null)
+  const handleScrollToComment = useCallback(
+    (c: import('../lib/api').CommentDTO) => {
+      // Preview-mode only — we walk the rendered body's text
+      // nodes to locate the range, and those nodes only exist
+      // when viewerBodyRef is mounted. If the user is in edit /
+      // diff / chat-preview view, stash the target and trigger
+      // a return to preview; the drain effect below retries.
+      if (!viewerBodyRef.current) {
+        pendingScrollCommentRef.current = c
+        if (editing) setEditing(false)
+        if (diffTs !== null) setDiffTs(null)
+        if (previewMessageId !== null) setPreviewMessageId(null)
+        return
+      }
+      const root = viewerBodyRef.current
+      const scroller = contentRef.current
+      if (!root || !scroller) return
+      // Try the stored offsets first, but verify the resulting
+      // range's text matches the saved quote — old comments may
+      // have been written with the pre-fix offset bug, in which
+      // case the range covers way too much. Fall back to a
+      // textContent substring search.
+      const findHit = (): { node: Text; offset: number } | null => {
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+        let consumed = 0
+        let cur: Node | null = walker.nextNode()
+        while (cur) {
+          const t = cur as Text
+          const len = t.data.length
+          if (consumed + len >= c.rangeStart) {
+            return { node: t, offset: c.rangeStart - consumed }
+          }
+          consumed += len
+          cur = walker.nextNode()
+        }
+        return null
+      }
+      let hit = findHit()
+      const fallbackToQuote = () => {
+        const txt = root.textContent ?? ''
+        const idx = txt.indexOf(c.quote)
+        if (idx < 0) return null
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+        let s = 0
+        let cur: Node | null = walker.nextNode()
+        while (cur) {
+          const t = cur as Text
+          if (s + t.data.length >= idx) {
+            return { node: t, offset: Math.max(0, idx - s) }
+          }
+          s += t.data.length
+          cur = walker.nextNode()
+        }
+        return null
+      }
+      if (!hit) hit = fallbackToQuote()
+      if (!hit) return
+      // Range build can throw if findHit lands the offset at the
+      // exact end of a text node — setEnd at offset+1 then
+      // exceeds data.length and the API throws IndexSizeError.
+      // Cap end to the node's own length so the range is always
+      // valid; on any other error bail silently rather than
+      // killing the rest of the handler.
+      let range: Range
+      try {
+        range = document.createRange()
+        const safeStart = Math.min(hit.offset, hit.node.data.length)
+        range.setStart(hit.node, safeStart)
+        const remaining = hit.node.data.length - safeStart
+        const tailLen = Math.min(
+          Math.max(remaining, 0),
+          Math.max(1, c.quote.length),
+        )
+        range.setEnd(hit.node, safeStart + tailLen)
+      } catch {
+        return
+      }
+
+      // Drive the doc scroller (contentRef) directly. We compute
+      // target scrollTop using the RANGE's bounding rect (precise
+      // text position) rather than hit.node.parentElement — the
+      // latter could be `<article>` (whole body wrapper) when the
+      // text is a direct child, which clamped every scroll to 0
+      // and made every click "scroll up only" feel.
+      const docScroller = contentRef.current
+      if (!docScroller) return
+      let rangeRect: DOMRect
+      try {
+        rangeRect = range.getBoundingClientRect()
+      } catch {
+        return
+      }
+      // If the range yielded a zero rect (collapsed / hidden),
+      // walk up looking for an element with a real layout box.
+      let useRect: DOMRect = rangeRect
+      if (rangeRect.width === 0 && rangeRect.height === 0) {
+        let el: HTMLElement | null = hit.node.parentElement
+        while (el) {
+          const r = el.getBoundingClientRect()
+          if (r.width > 0 || r.height > 0) {
+            useRect = r
+            break
+          }
+          el = el.parentElement
+        }
+      }
+      // Brute-force scroll EVERY overflow-y:auto/scroll ancestor
+      // that has scrollHeight > clientHeight, including contentRef.
+      // We can't rely on one named scroller — if a wrapper between
+      // contentRef and the article ended up being the real scroller
+      // due to some flex/height interaction, this catches it. Each
+      // attempt no-ops harmlessly if the element doesn't need to
+      // move.
+      const candidates: HTMLElement[] = []
+      const knownScroller = contentRef.current
+      if (knownScroller) candidates.push(knownScroller)
+      let walker: HTMLElement | null = hit.node.parentElement
+      while (walker && walker !== document.body) {
+        if (
+          !candidates.includes(walker) &&
+          walker.scrollHeight > walker.clientHeight + 1
+        ) {
+          const cs = getComputedStyle(walker)
+          if (
+            cs.overflowY === 'auto' ||
+            cs.overflowY === 'scroll' ||
+            cs.overflowY === 'overlay'
+          ) {
+            candidates.push(walker)
+          }
+        }
+        walker = walker.parentElement
+      }
+      for (const sc of candidates) {
+        const sr = sc.getBoundingClientRect()
+        const delta = useRect.top - sr.top
+        const maxScroll = sc.scrollHeight - sc.clientHeight
+        const tgt = Math.max(0, Math.min(maxScroll, sc.scrollTop + delta - 120))
+        sc.scrollTo({ top: tgt, behavior: 'smooth' })
+      }
+      // Don't programmatically select the range — that would
+      // re-trigger SelectionPopover's "Explain | Reply | Comment"
+      // chip, popping up unwanted action buttons on every click.
+      // The in-doc comment highlight already provides visible
+      // confirmation of where the scroll landed.
+    },
+    [],
+  )
+  // Drain the pending-scroll queue once we're back in the
+  // preview render path AND the body has mounted. Triggered by
+  // every state change that controls whether viewerBodyRef gets
+  // rendered (editing, diffTs, previewMessageId). Two rAFs to
+  // wait for layout + paint so getBoundingClientRect is accurate.
+  useEffect(() => {
+    if (editing || diffTs !== null || previewMessageId !== null) return
+    const pending = pendingScrollCommentRef.current
+    if (!pending) return
+    // Only drain once the body ref is actually live.
+    if (!viewerBodyRef.current) return
+    pendingScrollCommentRef.current = null
+    const r1 = requestAnimationFrame(() => {
+      requestAnimationFrame(() => handleScrollToComment(pending))
+    })
+    return () => cancelAnimationFrame(r1)
+  }, [editing, diffTs, previewMessageId, handleScrollToComment])
+  // Deep-link: if the URL carries ?comment=<id>, scroll to that
+  // comment as soon as the comments list (and the doc body) are
+  // available. Lets users share a comment by copying the link
+  // and have the recipient land on the same paragraph. Fires
+  // once per (doc, comment-id) so a normal interaction doesn't
+  // re-trigger.
+  const handledDeepLinkRef = useRef<string | null>(null)
+  useEffect(() => {
+    const commentId = searchParams.get('comment')
+    if (!commentId) return
+    if (!comments || comments.length === 0) return
+    const key = `${meta?.id ?? ''}::${commentId}`
+    if (handledDeepLinkRef.current === key) return
+    const target = comments.find((c) => c.id === commentId)
+    if (!target) return
+    handledDeepLinkRef.current = key
+    setCommentsOpen(true)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        handleScrollToComment(target)
+        // Set the focus flash AFTER the doc scroll has started.
+        // Doing it before makes the rail's focusedRow scrollIntoView
+        // race with the doc scroll — and on shorter rails the rail
+        // scroll is the only one the user sees ("the sidebar is
+        // scrolling, not the viewer"). Order: doc first, then rail
+        // flash.
+        setFocusedCommentId(commentId)
+      })
+    })
+    window.setTimeout(() => {
+      setFocusedCommentId((cur) => (cur === commentId ? null : cur))
+    }, 2500)
+  }, [searchParams, comments, meta?.id, handleScrollToComment])
+  const handleCopyCommentLink = useCallback(
+    async (c: import('../lib/api').CommentDTO) => {
+      const url = new URL(window.location.href)
+      url.searchParams.set('comment', c.id)
+      const prevTitle = document.title
+      try {
+        await navigator.clipboard.writeText(url.toString())
+        document.title = '✓ Link copied'
+        window.setTimeout(() => {
+          if (document.title === '✓ Link copied') {
+            document.title = prevTitle
+          }
+        }, 1200)
+      } catch {
+        /* clipboard denied — best-effort */
+      }
+    },
+    [],
+  )
   // Clear diff view whenever the doc changes.
   useEffect(() => {
     setDiffTs(null)
@@ -339,8 +920,33 @@ export function PathViewer({ path, canEdit = true }: Props) {
   // Enable only for markdown docs the viewer owns. Cross-owner
   // / public viewers stay on the existing HTTP fetch path until
   // the server route grows non-owner ACL support.
-  const crdtEnabled = isMarkdown && !ownerOpt && !!meta
+  // CRDT WS now accepts share-grant editors too (server route's
+  // ACL has the collection / share fallback), so allow shared
+  // editors with `canEdit` into the live-collab path. Read-only
+  // shared viewers still fall through to the plain fetch render.
+  const crdtEnabled = isMarkdown && (!ownerOpt || canEdit) && !!meta
   const crdt = useCrdtBody(meta?.id ?? null, crdtEnabled)
+
+  // ⌘E / Ctrl+E — toggle edit ↔ preview. Mounted on window so
+  // the shortcut works whether focus is in the CodeMirror editor
+  // or the preview. Default keymap doesn't bind Cmd-E, so
+  // there's no command we're stealing.
+  useEffect(() => {
+    if (!isMarkdown || !crdt) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.shiftKey || e.altKey) return
+      if (!(e.metaKey || e.ctrlKey)) return
+      if (e.key !== 'e' && e.key !== 'E') return
+      e.preventDefault()
+      toggleEditing()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // toggleEditing intentionally not in deps — it captures the
+    // latest `editing` via closure on each render; including it
+    // here would re-bind the listener every render needlessly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMarkdown, crdt])
   // Prefer CRDT text once it's available AND synced — otherwise
   // a brand-new hook hasn't pulled the IDB cache yet and would
   // briefly overwrite our fetched text with the empty string.
@@ -388,20 +994,36 @@ export function PathViewer({ path, canEdit = true }: Props) {
     }
   }, [frontmatter])
   const refetchForEvent = useCallback(
-    (e: { type: string; path?: string; status?: string }) => {
-      if (!e.path || e.path !== path) return
-      // Meta always — covers tag/visibility/archive toggles + ingest status.
+    (e: { type: string; path?: string; status?: string; docId?: string }) => {
+      // Comment events arrive whenever any user creates / deletes /
+      // resolves a comment on this doc. Refetch the list inline so
+      // a second tab sees the new thread without F5. We match on
+      // docId (carried in the event) rather than path because
+      // comments are doc-scoped and survive a rename.
+      if (e.type === 'comment' && meta?.id && e.docId === meta.id) {
+        api
+          .listComments(meta.id)
+          .then((r) => setComments(r.comments))
+          .catch(() => null)
+        return
+      }
+      // Exact-path match for most events. Lock events also fire on
+      // FOLDER paths, and locking an ancestor changes this file's
+      // EFFECTIVE lock state (server ORs ancestor-folder lock into
+      // meta.locked). So a folder lock event upstream of `path`
+      // needs to trigger a meta refetch here too — otherwise the
+      // editor keeps the pencil enabled and CRDT autosave silently
+      // drops the user's keystrokes.
+      const isExact = e.path === path
+      const isAncestorLock =
+        e.type === 'lock' &&
+        !!e.path &&
+        (e.path === '' || path.startsWith(e.path.replace(/\/+$/, '') + '/'))
+      if (!isExact && !isAncestorLock) return
       api.fileMeta(path, callerOpts).then((r) => setMeta(r.meta)).catch(() => null)
-      // Any content-changing event also drops a new version row, so kick
-      // DocRail to refetch its versions list. Without this the rail keeps
-      // showing the pre-edit list until manual reload.
       if (e.type === 'edit' || e.type === 'restore') {
         setVersionsReloadKey((k) => k + 1)
       }
-      // Body bytes only on actual content changes. Skip the intermediate
-      // ingest stages (extracting/embedding) so we don't thrash; the final
-      // `ingest:ready` covers slow extractors, and `edit` covers fast MCP
-      // / chat writes (they publish before the ingest pipeline kicks off).
       if (!wantsBody) return
       const shouldRefetch =
         e.type === 'edit' ||
@@ -413,7 +1035,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
         .then((r) => setText(r.content))
         .catch(() => null)
     },
-    [path, callerOpts?.owner, wantsBody],
+    [path, callerOpts?.owner, wantsBody, meta?.id],
   )
   useReaderEvents(refetchForEvent)
 
@@ -449,6 +1071,36 @@ export function PathViewer({ path, canEdit = true }: Props) {
     }
   }
 
+  // Source-line index of every ATX heading in the doc, derived
+  // from the raw markdown body. Paired with DOM-extracted slugs
+  // (below) to power the edit ↔ preview scroll sync — given a
+  // CodeMirror line, find the heading at-or-before it, jump to
+  // that slug in the preview (and vice versa).
+  const sourceHeadingLines = useMemo(() => {
+    if (!text) return [] as number[]
+    const out: number[] = []
+    const lines = text.split('\n')
+    let inFence = false
+    let fenceMarker: string | null = null
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i]
+      const fenceMatch = ln.match(/^\s*(```+|~~~+)/)
+      if (fenceMatch) {
+        if (!inFence) {
+          inFence = true
+          fenceMarker = fenceMatch[1][0]
+        } else if (fenceMatch[1][0] === fenceMarker) {
+          inFence = false
+          fenceMarker = null
+        }
+        continue
+      }
+      if (inFence) continue
+      if (/^#{1,6}\s+\S/.test(ln)) out.push(i + 1)
+    }
+    return out
+  }, [text])
+
   // Outline is built from the actual rendered DOM after react-markdown +
   // rehype-slug run, so the slug we click matches the heading's real id even
   // for tricky titles (parentheses, slashes, percent signs, etc.).
@@ -458,8 +1110,8 @@ export function PathViewer({ path, canEdit = true }: Props) {
       setHeadings([])
       return
     }
-    // Defer so react-markdown has finished committing the heading nodes.
-    const id = requestAnimationFrame(() => {
+    let rafId = 0
+    const extract = () => {
       const root = contentRef.current
       if (!root) return
       const nodes = root.querySelectorAll<HTMLElement>('h1[id], h2[id], h3[id], h4[id]')
@@ -472,9 +1124,58 @@ export function PathViewer({ path, canEdit = true }: Props) {
         clone.querySelectorAll('.anchor').forEach((a) => a.remove())
         out.push({ level, text: (clone.textContent ?? '').trim(), slug: n.id })
       })
-      setHeadings(out)
-    })
-    return () => cancelAnimationFrame(id)
+      // Only update on actual change so toggling something unrelated
+      // doesn't fan out a re-render across the rail.
+      setHeadings((prev) => {
+        if (prev.length === out.length) {
+          let same = true
+          for (let i = 0; i < prev.length; i++) {
+            if (prev[i].slug !== out[i].slug || prev[i].text !== out[i].text) {
+              same = false
+              break
+            }
+          }
+          if (same) return prev
+        }
+        return out
+      })
+    }
+    // Defer the initial extraction so ReactMarkdown / VersionDiffView
+    // has committed the heading nodes.
+    rafId = requestAnimationFrame(extract)
+    // Re-extract whenever the rendered DOM gains/loses heading
+    // elements — happens when the user opens a version snapshot,
+    // toggles Snapshot ↔ Diff inside the version view, or navigates
+    // between versions. Heading-aware filter keeps this cheap during
+    // editor typing (which mutates DOM constantly but doesn't add or
+    // remove headings).
+    const root = contentRef.current
+    let mo: MutationObserver | null = null
+    if (root) {
+      mo = new MutationObserver((mutations) => {
+        const headingChange = mutations.some((m) => {
+          for (const node of m.addedNodes) {
+            if (!(node instanceof Element)) continue
+            if (/^H[1-4]$/i.test(node.tagName)) return true
+            if (node.querySelector?.('h1, h2, h3, h4')) return true
+          }
+          for (const node of m.removedNodes) {
+            if (!(node instanceof Element)) continue
+            if (/^H[1-4]$/i.test(node.tagName)) return true
+            if (node.querySelector?.('h1, h2, h3, h4')) return true
+          }
+          return false
+        })
+        if (!headingChange) return
+        cancelAnimationFrame(rafId)
+        rafId = requestAnimationFrame(extract)
+      })
+      mo.observe(root, { childList: true, subtree: true })
+    }
+    return () => {
+      cancelAnimationFrame(rafId)
+      mo?.disconnect()
+    }
   }, [isMarkdown, text])
 
   // DocRail is shown for any markdown doc so the version-history
@@ -505,6 +1206,136 @@ export function PathViewer({ path, canEdit = true }: Props) {
     const el = root.querySelector<HTMLElement>(`#${CSS.escape(slug)}`)
     el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
+
+  // Slug ↔ source-line pairs (zipped from DOM headings and
+  // source-line regex scan — both produce headings in document
+  // order so the zip is by index). Used by the scroll-sync
+  // logic to translate between the rendered preview's heading
+  // position and CodeMirror's source line.
+  const headingsWithLine = useMemo(() => {
+    const n = Math.min(headings.length, sourceHeadingLines.length)
+    const out: Array<{ slug: string; line: number }> = []
+    for (let i = 0; i < n; i++) {
+      out.push({ slug: headings[i].slug, line: sourceHeadingLines[i] })
+    }
+    return out
+  }, [headings, sourceHeadingLines])
+
+  // Capture the current scroll anchor (top viewport line in
+  // CodeMirror OR the topmost-passed heading in the rendered
+  // preview), then flip mode. The next mounted surface reads
+  // `scrollAnchorLineRef` to align its viewport.
+  const toggleEditing = useCallback(() => {
+    if (editing) {
+      // Edit → Preview: anchor to the cursor's line, not the top
+      // visible line. With the editor's scroll-margins keeping the
+      // cursor in the middle of the viewport, the top visible line
+      // can sit several sections behind where the user actually is.
+      // Cursor position is the most reliable "where I am" signal.
+      // Fall back to the top visible line if there's no selection
+      // (rare — CM always has a default cursor at 0).
+      const view = crdtViewRef.current
+      if (view) {
+        try {
+          const sel = view.state.selection.main
+          const pos = sel.head
+          scrollAnchorLineRef.current = view.state.doc.lineAt(pos).number
+        } catch {
+          scrollAnchorLineRef.current = null
+        }
+        // Stash the top-of-viewport line for a clean round-trip
+        // back to Edit (when the viewer doesn't get scrolled).
+        try {
+          const topPos = view.lineBlockAtHeight(view.scrollDOM.scrollTop).from
+          editorTopLineRef.current = view.state.doc.lineAt(topPos).number
+        } catch {
+          editorTopLineRef.current = null
+        }
+      }
+    } else {
+      // Preview → Edit. Two cases:
+      //   1. Viewer hasn't been scrolled since landing → snap back
+      //      to the saved cursor line. Smooth round-trip — the user
+      //      flipped to viewer briefly and is back where they were.
+      //   2. Viewer has been scrolled → follow the user's reading
+      //      to wherever they ended up, by anchoring on the topmost
+      //      heading currently passed in the viewport.
+      const root = contentRef.current
+      const landing = viewerLandingScrollRef.current
+      const currentScroll = root?.scrollTop ?? 0
+      // 4px tolerance covers sub-pixel rounding from scrollIntoView.
+      const userScrolled =
+        landing != null && Math.abs(currentScroll - landing) > 4
+      const remembered = editorSelectionRef.current
+      if (!userScrolled && editorTopLineRef.current != null) {
+        // Round-trip back — anchor on the exact line that was at
+        // the top of the editor viewport before leaving. CrdtEditor
+        // dispatches scrollIntoView for this line at 'start', so
+        // the editor visually lines up with what we left.
+        scrollAnchorLineRef.current = editorTopLineRef.current
+      } else if (root) {
+        // User scrolled in viewer — find the topmost element with a
+        // `data-source-line` attribute (stamped by rehypeSourceLine
+        // on every block) that's still at or above the viewport top.
+        // This gives line-precision rather than just heading-section.
+        const rootRect = root.getBoundingClientRect()
+        const nodes = root.querySelectorAll<HTMLElement>('[data-source-line]')
+        let anchorLine: number | null = null
+        let firstBelow: number | null = null
+        for (const n of Array.from(nodes)) {
+          const rel = n.getBoundingClientRect().top - rootRect.top
+          const ln = Number(n.getAttribute('data-source-line'))
+          if (!Number.isFinite(ln)) continue
+          if (rel <= 8) {
+            anchorLine = ln
+          } else {
+            if (firstBelow == null) firstBelow = ln
+            break
+          }
+        }
+        if (anchorLine == null) anchorLine = firstBelow
+        scrollAnchorLineRef.current = anchorLine
+      } else if (remembered && text) {
+        const off = Math.max(0, Math.min(remembered.head, text.length))
+        const before = text.slice(0, off)
+        scrollAnchorLineRef.current = before.split('\n').length
+      }
+    }
+    setEditing((v) => !v)
+  }, [editing, headingsWithLine, text])
+
+  // After flipping back to preview, scroll the rendered markdown
+  // so the closest heading to the saved source-line sits at the
+  // viewport top. Deferred to rAF so headings have re-extracted
+  // from the new DOM.
+  useEffect(() => {
+    if (editing) {
+      // Switched to editor — invalidate the viewer landing baseline
+      // so the next round-trip starts fresh.
+      viewerLandingScrollRef.current = null
+      return
+    }
+    const target = scrollAnchorLineRef.current
+    if (!target) return
+    if (headingsWithLine.length === 0) return
+    const id = requestAnimationFrame(() => {
+      const root = contentRef.current
+      if (!root) return
+      let pick: { slug: string; line: number } | null = null
+      for (const h of headingsWithLine) {
+        if (h.line <= target) pick = h
+        else break
+      }
+      if (!pick) pick = headingsWithLine[0]
+      const el = root.querySelector<HTMLElement>(`#${CSS.escape(pick.slug)}`)
+      if (el) el.scrollIntoView({ block: 'start', behavior: 'auto' })
+      // Stash where the viewer landed. The next Preview → Edit
+      // toggle compares against this to know whether the user
+      // scrolled inside the viewer.
+      viewerLandingScrollRef.current = root.scrollTop
+    })
+    return () => cancelAnimationFrame(id)
+  }, [editing, headingsWithLine])
 
   const needsReindex = !!meta && !meta.ingest.embedded
   const reindexLabel = meta?.ingest.status === 'ready' ? 'Re-index' : 'Index'
@@ -587,7 +1418,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
             />
             {meta && <CollectionsToolbarButton docId={meta.id} path={meta.storageKey} />}
             {meta && <FindSimilarButton docId={meta.id} path={meta.storageKey} ownerHint={ownerOpt} />}
-            <ActivityButton path={path} />
+            <ActivityButton path={path} owner={ownerOpt} />
           </>
         )}
         {!ownerOpt && (
@@ -612,12 +1443,21 @@ export function PathViewer({ path, canEdit = true }: Props) {
               />
             ) : (
               <button className="btn-ghost" disabled title="Private" aria-label="Private">
-                <Lock size={13} />
+                <Shield size={13} />
               </button>
             )}
           </>
         )}
         <PinButton path={path} owner={ownerOpt} isFolder={false} onChanged={refresh} />
+        {/* Lock toggle — owner-only (the route enforces it too;
+            hiding here avoids a footgun for share-recipients). */}
+        {!ownerOpt && meta && (
+          <LockButton
+            path={path}
+            locked={!!meta.locked}
+            onChanged={() => refresh()}
+          />
+        )}
         {!ownerOpt && meta && (
           <ArchiveButton
             path={path}
@@ -629,6 +1469,7 @@ export function PathViewer({ path, canEdit = true }: Props) {
             }
           />
         )}
+        {!ownerOpt && meta && <DuplicateButton path={path} owner={ownerOpt} />}
         {!ownerOpt && isMarkdown && meta && (
           <SaveAsTemplateButton
             path={path}
@@ -641,21 +1482,42 @@ export function PathViewer({ path, canEdit = true }: Props) {
             onRefreshed={(next) => setMeta(next)}
           />
         )}
-        {/* Live-collab edit toggle. Markdown + own-vault only —
-            the CRDT WS route is owner-gated and other surfaces
-            (PDFs, images, csv) don't have a sensible editor. */}
-        {!ownerOpt && isMarkdown && meta && crdt && (
+        {/* Live-collab edit toggle. Markdown + (owner OR shared
+            recipient with `canEdit`). PDFs / images / csv don't
+            have a sensible editor. Disabled (not hidden) when the
+            doc is locked — keeps the layout stable + tells the
+            user why they can't edit on hover. */}
+        {(!ownerOpt || canEdit) && isMarkdown && meta && crdt && (
           <button
-            className="btn-ghost"
-            onClick={() => setEditing((v) => !v)}
-            title={editing ? 'Done editing' : 'Edit document'}
-            aria-label={editing ? 'Done editing' : 'Edit'}
-            style={editing ? { color: 'var(--accent)', background: 'var(--selected)' } : undefined}
+            className={
+              meta.locked
+                ? 'h-7 px-2 inline-flex items-center justify-center rounded text-[12.5px] font-medium cursor-not-allowed'
+                : 'btn-ghost'
+            }
+            onClick={() => !meta.locked && toggleEditing()}
+            disabled={!!meta.locked}
+            title={
+              meta.locked
+                ? meta.lockedBy
+                  ? `Locked by ${meta.lockedBy} — unlock to edit`
+                  : 'Locked — unlock to edit'
+                : editing
+                  ? 'Preview'
+                  : 'Edit document'
+            }
+            aria-label={editing ? 'Switch to preview' : 'Switch to edit'}
+            aria-keyshortcuts={editShortcutHint.replace('⌘', 'Meta+')}
+            style={
+              meta.locked
+                ? { color: 'var(--danger-fg)', background: 'transparent' }
+                : editing
+                  ? { color: 'var(--accent)', background: 'var(--selected)' }
+                  : undefined
+            }
           >
             {editing ? <Check size={13} /> : <Pencil size={13} />}
           </button>
         )}
-        {crdt?.awareness && <AwarenessPill awareness={crdt.awareness} />}
         {/* Copy the file's actual content to the system clipboard:
             text for markdown/csv/json/txt/html and any file we've
             extracted text for; PNG/JPEG/GIF/WebP go on as image
@@ -890,13 +1752,39 @@ export function PathViewer({ path, canEdit = true }: Props) {
           <div className="h-full">
             <CrdtEditor
               crdt={crdt}
-              userLabel={meta?.owner ?? null}
-              onExit={() => setEditing(false)}
+              userLabel={currentUsername ?? meta?.owner ?? null}
+              onExit={() => toggleEditing()}
+              initialSelection={editorSelectionRef.current}
+              onSelectionChange={(sel) => {
+                editorSelectionRef.current = sel
+              }}
+              initialScrollLine={scrollAnchorLineRef.current}
+              viewRef={crdtViewRef}
+              onMediaPaste={(file) => setPastedMediaFile(file)}
             />
           </div>
         )}
+        {pastedMediaFile && (
+          <PasteMediaDialog
+            file={pastedMediaFile}
+            docPath={path}
+            onCancel={() => setPastedMediaFile(null)}
+            onUploaded={({ markdown }) => {
+              const view = crdtViewRef.current
+              if (view) {
+                const pos = view.state.selection.main.head
+                view.dispatch({
+                  changes: { from: pos, to: pos, insert: markdown },
+                  selection: { anchor: pos + markdown.length },
+                })
+                view.focus()
+              }
+              setPastedMediaFile(null)
+            }}
+          />
+        )}
         {!error && isMarkdown && text != null && diffTs === null && previewMessageId === null && !editing && (
-          <div className="px-10 py-10">
+          <div ref={viewerBodyRef} className="px-10 py-10 relative">
             {frontmatter && (
               <div className="mb-6">
                 <button
@@ -966,11 +1854,34 @@ export function PathViewer({ path, canEdit = true }: Props) {
             )}
             <article className="md">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
+                // `remark-breaks` converts a single newline into a
+                // hard `<br>`, matching how the editor renders the
+                // source. Without it CommonMark collapses
+                //   line A
+                //   line B
+                // into one paragraph (joined by a space), which is
+                // why `{{/if}}` was appearing inline next to the
+                // bullet above instead of on its own visual row.
+                remarkPlugins={[remarkGfm, remarkBreaks]}
                 rehypePlugins={[
+                  // Stamp source-line attrs BEFORE downstream plugins
+                  // rewrite the tree (slugs, anchor links, highlight
+                  // spans) so the lines stay attached to the original
+                  // remark output.
+                  rehypeSourceLine,
                   rehypeSlug,
                   [rehypeAutolinkHeadings, { behavior: 'append', properties: { className: ['anchor'], 'aria-hidden': 'true', tabIndex: -1 }, content: { type: 'text', value: '#' } }],
                   rehypeHighlight,
+                  // Style `{{#if …}}` / `{{/if}}` / `{{var}}`
+                  // template-engine tokens in the rendered
+                  // preview — purple for control flow, accent
+                  // for variables.
+                  rehypeTemplateSyntax,
+                  // After tokens are styled, pair balanced
+                  // openers/closers and wrap the content between
+                  // them in an indented block so the template
+                  // structure reads at a glance.
+                  rehypeTemplateIndent,
                 ]}
                 // Custom renderers that resolve relative URLs against
                 // the doc's folder. Without these, `![](./img.jpg)`
@@ -1036,6 +1947,12 @@ export function PathViewer({ path, canEdit = true }: Props) {
                 {renderedText}
               </ReactMarkdown>
             </article>
+            <CommentHighlights
+              bodyRef={viewerBodyRef}
+              comments={comments}
+              recomputeKey={(text?.length ?? 0) + (comments?.length ?? 0)}
+              onClickComment={handleHighlightClick}
+            />
           </div>
         )}
 
@@ -1146,25 +2063,54 @@ export function PathViewer({ path, canEdit = true }: Props) {
             as a pending message — ChatDock consumes it and auto-
             sends "Explain this: …" once mounted. Hidden alongside
             the chat dock when Reader AI is off. */}
-        {chatEnabled && meta && (
+        {meta && (
           <SelectionPopover
             containerRef={contentRef}
-            onExplain={(text) => {
-              // Cap to ~3500 chars to leave room for the prefix
-              // inside the server's 4000-char content limit.
-              const trimmed = text.length > 3500 ? text.slice(0, 3500) + '…' : text
-              setPendingChatMessage(`Explain this: "${trimmed}"`)
-              setChatOpen(true)
-            }}
+            // Explain + Reply only when chat is available. The
+            // SelectionPopover collapses to just the Comment action
+            // (plus Reply if read-only chat is allowed) when the
+            // dock isn't reachable.
+            onExplain={
+              chatEnabled
+                ? (text) => {
+                    // Cap to ~3500 chars to leave room for the
+                    // prefix inside the server's 4000-char content
+                    // limit.
+                    const trimmed = text.length > 3500 ? text.slice(0, 3500) + '…' : text
+                    setPendingChatMessage(`Explain this: "${trimmed}"`)
+                    setChatOpen(true)
+                  }
+                : undefined
+            }
             // Reply affordance is universal — even read-only viewers
             // can ask freeform questions against a quoted selection.
             // The Apply button on any resulting proposed_edit card
             // is the actual edit gate (server enforces write access).
-            onReply={(text) => {
-              const trimmed = text.length > 3500 ? text.slice(0, 3500) + '…' : text
-              setPendingChatQuote(trimmed)
-              setChatOpen(true)
-            }}
+            onReply={
+              chatEnabled
+                ? (text) => {
+                    const trimmed = text.length > 3500 ? text.slice(0, 3500) + '…' : text
+                    setPendingChatQuote(trimmed)
+                    setChatOpen(true)
+                  }
+                : undefined
+            }
+            bodyRef={viewerBodyRef}
+            onComment={
+              meta?.id
+                ? async (anchor, text) => {
+                    const docId = meta.id
+                    const { comment } = await api.createComment({
+                      docId,
+                      text,
+                      quote: anchor.quote.slice(0, 2000),
+                      rangeStart: anchor.rangeStart,
+                      rangeEnd: anchor.rangeEnd,
+                    })
+                    handleCommentCreated(comment)
+                  }
+                : undefined
+            }
           />
         )}
        </div>
@@ -1219,6 +2165,19 @@ export function PathViewer({ path, canEdit = true }: Props) {
            activeDiffTs={diffTs}
            onPickVersion={(ts) => setDiffTs(ts)}
            versionsReloadKey={versionsReloadKey}
+           awareness={crdt?.awareness ?? null}
+           peersOpen={peersOpen}
+           setPeersOpen={setPeersOpen}
+           ownerOpt={ownerOpt}
+           comments={comments ?? undefined}
+           commentsOpen={commentsOpen}
+           setCommentsOpen={setCommentsOpen}
+           onScrollToComment={handleScrollToComment}
+           onResolveComment={handleCommentResolve}
+           onDeleteComment={handleCommentDelete}
+           onCopyCommentLink={handleCopyCommentLink}
+           currentUsername={currentUsername}
+           focusedCommentId={focusedCommentId}
          />
        )}
       </div>

@@ -37,52 +37,79 @@ export async function collectionsRoutes(app: FastifyInstance) {
     if (!req.currentUser) return reply.code(401).send({ error: 'auth required' })
     const me = req.currentUser.username
 
-    // For each collection, peek at up to the first 4 member docs and
-    // hand the client their {docId, path, kind} tuple so the card on
-    // /collections can paint a real mosaic cover instead of a blank
-    // folder icon. Kept to 4 because that's enough for a 2x2 mosaic
-    // and any larger N would inflate the response without changing
-    // the visual.
-    const previewFor = async (
-      cid: string,
-    ): Promise<
-      Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }>
-    > => {
-      const members = collections.listMembers(cid).slice(0, 4)
-      const out: Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }> = []
+    // Map a DocumentMeta to the lightweight {docId, path, kind}
+    // tuple the list-page card uses to render its mosaic cover.
+    const kindOf = (filename: string): 'image' | 'video' | 'file' => {
+      const ext = filename.toLowerCase().match(/\.[^./\\]+$/)?.[0] ?? ''
+      return /\.(png|jpe?g|webp|gif|avif|bmp|ico|heic|heif|tiff?|jxl)$/.test(ext)
+        ? 'image'
+        : /\.(mp4|mov|m4v|mkv|webm|avi|3gp|3gpp|mts|m2ts|mpg|mpeg|wmv|flv|ogv)$/.test(ext)
+          ? 'video'
+          : 'file'
+    }
+
+    // Hydrate count + preview for one collection. Static
+    // collections read from `collection_members`. Smart
+    // collections resolve their query live — the static row count
+    // is always 0 for those (they don't materialise members), so
+    // falling back to it caused the "Smart collection · 0 items"
+    // bug even when the live query had three matches.
+    type Hydrated = {
+      memberCount: number
+      preview: Array<{ docId: string; path: string; kind: 'image' | 'video' | 'file' }>
+    }
+    const hydrate = async (
+      c: { id: string; owner: string; query: collections.SmartCollectionQuery | null },
+    ): Promise<Hydrated> => {
+      if (c.query) {
+        // Smart collection — same resolver the detail page uses
+        // so the list count and the detail-page count can never
+        // disagree.
+        const docs = await resolveSmartCollection(c.query, c.owner).catch(
+          () => [] as Awaited<ReturnType<typeof resolveSmartCollection>>,
+        )
+        return {
+          memberCount: docs.length,
+          preview: docs.slice(0, 4).map((d) => ({
+            docId: d.id,
+            path: d.storageKey,
+            kind: kindOf(d.originalFilename),
+          })),
+        }
+      }
+      // Static collection — first 4 stored member rows.
+      const members = collections.listMembers(c.id).slice(0, 4)
+      const preview: Hydrated['preview'] = []
       for (const m of members) {
         const meta = await loadMeta(m.docId)
         if (!meta) continue
-        const ext = meta.originalFilename.toLowerCase().match(/\.[^./\\]+$/)?.[0] ?? ''
-        const kind: 'image' | 'video' | 'file' =
-          /\.(png|jpe?g|webp|gif|avif|bmp|ico|heic|heif|tiff?|jxl)$/.test(ext)
-            ? 'image'
-            : /\.(mp4|mov|m4v|mkv|webm|avi|3gp|3gpp|mts|m2ts|mpg|mpeg|wmv|flv|ogv)$/.test(ext)
-              ? 'video'
-              : 'file'
-        out.push({ docId: meta.id, path: meta.storageKey, kind })
+        preview.push({
+          docId: meta.id,
+          path: meta.storageKey,
+          kind: kindOf(meta.originalFilename),
+        })
       }
-      return out
+      return { memberCount: collections.memberCount(c.id), preview }
     }
 
     const mineRaw = collections.listByOwner(me)
     const sharedRaw = collections.listSharedTo(me)
-    // Resolve previews in parallel — each call is a couple of
-    // indexed lookups, so even 50 collections finishes in a few ms.
+    // Hydrate in parallel — static collections are a couple of
+    // indexed lookups; smart collections invoke the resolver,
+    // which is the same path the detail page already takes on
+    // open, so even 50 collections finishes in a few hundred ms.
     const mine = await Promise.all(
       mineRaw.map(async (c) => ({
         ...c,
         role: 'owner' as const,
-        memberCount: collections.memberCount(c.id),
-        preview: await previewFor(c.id),
+        ...(await hydrate(c)),
       })),
     )
     const shared = await Promise.all(
       sharedRaw.map(async (c) => ({
         ...c,
         role: (c.canEdit ? 'editor' : 'viewer') as 'editor' | 'viewer',
-        memberCount: collections.memberCount(c.id),
-        preview: await previewFor(c.id),
+        ...(await hydrate(c)),
       })),
     )
     return { mine, shared }

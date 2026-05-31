@@ -1,7 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { FolderPlus, Folder, Loader2, CornerDownLeft, X } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { FolderPlus, Folder, FileText, Loader2, CornerDownLeft, X } from 'lucide-react'
 import { ApiError, api } from '../lib/api'
+
+/** Detect if the leaf segment looks like a filename (has an
+ *  extension). Anything like `notes.md`, `index.html`, `data.csv`
+ *  triggers file-creation mode; a bare `folder` or `2026/q1`
+ *  stays as a plain mkdir. The regex is intentionally loose
+ *  (1–8 chars, alphanumeric) so common extensions match without
+ *  pulling in a big mime list. */
+function looksLikeFile(path: string): boolean {
+  const leaf = path.split('/').pop() ?? ''
+  return /\.[a-z0-9]{1,8}$/i.test(leaf)
+}
 
 /**
  * Centered overlay panel for creating a new folder. Mirrors the
@@ -40,6 +52,7 @@ export function NewFolderButton({
    *  to create a sibling — matches Finder / VS Code behavior. */
   currentDir?: string
 }) {
+  const navigate = useNavigate()
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false)
   const open = openProp ?? uncontrolledOpen
   const setOpen = (next: boolean | ((cur: boolean) => boolean)) => {
@@ -111,15 +124,42 @@ export function NewFolderButton({
     setActiveIdx(0)
   }, [clean])
 
+  const isFile = useMemo(() => looksLikeFile(clean), [clean])
+
   const submit = async () => {
     if (!clean) return
     setBusy(true)
     setError(null)
     try {
-      await api.mkdir(clean)
-      setOpen(false)
-      setName('')
-      onCreated()
+      if (isFile) {
+        // File-creation path: split into dir + filename, upload an
+        // (almost) empty file. The upload route auto-mkdirs the
+        // parent (`mkdir(targetDir, { recursive: true })`) so any
+        // intermediate folders along the way get created in one
+        // shot. The server rejects strictly-empty uploads, so seed
+        // with a single newline; the user fills it in after.
+        const lastSlash = clean.lastIndexOf('/')
+        const dir = lastSlash >= 0 ? clean.slice(0, lastSlash) : ''
+        const filename = lastSlash >= 0 ? clean.slice(lastSlash + 1) : clean
+        const file = new File(['\n'], filename, { type: 'text/plain' })
+        const r = await api.upload(file, { dir })
+        setOpen(false)
+        setName('')
+        onCreated()
+        // Open the new file straight away. Server returns the final
+        // path (uniquePath may have appended -N to avoid a collision),
+        // so always trust r.path over the input.
+        const segs = (r.path ?? `${dir ? dir + '/' : ''}${filename}`)
+          .split('/')
+          .map(encodeURIComponent)
+          .join('/')
+        navigate(`/${segs}`)
+      } else {
+        await api.mkdir(clean)
+        setOpen(false)
+        setName('')
+        onCreated()
+      }
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e))
     } finally {
@@ -193,8 +233,14 @@ export function NewFolderButton({
               className="flex items-center gap-2.5 px-4 h-12 border-b shrink-0"
               style={{ borderColor: 'var(--border)' }}
             >
-              <FolderPlus size={15} className="text-accent" />
-              <div className="text-[13.5px] font-medium text-fg">New folder</div>
+              {isFile ? (
+                <FileText size={15} className="text-accent" />
+              ) : (
+                <FolderPlus size={15} className="text-accent" />
+              )}
+              <div className="text-[13.5px] font-medium text-fg">
+                {isFile ? 'New file' : 'New folder'}
+              </div>
               <div className="flex-1" />
               <button
                 className="btn-ghost h-7 w-7 px-0"
@@ -207,16 +253,20 @@ export function NewFolderButton({
 
             <div className="px-4 py-4 border-b" style={{ borderColor: 'var(--border)' }}>
               <div className="text-[11px] uppercase tracking-wider font-semibold text-subtle mb-1.5">
-                Folder name
+                Path
               </div>
               <div className="relative">
-                <Folder size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-subtle pointer-events-none" />
+                {isFile ? (
+                  <FileText size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-subtle pointer-events-none" />
+                ) : (
+                  <Folder size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-subtle pointer-events-none" />
+                )}
                 <input
                   ref={inputRef}
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   onKeyDown={onInputKeyDown}
-                  placeholder="folder-name"
+                  placeholder="folder-name  or  folder/file.md"
                   className="input pl-8 h-8 text-[13px]"
                   disabled={busy}
                 />
@@ -224,7 +274,12 @@ export function NewFolderButton({
               <div className="text-[11px] text-subtle mt-1.5 flex items-center gap-2">
                 <CornerDownLeft size={10} />
                 <span>
-                  Create <code className="text-fg">/{clean || '…'}</code> · Tab to autocomplete · ↑↓ to pick
+                  {clean
+                    ? isFile
+                      ? <>Creates file <code className="text-fg">/{clean}</code> (and any missing folders)</>
+                      : <>Creates folder <code className="text-fg">/{clean}/</code></>
+                    : <>Folder name, or end with an extension (<code className="text-fg">.md</code>, <code className="text-fg">.txt</code>) to create a file</>}
+                  {' · Tab to autocomplete · ↑↓ to pick'}
                 </span>
               </div>
             </div>
@@ -264,7 +319,12 @@ export function NewFolderButton({
                 className="flex-1 text-[11.5px]"
                 style={error ? { color: '#BF2600' } : { color: 'var(--fg-subtle)' }}
               >
-                {error ?? (clean ? `Creates /${clean}` : 'Type a name to create')}
+                {error ??
+                  (clean
+                    ? isFile
+                      ? `Creates file /${clean}`
+                      : `Creates folder /${clean}/`
+                    : 'Type a name to create')}
               </div>
               <button className="btn-ghost h-7" onClick={() => setOpen(false)} disabled={busy}>
                 Cancel
@@ -274,7 +334,13 @@ export function NewFolderButton({
                 onClick={submit}
                 disabled={busy || !clean}
               >
-                {busy ? <Loader2 size={13} className="animate-spin" /> : <FolderPlus size={13} />}
+                {busy ? (
+                  <Loader2 size={13} className="animate-spin" />
+                ) : isFile ? (
+                  <FileText size={13} />
+                ) : (
+                  <FolderPlus size={13} />
+                )}
                 Create
               </button>
             </div>
