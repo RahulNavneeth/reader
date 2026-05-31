@@ -282,7 +282,17 @@ export async function buildApp(opts: BuildAppOptions = {}) {
       (req.url.startsWith('/api/file/raw') ||
         req.url.startsWith('/api/file/thumbnail') ||
         req.url.startsWith('/api/file/preview') ||
-        (!req.url.startsWith('/api') && !req.url.startsWith('/mcp')))
+        // Bare-path file proxy: `/foo.pdf`, `/notes/img.png` etc.
+        // Must have a file-extension-shaped last segment so
+        // routes like `/health`, `/oauth/token`, `/.well-known/…`
+        // don't accidentally get SAMEORIGIN (the test for the
+        // standard security headers explicitly expects DENY on
+        // `/health`).
+        (!req.url.startsWith('/api') &&
+          !req.url.startsWith('/mcp') &&
+          !req.url.startsWith('/oauth') &&
+          !req.url.startsWith('/.well-known') &&
+          /\.[a-z0-9]{1,8}(\?|$)/i.test(req.url)))
     if (isFileByteRoute && !isHtml) {
       reply.header('X-Frame-Options', 'SAMEORIGIN')
     } else {
